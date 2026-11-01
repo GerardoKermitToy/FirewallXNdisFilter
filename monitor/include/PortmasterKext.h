@@ -203,8 +203,8 @@ public:
     Driver& operator=(const Driver&) = delete;
 
     // Compatibility stub: returns a descriptive unsupported error. Install the
-    // NDIS LWF explicitly with dist/Install.exe, which targets only the
-    // Default Switch host vNIC. Neither this call nor Cleanup ever modifies SCM state.
+    // NDIS LWF explicitly with dist/Install.exe for all HNS ICS Hyper-V host vNICs.
+    // Neither this call nor Cleanup ever modifies SCM state.
     bool Install(const std::wstring& sys_path, std::string& error,
                  bool inbound_udp_pid_fallback = true);
 

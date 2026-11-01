@@ -10,7 +10,6 @@
 
 namespace hyperv_xndis_filter::setup {
 
-inline constexpr GUID kDefaultSwitchId = {0xc08cb7b8, 0x9b3c, 0x408e, {0x8e, 0x30, 0x5e, 0x16, 0xa3, 0xae, 0xb4, 0x44}};
 inline constexpr int kRebootRequired = ERROR_SUCCESS_REBOOT_REQUIRED;
 // Coherent driver-store package for the PID-free, full-packet, blocking-read 0.3.3.0 API.
 inline constexpr wchar_t kPackageVersion[] = L"0.3.3.0";
@@ -48,20 +47,30 @@ struct HostPort {
     std::vector<GUID> switches;
 };
 
+struct HnsNetwork {
+    std::wstring type;
+    GUID id{}, switch_id{};
+};
+
 struct Binding {
     GUID adapter{};
     bool enabled = false;
 };
+
+using Targets = std::vector<Adapter>;
 
 bool ParseOptions(Action executable, int argc, const wchar_t* const* argv,
                   Options& options, std::wstring& error);
 std::wstring Usage(Action executable);
 bool ParseGuid(const std::wstring& text, GUID& guid);
 GUID InternalPortGuid(const std::wstring& device_id);
-Adapter SelectTarget(const std::vector<GUID>& switches, const std::vector<HostPort>& ports,
-                     const std::vector<Adapter>& adapters);
+std::vector<GUID> SelectIcsSwitches(const std::vector<HnsNetwork>& networks);
+Targets SelectTargets(const std::vector<GUID>& switches, const std::vector<HostPort>& ports,
+                      const std::vector<Adapter>& adapters, const std::vector<HnsNetwork>& networks);
+void ValidateTargets(const Targets& targets);
 bool SameTarget(const Adapter& first, const Adapter& second);
-void ValidateBindings(const std::vector<Binding>& bindings, const Adapter& target,
+bool SameTargets(const Targets& first, const Targets& second);
+void ValidateBindings(const std::vector<Binding>& bindings, const Targets& targets,
                       bool all_disabled, bool require_enabled = false);
 
 // The workflow is shared by the EXEs and a fake implementation in offline tests.
@@ -72,15 +81,15 @@ public:
     virtual void RequireAdministrator() = 0;
     virtual void RequireSupportedOS() = 0;
     virtual void RequireMonitorStopped() = 0;
-    virtual Adapter ResolveTarget() = 0;
+    virtual Targets ResolveTargets() = 0;
     virtual bool HasService() = 0;
     virtual bool HasComponent() = 0;
     virtual void ValidatePackage(const std::filesystem::path& package) = 0;
-    virtual void VerifyConfiguration(const Adapter& target) = 0;
+    virtual void VerifyConfiguration(const Targets& targets) = 0;
     virtual bool Confirm(const std::wstring& action) = 0;
     virtual void Print(const std::wstring& text) = 0;
     virtual void LockNetwork() = 0;
-    virtual void WriteDisarmedConfiguration(const Adapter& target) = 0;
+    virtual void WriteDisarmedConfiguration(const Targets& targets) = 0;
     virtual void DisarmIfPresent() = 0;
     virtual void AllowBindings() = 0;
     virtual void AllowRuntimeRecovery() = 0;
@@ -89,8 +98,8 @@ public:
     virtual std::vector<std::wstring> ReadDriverPackages() = 0;
     virtual Change RemoveDriverPackage(const std::wstring& published_inf) = 0;
     virtual std::vector<Binding> ReadBindings() = 0;
-    virtual Change DisableTarget(const Adapter& target) = 0;
-    virtual Change EnableTarget(const Adapter& target) = 0;
+    virtual Change DisableTargets(const Targets& targets) = 0;
+    virtual Change EnableTargets(const Targets& targets) = 0;
     virtual void DeleteConfiguration() = 0;
 };
 

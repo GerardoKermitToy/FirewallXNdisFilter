@@ -71,7 +71,9 @@ struct CoString {
     CoString& operator=(const CoString&) = delete;
 };
 
-Adapter ResolveWindowsTarget();
+Targets ResolveWindowsTargets();
+std::vector<HnsNetwork> ParseHnsNetworks(const std::wstring& json);
+std::vector<HnsNetwork> ReadHnsNetworks();
 void ValidateInfFile(const std::filesystem::path& inf);
 void ValidateRemovalInfFile(const std::filesystem::path& inf);
 bool IsPublishedInfName(const std::wstring& name);

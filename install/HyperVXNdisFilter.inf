@@ -69,4 +69,4 @@ NotifyFiles=13
 [Strings]
 Provider="HyperVXNdisFilter Project"
 Description="HyperVXNdisFilter Rust Host Adapter LWF"
-Help="Rust packet verdicts for the Default Switch host vEthernet adapter only."
+Help="Rust packet verdicts for Hyper-V host vEthernet adapters associated with HNS ICS networks."

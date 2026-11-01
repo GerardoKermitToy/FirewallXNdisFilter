@@ -1,6 +1,7 @@
 #include "WindowsSupport.h"
 #include "../notify/BindingPolicy.h"
 #include "../notify/AdapterInventory.h"
+#include "../notify/TargetConfig.h"
 
 #include <netcfgx.h>
 #include <netcfgn.h>
@@ -8,6 +9,7 @@
 #include <setupapi.h>
 #include <tlhelp32.h>
 #include <iostream>
+#include <algorithm>
 
 namespace hyperv_xndis_filter::setup {
 namespace {
@@ -165,15 +167,6 @@ bool KeyExists(const wchar_t* path) {
     return true;
 }
 
-template<typename T>
-T RegistryValue(const wchar_t* name, DWORD flags) {
-    T value{};
-    DWORD size = sizeof(value);
-    CheckWin32(RegGetValueW(HKEY_LOCAL_MACHINE, kConfigKey, name, flags | RRF_SUBKEY_WOW6464KEY,
-                           nullptr, &value, &size), name);
-    if (size != sizeof(value)) throw Error{L"Invalid target configuration value size."};
-    return value;
-}
 
 class WindowsSystem final : public System {
 public:
@@ -240,7 +233,7 @@ public:
         if (GetLastError() != ERROR_NO_MORE_FILES) throw Error{L"Read process list: " + ErrorCode(GetLastError())};
     }
 
-    Adapter ResolveTarget() override { return ResolveWindowsTarget(); }
+    Targets ResolveTargets() override { return ResolveWindowsTargets(); }
     bool HasService() override { return KeyExists(kServiceKey); }
     bool HasComponent() override {
         if (network_) return static_cast<bool>(network_->Component());
@@ -254,18 +247,17 @@ public:
         Print(L"Package signatures, catalog membership and target-restricted INF verified.\n");
     }
 
-    void VerifyConfiguration(const Adapter& target) override {
-        const DWORD version = RegistryValue<DWORD>(L"ConfigVersion", RRF_RT_REG_DWORD);
-        const uint64_t luid = RegistryValue<uint64_t>(L"TargetNetLuid", RRF_RT_REG_QWORD);
-        const DWORD allowed = RegistryValue<DWORD>(L"AllowBindings", RRF_RT_REG_DWORD);
-        wchar_t text[39]{};
-        DWORD size = sizeof(text);
-        CheckWin32(RegGetValueW(HKEY_LOCAL_MACHINE, kConfigKey, L"TargetInterfaceGuid",
-                               RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, nullptr, text, &size), L"Read configured target GUID");
-        GUID guid{};
-        if (version != 2 || allowed > 1 || size != sizeof(text) || text[38] != L'\0' ||
-            !ParseGuid(text, guid) || guid != target.guid || luid != target.luid) {
-            throw Error{L"Configured GUID/NET_LUID does not match the current Default Switch host vNIC. Uninstall and reinstall explicitly; no automatic retargeting is allowed."};
+    void VerifyConfiguration(const Targets& targets) override {
+        ValidateTargets(targets);
+        TargetConfig config;
+        CheckWin32(ReadTargetConfig(config, false), L"Read configured target allowlist (schema 3 required; reinstall older configurations)");
+        if (HvTargetsRead32(config.data.data()) != targets.size()) {
+            throw Error{L"Configured target set changed. Uninstall and reinstall explicitly; no automatic retargeting is allowed."};
+        }
+        for (const auto& target : targets) {
+            if (!config.Matches(target.guid, target.luid)) {
+                throw Error{L"Configured GUID/NET_LUID does not match a current HNS ICS host vNIC. Uninstall and reinstall explicitly; no automatic retargeting is allowed."};
+            }
         }
     }
 
@@ -279,22 +271,30 @@ public:
 
     void LockNetwork() override { network_ = std::make_unique<Network>(true); }
 
-    void WriteDisarmedConfiguration(const Adapter& target) override {
+    void WriteDisarmedConfiguration(const Targets& targets) override {
+        ValidateTargets(targets);
+        TargetConfig config;
+        unsigned int size = 0;
+        if (!HvTargetsSize(static_cast<unsigned int>(targets.size()), &size)) throw Error{L"Target configuration size overflow."};
+        config.data.resize(size);
+        HvTargetsWrite32(config.data.data(), static_cast<unsigned int>(targets.size()));
+        for (size_t i = 0; i < targets.size(); ++i) {
+            auto* entry = config.data.data() + 4 + i * HV_TARGET_ENTRY_SIZE;
+            CopyMemory(entry, &targets[i].guid, sizeof(GUID));
+            HvTargetsWrite64(entry + 16, targets[i].luid);
+        }
         RegistryKey key;
         CheckWin32(RegCreateKeyExW(HKEY_LOCAL_MACHINE, kConfigKey, 0, nullptr, 0,
                                   kDurableConfigAccess, nullptr, &key.value, nullptr), L"Create target configuration");
-        const DWORD disarmed = 0, version = 2;
+        const DWORD disarmed = 0, version = HV_TARGET_CONFIG_VERSION;
         CheckWin32(RegSetValueExW(key.value, L"AutoRepairAllowed", 0, REG_DWORD,
                                  reinterpret_cast<const BYTE*>(&disarmed), sizeof(disarmed)), L"Block runtime recovery during installation");
         CheckWin32(RegFlushKey(key.value), L"Persist installer-controlled recovery state");
         CheckWin32(RegSetValueExW(key.value, L"AllowBindings", 0, REG_DWORD,
                                  reinterpret_cast<const BYTE*>(&disarmed), sizeof(disarmed)), L"Disarm bindings before installation");
-        const auto guid = GuidText(target.guid);
-        CheckWin32(RegSetValueExW(key.value, L"TargetInterfaceGuid", 0, REG_SZ,
-                                 reinterpret_cast<const BYTE*>(guid.c_str()),
-                                 static_cast<DWORD>((guid.size() + 1) * sizeof(wchar_t))), L"Write target GUID");
-        CheckWin32(RegSetValueExW(key.value, L"TargetNetLuid", 0, REG_QWORD,
-                                 reinterpret_cast<const BYTE*>(&target.luid), sizeof(target.luid)), L"Write target NET_LUID");
+        CheckWin32(RegFlushKey(key.value), L"Persist disarmed state before changing target identities");
+        CheckWin32(RegSetValueExW(key.value, L"TargetAdapters", 0, REG_BINARY,
+                                 config.data.data(), size), L"Write exact target GUID/NET_LUID allowlist");
         CheckWin32(RegSetValueExW(key.value, L"ConfigVersion", 0, REG_DWORD,
                                  reinterpret_cast<const BYTE*>(&version), sizeof(version)), L"Write target configuration version");
         CheckWin32(RegFlushKey(key.value), L"Persist disarmed target configuration");
@@ -392,24 +392,27 @@ public:
         return result;
     }
 
-    Change DisableTarget(const Adapter& target) override { return SetTargetBinding(target, false); }
-    Change EnableTarget(const Adapter& target) override { return SetTargetBinding(target, true); }
+    Change DisableTargets(const Targets& targets) override { return SetTargetBindings(targets, false); }
+    Change EnableTargets(const Targets& targets) override { return SetTargetBindings(targets, true); }
 
     void DeleteConfiguration() override {
         const LSTATUS result = RegDeleteTreeW(HKEY_LOCAL_MACHINE, kConfigKey);
         if (result != ERROR_FILE_NOT_FOUND && result != ERROR_PATH_NOT_FOUND) CheckWin32(result, L"Remove only HyperVXNdisFilter target configuration");
     }
 private:
-    Change SetTargetBinding(const Adapter& target, bool enabled) {
+    Change SetTargetBindings(const Targets& targets, bool enabled) {
         if (!network_) throw Error{L"NetCfg write lock is required for binding changes."};
         auto paths = Paths(*network_);
         std::vector<Binding> bindings;
         for (const auto& entry : paths) bindings.push_back(entry.binding);
-        ValidateBindings(bindings, target, false);
+        ValidateBindings(bindings, targets, false);
         HRESULT operation = S_OK;
         bool changed = false;
         for (auto& entry : paths) {
-            if (entry.binding.adapter != target.guid || entry.binding.enabled == enabled) continue;
+            const bool target = std::any_of(targets.begin(), targets.end(), [&](const Adapter& adapter) {
+                return entry.binding.adapter == adapter.guid;
+            });
+            if (!target || entry.binding.enabled == enabled) continue;
             const HRESULT result = entry.path->Enable(enabled ? TRUE : FALSE);
             Check(result, enabled ? L"Enable exact target binding path" : L"Disable exact target binding path before arming");
             changed = true;

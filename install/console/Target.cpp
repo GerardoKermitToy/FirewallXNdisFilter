@@ -104,17 +104,15 @@ private:
 
 } // namespace
 
-Adapter ResolveWindowsTarget() {
+Targets ResolveWindowsTargets() {
+    const auto networks = ReadHnsNetworks();
     Wmi hyperv(L"ROOT\\virtualization\\v2");
-    const auto switches = hyperv.Query(L"SELECT Name FROM Msvm_VirtualEthernetSwitch WHERE Name='C08CB7B8-9B3C-408E-8E30-5E16A3AEB444'");
+    const auto switches = hyperv.Query(L"SELECT Name FROM Msvm_VirtualEthernetSwitch");
     std::vector<GUID> identities;
     for (const auto& object : switches) {
         GUID guid{};
         if (!ParseGuid(Text(object.Get(), L"Name"), guid)) throw Error{L"Invalid Hyper-V switch identity."};
         identities.push_back(guid);
-    }
-    if (identities.size() != 1 || identities.front() != kDefaultSwitchId) {
-        throw Error{L"The automatic Default Switch is missing or ambiguous."};
     }
     std::vector<HostPort> ports;
     // This class represents management-OS ports, never guest synthetic ports.
@@ -145,13 +143,15 @@ Adapter ResolveWindowsTarget() {
         adapter.interface_type = static_cast<uint32_t>(type);
         adapters.push_back(std::move(adapter));
     }
-    const Adapter target = SelectTarget(identities, ports, adapters);
-    NET_LUID luid{};
-    CheckWin32(ConvertInterfaceGuidToLuid(&target.guid, &luid), L"Convert target GUID to NET_LUID");
-    GUID round_trip{};
-    CheckWin32(ConvertInterfaceLuidToGuid(&luid, &round_trip), L"Verify target NET_LUID identity");
-    if (luid.Value != target.luid || round_trip != target.guid) throw Error{L"Target GUID/NET_LUID changed during discovery."};
-    return target;
+    const Targets targets = SelectTargets(identities, ports, adapters, networks);
+    for (const auto& target : targets) {
+        NET_LUID luid{};
+        CheckWin32(ConvertInterfaceGuidToLuid(&target.guid, &luid), L"Convert target GUID to NET_LUID");
+        GUID round_trip{};
+        CheckWin32(ConvertInterfaceLuidToGuid(&luid, &round_trip), L"Verify target NET_LUID identity");
+        if (luid.Value != target.luid || round_trip != target.guid) throw Error{L"Target GUID/NET_LUID changed during discovery."};
+    }
+    return targets;
 }
 
 } // namespace hyperv_xndis_filter::setup

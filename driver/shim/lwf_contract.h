@@ -20,9 +20,6 @@ typedef enum _HV_FINISH_ROUTE {
     HvRouteFreeReceive
 } HV_FINISH_ROUTE;
 
-static int HvTargetMatches(unsigned long long target, unsigned long long actual) {
-    return target != 0 && target == actual;
-}
 static int HvIoctlInputEmpty(unsigned long inputLength) {
     return inputLength == 0;
 }

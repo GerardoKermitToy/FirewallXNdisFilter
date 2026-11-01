@@ -1,14 +1,14 @@
 # HyperVXNdisFilter
 
-Experimental Rust-based **NDIS Lightweight Filter (LWF)** and a C++ monitor with a `kext_monitor`-style API. The filter targets only the management-OS host adapter **`vEthernet (Default Switch)`**. It is not a Hyper-V switch extension or a WFP callout.
+Experimental Rust-based **NDIS Lightweight Filter (LWF)** and a C++ monitor with a `kext_monitor`-style API. The filter targets **all Hyper-V management-OS Ethernet host adapters associated with HNS networks of type `ICS`**, regardless of network, switch or adapter names. This includes Default Switch and WSL (Hyper-V firewall) when their HNS networks are ICS. It is not a Hyper-V switch extension or a WFP callout.
 
 Driver package and device API: **0.3.3.0**. Connection records add the host adapter `interface_index:u32` immediately after `id:u64`, and bandwidth group headers now carry the same index. This breaks compatibility with 0.3.2.0 and earlier event layouts; nonzero reads still wait for event data and support cancellation. Use a matching SYS and monitor; the monitor rejects older device versions.
 
-Only traffic passing through the host vNIC is covered; VM-to-VM traffic is not guaranteed to be visible. The installer and kernel check the exact adapter GUID/NET_LUID, not its display name. The standalone setup tools do not automatically retarget a recreated adapter. A compatible controller can perform validated target-only recovery as described below; otherwise explicitly uninstall and reinstall.
+Only traffic passing through these host vNICs is covered; VM-to-VM traffic is not guaranteed to be visible. The installer and kernel check the exact adapter GUID/NET_LUID, not its display name. The complete eligible ICS adapter set is captured during installation. Adding/removing an ICS target, changing network type or recreating an adapter requires explicit uninstall/reinstall; setup does not silently expand or retarget the stored set.
 
 ## Build
 
-Requires Windows x64 **build 25341+**, Hyper-V with Default Switch, Visual Studio C++ x64 tools with CMake/Ninja, Rust with the `x86_64-pc-windows-msvc` target, and WDK/SDK **10.0.28000.0**. Kernel builds are **release-only**.
+Requires Windows x64 **build 25341+**, Hyper-V with at least one HNS ICS network, Visual Studio C++ x64 tools with CMake/Ninja, Rust with the `x86_64-pc-windows-msvc` target, and WDK/SDK **10.0.28000.0**. Kernel builds are **release-only**.
 
 Cargo resolves the `no_std`-compatible `likely_stable` dependency from crates.io (or its local cache). The [WDK ABI shim](driver/shim/ndis_shim.cpp) uses C++20 branch attributes, with C linkage and exceptions/RTTI disabled. Hints favor IPv4 TCP/UDP and successful allocation; all validation and allocation-failure fallbacks remain in place.
 
@@ -36,7 +36,11 @@ Use an **elevated Administrator/SYSTEM console**, stop the monitor, and have loc
 ./dist/Install.exe
 ```
 
-The native installer reads the package beside its EXE and enables HyperVXNdisFilter only on the exact Default Switch host vNIC. `--what-if` performs read-only preflight; `--yes` skips confirmation only.
+The native installer reads the package beside its EXE and enables HyperVXNdisFilter on every eligible HNS ICS host vNIC present during installation. It never starts WSL or creates/changes HNS networks. Default Switch and WSL are examples, not a name allowlist or a mandatory pair. Non-ICS networks are excluded even if their names match those examples. No eligible ICS network, or malformed/ambiguous ICS topology, aborts installation rather than choosing a fallback. `--what-if` performs read-only preflight; `--yes` skips confirmation only.
+
+The [native HNS discovery](install/console/Hns.cpp) selects records by `Type=ICS` and obtains their `SwitchGuid`. Network IDs must be valid and unique; they need not equal switch GUIDs. Setup follows each switch through Hyper-V management-OS port associations to all of its exact host interface GUIDs and verifies their NET_LUIDs through NETIO. Shared switch references are deduplicated. The notify DLL and kernel independently enforce the resulting GUID/LUID allowlist; physical, non-Ethernet and unrelated virtual adapters remain forbidden.
+
+Target configuration uses **`ConfigVersion=3`** and an atomic `TargetAdapters` REG_BINARY allowlist: `[count:u32 LE]` followed by `count` entries of `[Windows GUID:16 bytes][NET_LUID:u64 LE]`. There is no two-adapter/fixed-capacity limit: count is positive and checked against the native `u32` value length; allocation is fallible. Zero/duplicate identities, length overflow and malformed records are rejected by the [shared codec](driver/shim/target_config.h). Writers use stable GUID ordering; comparisons do not depend on enumeration or stored entry order. Readers size the actual value and retry boundedly if it grows. This setup schema is independent of the unchanged **0.3.3.0** event/API version. Older schema-2 configurations require explicit uninstall/reinstall; `--enable` never changes a stored target set. Use a coherent SYS/notify DLL/setup package, not older limited-list binaries, and never replace an installed SYS or edit configuration manually.
 
 If installation returns **3010**, reboot, then resume explicitly:
 
@@ -48,7 +52,7 @@ If installation returns **3010**, reboot, then resume explicitly:
 
 `HKLM\SOFTWARE\HyperVXNdisFilter\Lwf` separates current attach admission (`AllowBindings`) from permission for runtime repair (`AutoRepairAllowed`). Setup durably writes `AutoRepairAllowed=0` before installation, resume or removal and publishes `1` only after the exact target paths have enabled successfully. A failed setup or a requested reboot remains installer-controlled; complete the reboot and explicit resume instead of overriding these flags.
 
-A compatible controller such as FirewallX can use `AutoRepairAllowed=1` to retry a transient runtime failure, including `AllowBindings=0`, or refresh a recreated Default Switch host-vNIC GUID/LUID. It must resolve the switch through Hyper-V topology, hold the NetCfg write lock, refuse enabled foreign paths, disarm and disable only the target paths before updating identity, and revalidate before exact-target enable. A NetCfg reboot request must block subsequent automatic repair. Legacy installations without this flag are not permission to override an already disarmed configuration. Kernel GUID/LUID and notify-object gates remain unchanged; no new service is needed. NetCfg enabled state alone is not proof of a running NDIS module.
+A compatible controller may use `AutoRepairAllowed=1` to retry a transient runtime failure only for the existing schema-3 target set. It must understand the complete allowlist, revalidate every identity through HNS/Hyper-V/NETIO, hold the NetCfg write lock, refuse enabled foreign paths, and disarm/disable only the exact target paths before re-enabling them. It must not add newly discovered ICS targets, rewrite a recreated adapter identity, or treat old single-target recovery support as schema-3 compatibility. Such changes require explicit uninstall/reinstall. A NetCfg reboot request blocks further automatic repair. NetCfg enabled state alone is not proof of a running NDIS module.
 
 ## Monitor
 
@@ -127,7 +131,7 @@ All supported IOCTLs use `CTL_CODE(40000, function, METHOD_BUFFERED, FILE_READ_D
 | `IOCTL_FILTERED_DEVICE_COUNT` | `0x802` / `0x9C40E008` | Exactly four bytes: an unsigned 32-bit little-endian count of running NDIS filter modules. The output buffer must have at least four bytes; input must be empty. No policy or binding side effects. |
 | `IOCTL_ADAPTER_INFO` | `0x803` / `0x9C40E00C` | Versioned snapshot of every attached module, including not-running modules, with host adapter identity, names, MAC, link and general NDIS attributes. Empty input; variable-size output with a 16-byte sizing header on `STATUS_BUFFER_OVERFLOW`. Both clients grow their buffer as needed. No policy, OID or binding side effects. |
 
-The count includes only modules admitted by the kernel target gate that successfully restarted and have not begun pausing. Merely configured, rejected, attached-but-paused, failed-restart and detached modules do not count. Pause removes a module immediately, even while outstanding NBLs are draining; a later successful restart adds it again. The snapshot is independent of the controller's policy-session state, so shutdown does not reset it. It describes active interception on adapters, not packet delivery, link connectivity or proof that traffic was observed. Current target isolation normally allows zero or one running device. Polling can miss brief transitions.
+The count includes only modules admitted by the kernel target gate that successfully restarted and have not begun pausing. Merely configured, rejected, attached-but-paused, failed-restart and detached modules do not count. Pause removes a module immediately, even while outstanding NBLs are draining; a later successful restart adds it again. The snapshot is independent of the controller's policy-session state, so shutdown does not reset it. It describes active interception on adapters, not packet delivery, link connectivity or proof that traffic was observed. The count is not limited to two: it follows the running modules for the configured HNS ICS host-vNIC set. Missing, paused or rejected attachments reduce it; a nonzero count still does not prove that guest traffic actually traversed the filter. Polling can miss brief transitions.
 
 All other IOCTLs are unsupported. After shutdown, close and reopen the handle to activate a new session. Closing the active handle also disconnects the controller and drains pending decisions. Shutdown does not itself close the handle or stop a custom application's read loop.
 

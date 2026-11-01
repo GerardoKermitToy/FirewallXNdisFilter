@@ -1,4 +1,4 @@
-#include "Management.h"
+#include "WindowsSupport.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -29,15 +29,27 @@ GUID Guid(const wchar_t* text) {
     return result;
 }
 
+const GUID kDefaultSwitchId = Guid(L"{10000000-0002-0003-0405-060708090A0B}");
 const GUID target_guid = Guid(L"{9EB6CA05-3905-4420-A34F-4FA09DCC6A2D}");
 const GUID foreign_guid = Guid(L"{00000001-0002-0003-0405-060708090A0B}");
+const GUID wsl_guid = Guid(L"{00000011-0002-0003-0405-060708090A0B}");
+const GUID wsl_switch = Guid(L"{00000022-0002-0003-0405-060708090A0B}");
 
 Adapter Target() { return {target_guid, 1689399750295552ull, L"Renamed host vNIC", true, false, 6}; }
+Adapter WslTarget() { return {wsl_guid, 0x1122334455667788ull, L"Renamed WSL host vNIC", true, false, 6}; }
+
+Adapter SelectFixtureTarget(const std::vector<GUID>& switches, const std::vector<HostPort>& ports,
+                            const Targets& adapters) {
+    const auto targets = SelectTargets(switches, ports, adapters, {{L"ICS", kDefaultSwitchId, kDefaultSwitchId}});
+    Require(targets.size() == 1);
+    return targets.front();
+}
 
 class FakeSystem final : public System {
 public:
     Adapter target = Target();
-    Adapter configured = target;
+    Targets extra_targets;
+    Targets configured{target};
     std::vector<Binding> bindings;
     std::vector<std::wstring> packages, removed_packages;
     std::wstring package_failure;
@@ -51,6 +63,7 @@ public:
     bool service = false, component = false, config = false, allowed = false, recovery = false;
     bool consent = true, foreign_enabled = false, target_enabled_on_install = false;
     bool change_luid_after_install = false, change_target_after_confirm = false;
+    bool change_wsl_after_confirm = false, change_wsl_luid_after_install = false, skip_wsl_enable = false;
     bool enable_has_effect = true, disable_has_effect = true, leave_service = false;
     Change install_result = Change::Complete, remove_result = Change::Complete, enable_result = Change::Complete, disable_result = Change::Complete;
 
@@ -63,30 +76,36 @@ public:
     void RequireAdministrator() override { Step("admin"); }
     void RequireSupportedOS() override { Step("os"); }
     void RequireMonitorStopped() override { Step("monitor"); }
-    Adapter ResolveTarget() override {
+    Targets CurrentTargets() const {
+        Targets result{target};
+        result.insert(result.end(), extra_targets.begin(), extra_targets.end());
+        return result;
+    }
+    Targets ResolveTargets() override {
         Step("resolve");
-        return target;
+        return CurrentTargets();
     }
     bool HasService() override { Step("service"); return service; }
     bool HasComponent() override { Step("component"); return component; }
     void ValidatePackage(const std::filesystem::path&) override { Step("package"); }
-    void VerifyConfiguration(const Adapter& adapter) override {
+    void VerifyConfiguration(const Targets& adapters) override {
         Step("verify-config");
-        if (!config || !SameTarget(configured, adapter)) throw Error{L"stale configuration"};
+        if (!config || !SameTargets(configured, adapters)) throw Error{L"stale configuration"};
     }
     bool Confirm(const std::wstring&) override {
         Step("confirm");
         if (change_target_after_confirm) target.guid = foreign_guid;
+        if (change_wsl_after_confirm) extra_targets.front().guid = foreign_guid;
         if (appear_after_confirm) service = component = true;
         if (package_after_confirmation) packages.push_back(L"oem999.inf");
         return consent;
     }
     void Print(const std::wstring& text) override { messages.push_back(text); }
     void LockNetwork() override { Step("lock"); }
-    void WriteDisarmedConfiguration(const Adapter& adapter) override {
+    void WriteDisarmedConfiguration(const Targets& adapters) override {
         config = true;
         allowed = recovery = false;
-        configured = adapter;
+        configured = adapters;
         Step("write-disarmed");
     }
     void DisarmIfPresent() override { Step("disarm"); if (config) allowed = recovery = false; }
@@ -100,7 +119,9 @@ public:
         Require(config && !allowed, "NetCfg must never install armed");
         component = service = true;
         bindings = {{target.guid, target_enabled_on_install}, {foreign_guid, foreign_enabled}};
+        for (const auto& adapter : extra_targets) bindings.push_back({adapter.guid, target_enabled_on_install});
         if (change_luid_after_install) ++target.luid;
+        if (change_wsl_luid_after_install) ++extra_targets.front().luid;
         Step("install");
         return install_result;
     }
@@ -125,19 +146,25 @@ public:
         return package_remove_result;
     }
     std::vector<Binding> ReadBindings() override { Step("bindings"); return bindings; }
-    Change DisableTarget(const Adapter& adapter) override {
-        Require(config && !allowed && SameTarget(configured, adapter), "disable must follow exact config validation and disarm");
+    Change DisableTargets(const Targets& adapters) override {
+        Require(config && !allowed && SameTargets(configured, adapters), "disable must follow exact config validation and disarm");
         Step("disable");
         if (disable_has_effect) {
-            for (auto& binding : bindings) if (binding.adapter == adapter.guid) binding.enabled = false;
+            for (auto& binding : bindings) {
+                for (const auto& adapter : adapters) if (binding.adapter == adapter.guid) binding.enabled = false;
+            }
         }
         return disable_result;
     }
-    Change EnableTarget(const Adapter& adapter) override {
-        Require(allowed && config && SameTarget(configured, adapter), "enable must follow exact config validation and arming");
+    Change EnableTargets(const Targets& adapters) override {
+        Require(allowed && config && SameTargets(configured, adapters), "enable must follow exact config validation and arming");
         Step("enable");
         if (enable_has_effect) {
-            for (auto& binding : bindings) if (binding.adapter == adapter.guid) binding.enabled = true;
+            for (auto& binding : bindings) {
+                for (const auto& adapter : adapters) {
+                    if (binding.adapter == adapter.guid && !(skip_wsl_enable && adapter.guid == wsl_guid)) binding.enabled = true;
+                }
+            }
         }
         return enable_result;
     }
@@ -156,8 +183,9 @@ public:
     }
     void Installed() {
         service = component = config = true;
-        configured = target;
+        configured = CurrentTargets();
         bindings = {{target.guid, false}, {foreign_guid, false}};
+        for (const auto& adapter : extra_targets) bindings.push_back({adapter.guid, false});
     }
 };
 
@@ -205,21 +233,21 @@ int main() {
         {"target resolution uses switch connections and GUID, never alias", [] {
             const HostPort port{L"Microsoft:{9EB6CA05-3905-4420-A34F-4FA09DCC6A2D}", {kDefaultSwitchId}};
             auto target = Target();
-            const auto selected = SelectTarget({kDefaultSwitchId}, {port}, {target});
+            const auto selected = SelectFixtureTarget({kDefaultSwitchId}, {port}, {target});
             Require(SameTarget(selected, target));
             target.name = L"a localized alias";
-            Require(SelectTarget({kDefaultSwitchId}, {port}, {target}).name == target.name);
-            Throws([&] { SelectTarget({}, {port}, {target}); }, L"missing or ambiguous");
-            Throws([&] { SelectTarget({kDefaultSwitchId, kDefaultSwitchId}, {port}, {target}); }, L"missing or ambiguous");
-            Throws([&] { SelectTarget({kDefaultSwitchId}, {port, port}, {target}); }, L"unambiguous");
-            Throws([&] { SelectTarget({kDefaultSwitchId}, {}, {target}); }, L"management-OS");
-            Throws([&] { SelectTarget({kDefaultSwitchId}, {{port.device_id, {foreign_guid}}}, {target}); }, L"management-OS");
-            Throws([&] { SelectTarget({kDefaultSwitchId}, {{port.device_id, {kDefaultSwitchId, foreign_guid}}}, {target}); }, L"unambiguous");
-            Throws([&] { SelectTarget({kDefaultSwitchId}, {port}, {}); }, L"not found");
-            Throws([&] { SelectTarget({kDefaultSwitchId}, {port}, {target, target}); }, L"ambiguous");
+            Require(SelectFixtureTarget({kDefaultSwitchId}, {port}, {target}).name == target.name);
+            Throws([&] { SelectFixtureTarget({}, {port}, {target}); }, L"missing or ambiguous");
+            Throws([&] { SelectFixtureTarget({kDefaultSwitchId, kDefaultSwitchId}, {port}, {target}); }, L"missing or ambiguous");
+            Throws([&] { SelectFixtureTarget({kDefaultSwitchId}, {port, port}, {target}); }, L"ambiguous");
+            Throws([&] { SelectFixtureTarget({kDefaultSwitchId}, {}, {target}); }, L"management-OS");
+            Throws([&] { SelectFixtureTarget({kDefaultSwitchId}, {{port.device_id, {foreign_guid}}}, {target}); }, L"management-OS");
+            Throws([&] { SelectFixtureTarget({kDefaultSwitchId}, {{port.device_id, {kDefaultSwitchId, foreign_guid}}}, {target}); }, L"ambiguous");
+            Throws([&] { SelectFixtureTarget({kDefaultSwitchId}, {port}, {}); }, L"not found");
+            Throws([&] { SelectFixtureTarget({kDefaultSwitchId}, {port}, {target, target}); }, L"ambiguous");
             target.guid = foreign_guid;
             target.name = L"vEthernet (Default Switch)";
-            Throws([&] { SelectTarget({kDefaultSwitchId}, {port}, {target}); }, L"not found");
+            Throws([&] { SelectFixtureTarget({kDefaultSwitchId}, {port}, {target}); }, L"not found");
         }},
         {"invalid port GUIDs and non-host Ethernet adapters are rejected", [] {
             for (const auto text : {L"not-a-guid", L"Microsoft:not-a-guid", L"Microsoft:{00000000-0000-0000-0000-000000000000}", L"{9EB6CA05-3905-4420-A34F-4FA09DCC6A2D}"}) {
@@ -232,18 +260,142 @@ int main() {
                 if (condition == 1) target.hardware = true;
                 if (condition == 2) target.interface_type = 71;
                 if (condition == 3) target.luid = 0;
-                Throws([&] { SelectTarget({kDefaultSwitchId}, {port}, {target}); }, L"Ethernet host vNIC");
+                Throws([&] { SelectFixtureTarget({kDefaultSwitchId}, {port}, {target}); }, L"Ethernet host vNIC");
             }
         }},
         {"all exact target paths are required; foreign enabled paths are rejected", [] {
             const auto target = Target();
-            ValidateBindings({{target.guid, false}, {target.guid, false}, {foreign_guid, false}}, target, true);
-            ValidateBindings({{target.guid, true}, {target.guid, true}, {foreign_guid, false}}, target, false, true);
-            Throws([&] { ValidateBindings({{target.guid, true}}, target, true); }, L"unexpectedly enabled");
-            Throws([&] { ValidateBindings({{target.guid, true}, {foreign_guid, true}}, target, false); }, L"unexpectedly enabled");
-            Throws([&] { ValidateBindings({{target.guid, true}, {target.guid, false}}, target, false, true); }, L"did not enable");
-            Throws([&] { ValidateBindings({{foreign_guid, false}}, target, false); }, L"No HyperVXNdisFilter binding");
-            Throws([&] { ValidateBindings({{GUID_NULL, false}}, target, false); }, L"ambiguous");
+            ValidateBindings({{target.guid, false}, {target.guid, false}, {foreign_guid, false}}, {target}, true);
+            ValidateBindings({{target.guid, true}, {target.guid, true}, {foreign_guid, false}}, {target}, false, true);
+            Throws([&] { ValidateBindings({{target.guid, true}}, {target}, true); }, L"unexpectedly enabled");
+            Throws([&] { ValidateBindings({{target.guid, true}, {foreign_guid, true}}, {target}, false); }, L"unexpectedly enabled");
+            Throws([&] { ValidateBindings({{target.guid, true}, {target.guid, false}}, {target}, false, true); }, L"did not enable");
+            Throws([&] { ValidateBindings({{foreign_guid, false}}, {target}, false); }, L"No HyperVXNdisFilter binding");
+            Throws([&] { ValidateBindings({{GUID_NULL, false}}, {target}, false); }, L"ambiguous");
+        }},
+        {"ICS JSON selection depends on type and switch GUID, never names", [] {
+            const auto networks = ParseHnsNetworks(LR"json({"Success":true,"Output":[{"Name":"WSL (Hyper-V firewall)","Type":"NAT"},{"Name":"arbitrary","Type":"ICS","ID":"00000001-0002-0003-0405-060708090A0B","SwitchGuid":"00000022-0002-0003-0405-060708090A0B"},{"Type":"ICS","ID":"10000000-0002-0003-0405-060708090A0B","SwitchGuid":"10000000-0002-0003-0405-060708090A0B"}]})json");
+            Require(networks.size() == 2);
+            Require(SelectIcsSwitches(networks) == std::vector<GUID>{wsl_switch, kDefaultSwitchId});
+            Require(ParseHnsNetworks(LR"json({"Success":true,"Output":[]})json").empty());
+            for (const auto text : {
+                LR"json({"Success":false,"Output":[]})json", LR"json({"Output":[]})json",
+                LR"json({"Success":true,"Output":{}})json", LR"json({"Success":true,"Output":[{"Name":"Default Switch"}]})json",
+                LR"json({"Success":true,"Output":[{"Type":"ICS","ID":"not-a-guid","SwitchGuid":"not-a-guid"}]})json",
+                L"not JSON"}) {
+                Throws([&] { ParseHnsNetworks(text); }, L"HNS");
+            }
+        }},
+        {"all ICS switch identities are validated and shared switches are deduplicated", [] {
+            const HnsNetwork network{L"ICS", foreign_guid, wsl_switch};
+            Require(SelectIcsSwitches({network}) == std::vector<GUID>{wsl_switch});
+            Require(SelectIcsSwitches({{L"NAT", GUID_NULL, GUID_NULL}}).empty());
+            Require(SelectIcsSwitches({network, {L"ICS", kDefaultSwitchId, wsl_switch}}).size() == 1);
+            Throws([&] { SelectIcsSwitches({network, network}); }, L"invalid or ambiguous");
+            Throws([&] { SelectIcsSwitches({{L"ICS", GUID_NULL, wsl_switch}}); }, L"invalid or ambiguous");
+            Throws([&] { SelectIcsSwitches({{L"ICS", wsl_switch, GUID_NULL}}); }, L"invalid or ambiguous");
+        }},
+        {"ICS selection does not require Default Switch or WSL to exist", [] {
+            const HostPort port{L"Microsoft:{9EB6CA05-3905-4420-A34F-4FA09DCC6A2D}", {wsl_switch}};
+            const HnsNetwork network{L"ICS", foreign_guid, wsl_switch};
+            const auto selected = SelectTargets({wsl_switch}, {port}, {Target()}, {network});
+            Require(SameTargets(selected, {Target()}));
+            Throws([&] { SelectTargets({wsl_switch}, {port}, {Target()}, {}); }, L"No HNS ICS");
+            Throws([&] { SelectTargets({wsl_switch}, {port}, {Target()}, {{L"NAT", foreign_guid, wsl_switch}}); }, L"No HNS ICS");
+        }},
+        {"every management-OS Ethernet vNIC on an ICS switch is selected", [] {
+            const HnsNetwork network{L"ICS", wsl_switch, wsl_switch};
+            const HostPort first{L"Microsoft:{9EB6CA05-3905-4420-A34F-4FA09DCC6A2D}", {wsl_switch}};
+            const HostPort second{L"Microsoft:{00000011-0002-0003-0405-060708090A0B}", {wsl_switch}};
+            const auto targets = SelectTargets({wsl_switch}, {first, second}, {Target(), WslTarget()}, {network});
+            Require(SameTargets(targets, {Target(), WslTarget()}));
+            Require(SameTargets(targets, SelectTargets({wsl_switch}, {second, first}, {WslTarget(), Target()}, {network})));
+            Throws([&] { SelectTargets({}, {first}, {Target()}, {network}); }, L"missing or ambiguous");
+            Throws([&] { SelectTargets({wsl_switch}, {}, {Target()}, {network}); }, L"management-OS");
+            auto spoof = Target(); spoof.guid = foreign_guid; spoof.name = L"vEthernet (Default Switch)";
+            Throws([&] { SelectTargets({wsl_switch}, {first}, {spoof}, {network}); }, L"not found");
+            Throws([&] { SelectTargets({wsl_switch}, {first, first}, {Target()}, {network}); }, L"ambiguous");
+        }},
+        {"ICS topology selection grows beyond two targets and excludes non-ICS switches", [] {
+            std::vector<GUID> switches;
+            std::vector<HostPort> ports;
+            Targets adapters;
+            std::vector<HnsNetwork> networks;
+            for (unsigned i = 0; i < 129; ++i) {
+                const GUID switch_id{0x20000000 + i, 0, 0, {}};
+                const GUID adapter_id{0x30000000 + i, 0, 0, {}};
+                switches.push_back(switch_id);
+                ports.push_back({L"Microsoft:" + GuidText(adapter_id), {switch_id}});
+                adapters.push_back({adapter_id, 1000ull + i, L"arbitrary adapter", true, false, 6});
+                networks.push_back({L"ICS", switch_id, switch_id});
+            }
+            switches.push_back(kDefaultSwitchId);
+            ports.push_back({L"Microsoft:" + GuidText(target_guid), {kDefaultSwitchId}});
+            adapters.push_back(Target());
+            networks.push_back({L"NAT", kDefaultSwitchId, kDefaultSwitchId});
+            const auto targets = SelectTargets(switches, ports, adapters, networks);
+            Require(targets.size() == 129);
+            Require(std::none_of(targets.begin(), targets.end(), [](const Adapter& target) { return target.guid == target_guid; }));
+            std::reverse(networks.begin(), networks.end());
+            std::reverse(ports.begin(), ports.end());
+            const auto reordered = SelectTargets(switches, ports, adapters, networks);
+            Require(std::equal(targets.begin(), targets.end(), reordered.begin(), SameTarget));
+        }},
+        {"target allowlist rejects duplicate identities but has no two-adapter quota", [] {
+            ValidateTargets({Target(), WslTarget(), {wsl_switch, 777, L"third", true, false, 6}});
+            Throws([&] { ValidateTargets({}); }, L"count");
+            Throws([&] { ValidateTargets({Target(), WslTarget(), WslTarget()}); }, L"ambiguous");
+            auto wsl = WslTarget(); wsl.guid = target_guid;
+            Throws([&] { ValidateTargets({Target(), wsl}); }, L"ambiguous");
+            wsl = WslTarget(); wsl.luid = Target().luid;
+            Throws([&] { ValidateTargets({Target(), wsl}); }, L"ambiguous");
+        }},
+        {"setup enables more than two exact targets without editing a foreign path", [] {
+            FakeSystem system;
+            system.extra_targets = {WslTarget(), {wsl_switch, 777, L"third", true, false, 6}};
+            Require(Execute(Install(), system) == 0);
+            Require(system.configured.size() == 3 && system.bindings.size() == 4);
+            Require(system.bindings[0].enabled && !system.bindings[1].enabled && system.bindings[2].enabled && system.bindings[3].enabled);
+        }},
+        {"both exact adapters are enabled but every foreign binding stays disabled", [] {
+            FakeSystem system; system.extra_targets = {WslTarget()}; system.target_enabled_on_install = true;
+            Require(Execute(Install(), system) == 0);
+            Require(SameTargets(system.configured, {Target(), WslTarget()}));
+            Require(system.bindings[0].enabled && !system.bindings[1].enabled && system.bindings[2].enabled);
+            Require(system.At("disable") < system.At("arm") && system.At("arm") < system.At("enable"));
+        }},
+        {"WSL recreation during confirmation or installation cannot arm targets", [] {
+            for (const bool during_install : {false, true}) {
+                FakeSystem system; system.extra_targets = {WslTarget()};
+                system.change_wsl_after_confirm = !during_install;
+                system.change_wsl_luid_after_install = during_install;
+                Throws([&] { Execute(Install(), system); }, L"changed");
+                Require(!system.Called("arm") && !system.allowed);
+                Require(system.Called("remove") == during_install);
+            }
+        }},
+        {"partial two-adapter enable is failure, not single-adapter success", [] {
+            FakeSystem system; system.extra_targets = {WslTarget()}; system.skip_wsl_enable = true;
+            Throws([&] { Execute(Install(), system); }, L"did not enable");
+            Require(system.Called("remove") && !system.allowed && !system.recovery);
+        }},
+        {"resume never adds newly appearing WSL or drops a missing configured WSL", [] {
+            for (const bool disappears : {false, true}) {
+                FakeSystem system;
+                if (disappears) system.extra_targets = {WslTarget()};
+                system.Installed();
+                if (disappears) system.extra_targets.clear();
+                else system.extra_targets = {WslTarget()};
+                Throws([&] { Execute(Enable(), system); }, L"stale configuration");
+                system.RequireNoMutation();
+            }
+        }},
+        {"both adapters require paths and reject an enabled foreign path", [] {
+            const Targets targets{Target(), WslTarget()};
+            ValidateBindings({{target_guid, true}, {wsl_guid, true}, {foreign_guid, false}}, targets, false, true);
+            Throws([&] { ValidateBindings({{target_guid, false}}, targets, false); }, L"No HyperVXNdisFilter binding");
+            Throws([&] { ValidateBindings({{target_guid, true}, {wsl_guid, false}}, targets, false, true); }, L"did not enable");
+            Throws([&] { ValidateBindings({{target_guid, true}, {wsl_guid, true}, {foreign_guid, true}}, targets, false); }, L"unexpectedly enabled");
         }},
         {"fresh install orders validation, disarm, NetCfg, arm and exact enable", [] {
             FakeSystem system;
@@ -381,7 +533,7 @@ int main() {
             FakeSystem missing;
             Throws([&] { Execute(Enable(), missing); }, L"not installed");
             missing.RequireNoMutation();
-            FakeSystem stale; stale.Installed(); ++stale.configured.luid;
+            FakeSystem stale; stale.Installed(); ++stale.configured.front().luid;
             Throws([&] { Execute(Enable(), stale); }, L"stale");
             stale.RequireNoMutation();
         }},

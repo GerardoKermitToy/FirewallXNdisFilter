@@ -27,13 +27,6 @@ int main() {
     CHECK(HvOidHandlerReturn(0) == 0);
     CHECK(HvOidHandlerReturn(-1) == -1);
 
-    CHECK(!HvTargetMatches(0, 0));
-    CHECK(!HvTargetMatches(0, 123));
-    CHECK(!HvTargetMatches(123, 0));
-    CHECK(!HvTargetMatches(123, 124));
-    CHECK(HvTargetMatches(123, 123));
-    CHECK(HvTargetMatches(ULLONG_MAX, ULLONG_MAX));
-
     unsigned char first = 0, second = 0;
     int active = 0;
     // Attach starts paused. Repeated transitions must not double-count a device.

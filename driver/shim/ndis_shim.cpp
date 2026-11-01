@@ -5,6 +5,7 @@
 #include "lwf_contract.h"
 #include "driver_ready.h"
 #include "adapter_info.h"
+#include "target_config.h"
 
 // C++20 branch attributes are hints only; retain the Rust/NDIS C ABI.
 extern "C" {
@@ -1039,41 +1040,42 @@ static ULONG ReadDword(HANDLE key, PCWSTR name, ULONG fallback) {
         info->Type == REG_DWORD && info->DataLength == sizeof(ULONG)) return *(ULONG*)info->Data;
     return fallback;
 }
-static UINT64 ReadQword(HANDLE key, PCWSTR name) {
-    UNICODE_STRING value;
-    UCHAR buffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(UINT64)];
-    PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buffer;
-    ULONG size;
-    UINT64 result = 0;
-    RtlInitUnicodeString(&value, name);
-    if (NT_SUCCESS(ZwQueryValueKey(key, &value, KeyValuePartialInformation, buffer, sizeof(buffer), &size)) &&
-        info->Type == REG_QWORD && info->DataLength == sizeof(result)) RtlCopyMemory(&result, info->Data, sizeof(result));
-    return result;
-}
 static BOOLEAN TargetAdapter(PNDIS_FILTER_ATTACH_PARAMETERS p, GUID* interfaceGuid) {
     UNICODE_STRING path = RTL_CONSTANT_STRING(L"\\Registry\\Machine\\SOFTWARE\\HyperVXNdisFilter\\Lwf");
-    UNICODE_STRING name = RTL_CONSTANT_STRING(L"TargetInterfaceGuid");
-    UNICODE_STRING text;
+    UNICODE_STRING name = RTL_CONSTANT_STRING(L"TargetAdapters");
     OBJECT_ATTRIBUTES attributes;
     HANDLE key;
-    UCHAR buffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 40 * sizeof(WCHAR)];
-    PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buffer;
-    ULONG size;
-    GUID target, actual;
+    PKEY_VALUE_PARTIAL_INFORMATION info = NULL;
+    GUID actual;
     BOOLEAN match = FALSE;
+    const ULONG prefix = FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data);
     InitializeObjectAttributes(&attributes, &path, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
     if (!NT_SUCCESS(ZwOpenKey(&key, KEY_READ, &attributes))) return FALSE;
-    if (ReadDword(key, L"ConfigVersion", 0) != 2 || ReadDword(key, L"AllowBindings", 0) != 1) goto Exit;
-    if (!HvTargetMatches(ReadQword(key, L"TargetNetLuid"), p->BaseMiniportNetLuid.Value)) goto Exit;
-    if (!NT_SUCCESS(ZwQueryValueKey(key, &name, KeyValuePartialInformation, buffer, sizeof(buffer), &size)) ||
-        info->Type != REG_SZ || info->DataLength != 39 * sizeof(WCHAR)) goto Exit;
-    text.Buffer = (PWCHAR)info->Data;
-    text.Length = 38 * sizeof(WCHAR); text.MaximumLength = 39 * sizeof(WCHAR);
-    if (text.Buffer[38] != 0 || !NT_SUCCESS(RtlGUIDFromString(&text, &target))) goto Exit;
-    if (!NT_SUCCESS(ConvertInterfaceLuidToGuid(&p->BaseMiniportNetLuid, &actual))) goto Exit;
-    match = RtlEqualMemory(&target, &actual, sizeof(GUID));
-    if (match) *interfaceGuid = actual;
+    if (ReadDword(key, L"ConfigVersion", 0) != HV_TARGET_CONFIG_VERSION || ReadDword(key, L"AllowBindings", 0) != 1) goto Exit;
+    // Attach runs at PASSIVE_LEVEL, before module allocation and without NDIS or
+    // policy locks. Size the actual value; never put an adapter-sized list on stack.
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        ULONG needed = 0, returned = 0;
+        NTSTATUS status = ZwQueryValueKey(key, &name, KeyValuePartialInformation, NULL, 0, &needed);
+        if ((status != STATUS_BUFFER_TOO_SMALL && status != STATUS_BUFFER_OVERFLOW) || needed < prefix + 4) break;
+        info = (PKEY_VALUE_PARTIAL_INFORMATION)ExAllocatePool2(POOL_FLAG_NON_PAGED, needed, TAG);
+        if (info == NULL) break;
+        status = ZwQueryValueKey(key, &name, KeyValuePartialInformation, info, needed, &returned);
+        if (status == STATUS_BUFFER_TOO_SMALL || status == STATUS_BUFFER_OVERFLOW) {
+            ExFreePoolWithTag(info, TAG); info = NULL;
+            continue;
+        }
+        if (!NT_SUCCESS(status) || returned < prefix || returned > needed || info->Type != REG_BINARY ||
+            info->DataLength > returned - prefix || !HvTargetsValid(info->Data, info->DataLength)) break;
+        if (ReadDword(key, L"ConfigVersion", 0) != HV_TARGET_CONFIG_VERSION || ReadDword(key, L"AllowBindings", 0) != 1) break;
+        if (!NT_SUCCESS(ConvertInterfaceLuidToGuid(&p->BaseMiniportNetLuid, &actual))) break;
+        match = (BOOLEAN)HvTargetsMatch(info->Data, info->DataLength,
+            reinterpret_cast<const unsigned char*>(&actual), p->BaseMiniportNetLuid.Value);
+        if (match) *interfaceGuid = actual;
+        break;
+    }
 Exit:
+    if (info != NULL) ExFreePoolWithTag(info, TAG);
     ZwClose(key); return match;
 }
 static void ReadConfiguration(PUNICODE_STRING registry) {

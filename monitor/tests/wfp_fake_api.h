@@ -364,6 +364,8 @@ struct FilterRecord {
     UINT64 id = 0;
     GUID layer{};
     GUID callout{};
+    GUID sublayer{};
+    UINT16_t sublayer_weight = 0;
     ULONG condition_count = 0;
     BOOLEAN has_condition_pointer = FALSE;
     FWP_ACTION_TYPE action_type = 0;
@@ -374,6 +376,8 @@ struct FakeEngine {
     UINT64 serial = 0;
     BOOLEAN live = FALSE;
     BOOLEAN in_transaction = FALSE;
+    GUID sublayer{};
+    UINT16_t sublayer_weight = 0;
     std::vector<FilterRecord> staged_filters;
 };
 struct FakeSubscription {
@@ -978,11 +982,14 @@ inline NTSTATUS FwpmProviderAdd0(HANDLE engine_handle, const FWPM_PROVIDER0*, vo
     hv_wfp_fake::FakeEngine* engine = hv_wfp_fake::RequireLiveEngine(engine_handle);
     return engine != nullptr && engine->in_transaction ? STATUS_SUCCESS : STATUS_INVALID_HANDLE;
 }
-inline NTSTATUS FwpmSubLayerAdd0(HANDLE engine_handle, const FWPM_SUBLAYER0*, void*) {
+inline NTSTATUS FwpmSubLayerAdd0(HANDLE engine_handle, const FWPM_SUBLAYER0* sublayer, void*) {
     NTSTATUS failure = STATUS_SUCCESS;
     if (hv_wfp_fake::TakeFailure(hv_wfp_fake::FailurePoint::sublayer_add, &failure)) return failure;
     hv_wfp_fake::FakeEngine* engine = hv_wfp_fake::RequireLiveEngine(engine_handle);
-    return engine != nullptr && engine->in_transaction ? STATUS_SUCCESS : STATUS_INVALID_HANDLE;
+    if (engine == nullptr || !engine->in_transaction || sublayer == nullptr) return STATUS_INVALID_PARAMETER;
+    engine->sublayer = sublayer->subLayerKey;
+    engine->sublayer_weight = sublayer->weight;
+    return STATUS_SUCCESS;
 }
 inline NTSTATUS FwpmCalloutAdd0(HANDLE engine_handle, const FWPM_CALLOUT0*, void*, UINT32*) {
     NTSTATUS failure = STATUS_SUCCESS;
@@ -995,12 +1002,15 @@ inline NTSTATUS FwpmFilterAdd0(HANDLE engine_handle, const FWPM_FILTER0* filter,
     if (hv_wfp_fake::TakeFailure(hv_wfp_fake::FailurePoint::filter_add, &failure)) return failure;
     hv_wfp_fake::FakeEngine* engine = hv_wfp_fake::RequireLiveEngine(engine_handle);
     if (engine == nullptr || !engine->in_transaction || filter == nullptr ||
+        !(filter->subLayerKey == engine->sublayer) ||
         (filter->numFilterConditions != 0 && filter->filterCondition == nullptr)) return STATUS_INVALID_PARAMETER;
     hv_wfp_fake::FilterRecord record{};
     record.engine_serial = engine->serial;
     record.id = (engine->serial << 32) | hv_wfp_fake::state().next_filter_serial++;
     record.layer = filter->layerKey;
     record.callout = filter->action.calloutKey;
+    record.sublayer = filter->subLayerKey;
+    record.sublayer_weight = engine->sublayer_weight;
     record.condition_count = filter->numFilterConditions;
     record.has_condition_pointer = filter->filterCondition != nullptr;
     record.action_type = filter->action.type;

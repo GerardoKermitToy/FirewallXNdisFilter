@@ -58,7 +58,7 @@ A compatible controller may use `AutoRepairAllowed=1` to retry a transient runti
 
 ### Forwarded IPv4/IPv6
 
-The same SYS registers callouts at `FWPM_LAYER_IPFORWARD_V4` and `FWPM_LAYER_IPFORWARD_V6`. No separate WFP installer, service, controller or protocol is needed. [WFP registration](driver/shim/wfp_forward.cpp) creates **two unconditional dynamic filters**, one per family. They do not depend on HNS discovery, NDIS bindings, an adapter allowlist, or an attached LWF module. A route between two NDIS targets is not rejected merely for that reason.
+The same SYS registers callouts at `FWPM_LAYER_IPFORWARD_V4` and `FWPM_LAYER_IPFORWARD_V6`. No separate WFP installer, service, controller or protocol is needed. [WFP registration](driver/shim/wfp_forward.cpp) creates **two unconditional dynamic filters**, one per family, in the shared private sublayer requesting **weight `0x7FFF`**, below **`FWPM_SUBLAYER_UNIVERSAL` (`0x8000`)**. BFE may assign a nearby available weight if the requested value is already occupied. They do not depend on HNS discovery, NDIS bindings, an adapter allowlist, or an attached LWF module. A route between two NDIS targets is not rejected merely for that reason.
 
 Both sources use **one policy engine and the same pending/event, cache and bandwidth structures**. The public verdict ID identifies the one pending record holding the actual NBL. There is no separate opaque packet token, token hash table, policy generation or source-specific flow mirror. The NBL itself carries only the ownership/completion context required by NDIS or WFP. Forwarding interfaces join the existing per-interface cache state when observed; WFP does not enumerate NETIO interfaces or schedule extra cache resets/work on interface connect/disconnect. Existing NDIS pause/detach invalidation remains in place.
 
@@ -92,7 +92,13 @@ For an interactive session, omit `--duration` and exit with **Ctrl+C**:
 ./dist/hyperv_monitor.exe
 ```
 
-Without `--duration`, an open failure makes the monitor create/open `Global\HyperVXNdisFilter.DriverReady` and wait for driver startup. Ctrl+C also cancels this wait. With a positive `--duration N`, it never waits for startup: an open failure exits immediately; a successful session stops after N seconds. Use `--duration` for automated/live tests; zero, negative and malformed values remain invalid.
+If `\\.\HyperVXNdisFilter` is absent, the monitor loads `HyperVXNdisFilter.sys` from its **EXE directory**, or from `--sys PATH`. It creates a temporary demand-start kernel service when none exists, setting its `Parameters\StandaloneWfp=1`: this loads **WFP IPFORWARD and the control device only**, without installing a NetCfg component or creating NDIS bindings. Loading requires elevation and a SYS accepted by Windows signing policy. An existing service is never reconfigured; an explicit conflicting SYS path is refused. Busy-device and access-denied errors do not trigger loading.
+
+```bash
+./dist/hyperv_monitor.exe --sys 'C:/drivers/HyperVXNdisFilter.sys' --duration 15
+```
+
+Without `--duration`, monitoring ends on Ctrl+C. A positive `--duration N` limits monitoring, not the synchronous SCM load. Startup failures return an error rather than waiting indefinitely. Zero, negative and malformed durations remain invalid.
 
 The monitor prints `Filtered network devices: N (running NDIS modules)` after the version check and whenever the count changes, checking at the `--poll` interval (default 1000 ms). This is the driver's live attachment/running-state count, not the number of configured or enabled bindings. A loaded driver can report zero. Status lines honor `--out` and `--timestamps`. If the installed SYS lacks the new IOCTL or a query fails, the monitor warns that the count is unavailable rather than reporting zero; monitoring continues and later polls retry.
 
@@ -102,7 +108,7 @@ Each `[CONN v4]` / `[CONN v6]` header prints `interface_index=N` immediately aft
 
 `--match` selects the remote endpoint in both directions; unmatched events receive PermanentAccept. `--filter-ip` only filters output, not verdicts. A blocking verdict without `--match` applies to every event and can disconnect host-vNIC or routed traffic.
 
-The monitor never installs, unbinds, or uninstalls the filter. Exiting closes the policy session; the LWF remains installed and bound and drops target-interface NDIS IP traffic and all IPFORWARD traffic by default until a controller reconnects. Use `--help` for all options without opening the device.
+On exit, the monitor closes its device session before stopping a driver it started and deleting a service it created. A previously running driver is left running; a preexisting stopped service started by the monitor is stopped but not deleted. Cleanup also runs after startup/version errors; stop/delete failures are reported. Forced process termination cannot guarantee cleanup. A driver installed through NetCfg remains installed/bound; use `Uninstall.exe` to remove it. `--help` performs no device or SCM access.
 
 ## Remove
 
@@ -211,7 +217,7 @@ Names longer than 255 UTF-16 code units are bounded explicitly, with the corresp
 
 `Global\HyperVXNdisFilter.DriverReady` (kernel name `\BaseNamedObjects\HyperVXNdisFilter.DriverReady`) is a named manual-reset event, separate from the device byte stream and IOCTLs. New objects allow access only to Administrator/SYSTEM. At startup, after initializing the control device and timer, the driver creates/opens the event, signals it, and keeps its handle until unload; unload clears the event and closes the handle. This requires the updated SYS, not just the monitor. Event creation is best-effort if the global object directory is not yet available during early system boot; device initialization does not depend on notification success.
 
-Only the console monitor's **unlimited mode** uses startup waiting. It first tries `Driver::Open`. On failure it creates/opens the event, clears it **before** retrying the device, and waits only if that retry also fails. A signal causes another reset/retry; a stale signal cannot cause a busy loop. Wait timeouts check Ctrl+C at 100 ms intervals without polling the device. A signal is only a retry hint, not proof of successful NDIS attachment, device authorization, compatible version or packet interception. The monitor never installs or loads the LWF while waiting; another application releasing an exclusive device handle does not itself generate a startup signal. No automatic reconnect is added after an established session ends.
+The header-only client uses reset-before-retry startup waiting on this event, without device polling. A signal is only a retry hint, not proof of NDIS attachment, device authorization or version compatibility. The console monitor instead attempts temporary SCM loading when the device is absent; it does not wait on the readiness event or reconnect after an established session ends.
 
 ### C++ client methods
 
@@ -219,7 +225,7 @@ Construct `Driver(std::wstring service_name = L"HyperVXNdisFilter")`; the argume
 
 | Method | Contract |
 |---|---|
-| `bool Open(std::string& error)` | Opens the already installed device. Fails if this client session is already open. Does not install, bind, or negotiate the version. |
+| `bool Open(std::string& error)` | Opens the existing device, preserving the Win32 failure code in `GetLastError()`. Fails if this client session is already open. Does not install, bind, load or negotiate the version. |
 | `bool GetVersion(uint8_t out[4], std::string& error)` | Reads the four-byte version; integrations should require `0.3.3.0`. |
 | `bool GetFilteredDeviceCount(uint32_t& out, std::string& error)` | Synchronously reads the running-module snapshot through `IOCTL_FILTERED_DEVICE_COUNT`. Requires exactly four response bytes. On failure returns false and leaves `out` unchanged; an unsupported request means unavailable, not zero. |
 | `bool GetAdapterInfo(AdapterSnapshot& out, std::string& error)` | Synchronously reads and validates the complete variable-size attached-module snapshot described above, growing the query buffer as needed. Includes not-running modules; owning strings/arrays remain valid after return. Leaves `out` unchanged on failure, including malformed output or allocation failure. |

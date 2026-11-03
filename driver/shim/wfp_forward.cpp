@@ -330,7 +330,7 @@ NTSTATUS OpenEngine() {
     sublayer.subLayerKey = SublayerKey;
     sublayer.displayData.name = const_cast<PWSTR>(L"HyperVXNdisFilter forwarding");
     sublayer.providerKey = const_cast<GUID*>(&ProviderKey);
-    sublayer.weight = 0x100;
+    sublayer.weight = 0x7FFF;
     status = FwpmSubLayerAdd0(Engine, &sublayer, NULL);
     if (!NT_SUCCESS(status)) goto Abort;
     for (ULONG family = 0; family != 2; ++family) {

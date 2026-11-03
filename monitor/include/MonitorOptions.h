@@ -17,7 +17,8 @@ struct Endpoint {
 
 struct Options {
     std::wstring out_path;
-    unsigned duration_s = 0; // Omitted: wait for startup and run until Ctrl+C.
+    std::wstring sys_path; // Empty: HyperVXNdisFilter.sys beside the monitor EXE.
+    unsigned duration_s = 0; // Omitted: run until Ctrl+C.
     unsigned poll_ms = 1000;
     unsigned verdict_delay_ms = 0;
     bool show_connections = true;

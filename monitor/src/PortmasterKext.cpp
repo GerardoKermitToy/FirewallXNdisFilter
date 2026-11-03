@@ -206,6 +206,7 @@ bool Driver::Install(const std::wstring&, std::string& error, bool) {
 bool Driver::Open(std::string& error) {
     if (device_ != nullptr || stop_event_ != nullptr) {
         error = "device session is already open";
+        SetLastError(ERROR_ALREADY_EXISTS);
         return false;
     }
     const std::wstring path = L"\\\\.\\" + service_name_;
@@ -213,8 +214,10 @@ bool Driver::Open(std::string& error) {
                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
                                 nullptr);
     if (device == INVALID_HANDLE_VALUE) {
-        error = "CreateFile on installed device failed: " + LastErrorText(GetLastError()) +
-                "; install/bind the LWF explicitly and run elevated";
+        const DWORD status = GetLastError();
+        error = "CreateFile on device failed: " + LastErrorText(status) +
+                "; ensure the driver is loaded and run elevated";
+        SetLastError(status);
         return false;
     }
     HANDLE stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -222,6 +225,7 @@ bool Driver::Open(std::string& error) {
         const DWORD status = GetLastError();
         CloseHandle(device);
         error = "CreateEvent failed: " + LastErrorText(status);
+        SetLastError(status);
         return false;
     }
     device_ = device;
@@ -229,6 +233,7 @@ bool Driver::Open(std::string& error) {
     shutdown_requested_.store(false, std::memory_order_release);
     records_->Reset();
     error.clear();
+    SetLastError(ERROR_SUCCESS);
     return true;
 }
 

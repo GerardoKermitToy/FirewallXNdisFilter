@@ -124,8 +124,12 @@ bool ParseOptions(int argc, const wchar_t* const* argv, Options& opt, std::strin
         } else if (arg == L"--no-verdicts") {
             opt.send_verdicts = false;
         } else if (arg == L"--sys") {
-            error = "--sys/automatic SCM installation is not supported; use dist/Install.exe and bind the LWF explicitly";
-            return false;
+            std::wstring_view path;
+            if (!opt.sys_path.empty() || !next(path) || path.empty() || path.starts_with(L"--")) {
+                error = "--sys needs one nonempty SYS path and may be specified only once";
+                return false;
+            }
+            opt.sys_path = path;
         } else if (arg == L"--suspend-pid-on-verdict-delay") {
             error = "PID suspension is not supported: NDIS LWF events have no process owner";
             return false;
@@ -173,7 +177,7 @@ bool ParseOptions(int argc, const wchar_t* const* argv, Options& opt, std::strin
             opt.has_filter_protocol = true;
             opt.filter_protocol = static_cast<uint8_t>(protocol);
         } else {
-            error = "unknown option or positional driver path; use --help (automatic driver loading is not supported)";
+            error = "unknown option or positional driver path; use --sys PATH or --help";
             return false;
         }
     }
@@ -206,15 +210,15 @@ void PrintUsage(FILE* out) {
     std::fprintf(out,
         "Usage: hyperv_monitor.exe [--duration SECONDS] [options]\n"
         "       hyperv_monitor.exe --help\n\n"
-        "Opens the existing \\\\.\\HyperVXNdisFilter device; never installs/starts/stops an SCM service.\n"
-        "Install explicitly with dist/Install.exe for Hyper-V host adapters\n"
-        "associated with HNS ICS networks. Device access requires elevated admin/SYSTEM.\n"
-        "Without --duration, wait for driver startup if open fails; Ctrl+C exits\n"
-        "both the startup wait and monitoring. The monitor never loads the LWF.\n\n"
+        "Opens \\\\.\\HyperVXNdisFilter; if absent, loads a driver through SCM.\n"
+        "Default SYS: HyperVXNdisFilter.sys beside this EXE (not the working directory).\n"
+        "Requires elevated admin/SYSTEM. Temporary loads run WFP only, without NDIS bindings.\n"
+        "Drivers started here are stopped on exit; only services created here are deleted.\n"
+        "An already running driver/service is left untouched. No NetCfg installation.\n\n"
         "Collection:\n"
-        "  --duration N     optional positive seconds; never wait for driver startup.\n"
-        "                   Open failure exits immediately; otherwise stop after N s.\n"
-        "                   This does not uninstall or unbind the LWF.\n"
+        "  --sys PATH       optional SYS path, used only if the device is absent.\n"
+        "  --duration N     optional positive seconds; otherwise run until Ctrl+C.\n"
+        "                   Startup/load failures exit without an indefinite wait.\n"
         "  --out FILE       write records to FILE, flushed per record.\n"
         "  --poll N         query device count/logs/bandwidth every N ms (default 1000).\n"
         "  --timestamps     prefix records with local HH:MM:SS.mmm.\n"
@@ -258,7 +262,7 @@ void PrintUsage(FILE* out) {
         "  CleanEndedConnections sweeps TTLs; no END is fabricated on expiry/timeout.\n"
         "  UpdateV4/UpdateV6 commands and redirect verdicts are unsupported.\n"
         "  Block/drop for all events can cut host-vNIC traffic and remote access.\n"
-        "  --sys, positional .sys paths and PID-suspension options are rejected.\n\n"
+        "  Positional .sys paths and PID-suspension options are rejected.\n\n"
         "Examples:\n"
         "  hyperv_monitor.exe\n"
         "  hyperv_monitor.exe --duration 10 --only-logs\n"

@@ -15,7 +15,7 @@ function(expect_invalid name expected)
     if(NOT text MATCHES "${expected}")
         message(FATAL_ERROR "${name}: missing expected diagnostic '${expected}': ${text}")
     endif()
-    if(text MATCHES "Opening explicitly installed|Driver version")
+    if(text MATCHES "Device name :|Driver version")
         message(FATAL_ERROR "${name}: invalid CLI reached the device path: ${text}")
     endif()
 endfunction()
@@ -36,7 +36,8 @@ expect_invalid(bad_port "1 to 65535" --duration 1 --verdict block --match 192.0.
 expect_invalid(bad_ipv6_port "1 to 65535" --duration 1 --filter-ip "[::1]:53x")
 expect_invalid(bad_delay "0 to 4294967295" --duration 1 --verdict-delay-ms 4294967296)
 expect_invalid(suspend_rejected "PID suspension is not supported" --duration 1 --suspend-pid-on-verdict-delay)
-expect_invalid(sys_rejected "SCM installation is not supported" --duration 1 --sys ignored.sys)
+expect_invalid(sys_missing "nonempty SYS path" --sys)
+expect_invalid(sys_duplicate "only once" --sys a.sys --sys b.sys)
 expect_invalid(positional_rejected "positional driver path" --duration 1 ignored.sys)
 expect_invalid(update_v4_rejected "unknown option" --duration 1 --update-v4)
 expect_invalid(update_v6_rejected "unknown option" --duration 1 --update-v6)
@@ -64,9 +65,9 @@ if(NOT result STREQUAL "0" OR NOT output MATCHES "direction=0 outbound, 1 inboun
    NOT output MATCHES "relative to the guest side" OR NOT output MATCHES "local=guest endpoint" OR
    NOT output MATCHES "Host receive=outbound, send=inbound" OR
    NOT output MATCHES "Redirects are NOT supported" OR
-   NOT output MATCHES "Without --duration, wait for driver startup" OR
-   NOT output MATCHES "Ctrl\\+C exits" OR
-   NOT output MATCHES "never wait for driver startup" OR
+   NOT output MATCHES "loads a driver through SCM" OR
+   NOT output MATCHES "Temporary loads run WFP only" OR
+   NOT output MATCHES "only services created here are deleted" OR
    NOT output MATCHES "complete logical IP packet" OR
    NOT output MATCHES "up to 1 MiB, no truncation" OR
    NOT output MATCHES "pending timeout defaults to 8 s" OR
@@ -80,7 +81,7 @@ if(NOT result STREQUAL "0" OR NOT output MATCHES "direction=0 outbound, 1 inboun
    NOT output MATCHES "Connection events carry no process/thread identity" OR
    output MATCHES "--filter-pid|PID=0|possibly shortened" OR
    output MATCHES "HyperVXNdisFilterPipe|Bridge:|winrpc|named-pipe" OR
-   output MATCHES "Opening explicitly installed|Driver version")
+   output MATCHES "Device name :|Driver version")
     message(FATAL_ERROR "Help did not stay on the no-device path: ${result}: ${output}${errors}")
 endif()
 message(STATUS "PASS: bounded help/invalid CLI checks, early redirect rejection, no output/device/SCM access")

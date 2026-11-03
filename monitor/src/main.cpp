@@ -1,8 +1,8 @@
 // HyperVXNdisFilter console monitor, adapted from kext_client on 2026-10-25 (see README.md/LICENSE).
-// Interactive runs wait for driver startup; --duration runs never wait.
+// Missing devices can be loaded temporarily; existing driver ownership is preserved.
 #include "PortmasterKext.h"
 #include "DriverProtocol.h"
-#include "DriverStartup.h"
+#include "DriverLoader.h"
 #include "DelayedVerdicts.h"
 #include "MonitorOptions.h"
 #include "RecordOutput.h"
@@ -103,8 +103,11 @@ public:
     }
     bool Register(std::string& error) {
         registered_ = SetConsoleCtrlHandler(ConsoleHandler, TRUE) != FALSE;
-        if (!registered_) error = "cannot register console handler: error " + std::to_string(GetLastError());
-        return registered_;
+        if (!registered_ || !SetConsoleCtrlHandler(nullptr, FALSE)) {
+            error = "cannot register console handler: error " + std::to_string(GetLastError());
+            return false;
+        }
+        return true;
     }
 private:
     bool registered_ = false;
@@ -131,49 +134,27 @@ public:
     }
 };
 
-int MonitorMain(int argc, wchar_t** argv) {
-    pmkext::monitor::Options opt;
+int RunMonitor(const pmkext::monitor::Options& opt, pmkext::monitor::DriverLoader& loader) {
     std::string error;
-    if (!pmkext::monitor::ParseOptions(argc, argv, opt, error)) {
-        std::fprintf(stderr, "ERROR: %s\n", error.c_str());
-        return 2;
-    }
-    if (opt.help) {
-        pmkext::monitor::PrintUsage();
-        return 0;
-    }
-    // Everything above is device/service/output-file free.
-    SingleInstanceGuard single_instance;
-    if (!single_instance.Acquire(error)) {
-        std::fprintf(stderr, "ERROR: %s. No device or service state was changed.\n", error.c_str());
-        return 1;
-    }
-    ConsoleRegistration console_handler;
-    if (!console_handler.Register(error)) {
-        std::fprintf(stderr, "ERROR: %s\n", error.c_str());
-        return 1;
-    }
-    OutputFile output;
-    if (!output.Open(opt.out_path)) return 1;
-
-    std::printf("Device name : HyperVXNdisFilter\n"
-                "Opening explicitly installed host-adapter NDIS LWF (no SCM lifecycle).\n");
+    std::printf("Device name : HyperVXNdisFilter\n");
     pmkext::Driver driver;
-    const auto startup = pmkext::monitor::OpenDriverWhenReady(
-        [&](std::string& reason) { return driver.Open(reason); }, opt.duration_s == 0,
-        g_shutdown_requested, [&](const std::string& reason) {
-            std::printf("Device open failed: %s\n"
-                        "Waiting for driver startup (Global\\HyperVXNdisFilter.DriverReady); Ctrl+C to exit.\n",
-                        reason.c_str());
-            std::fflush(stdout);
-        }, error);
-    if (startup == pmkext::monitor::StartupResult::Failed) {
-        std::fprintf(stderr, "ERROR: open device failed: %s\n", error.c_str());
-        return 1;
-    }
-    if (startup == pmkext::monitor::StartupResult::Cancelled || g_shutdown_requested.load()) {
-        std::printf("Console stop requested during startup; exiting.\n");
-        return 0;
+    if (!driver.Open(error)) {
+        const DWORD status = GetLastError();
+        if (status != ERROR_FILE_NOT_FOUND && status != ERROR_PATH_NOT_FOUND && status != ERROR_DEV_NOT_EXIST) {
+            std::fprintf(stderr, "ERROR: open device: %s\n", error.c_str());
+            return 1;
+        }
+        if (g_shutdown_requested.load()) return 0;
+        std::printf("Device unavailable; loading driver through SCM.\n");
+        if (!loader.Load(opt.sys_path, error)) {
+            std::fprintf(stderr, "ERROR: load driver: %s\n", error.c_str());
+            return 1;
+        }
+        if (g_shutdown_requested.load()) return 0;
+        if (!driver.Open(error)) {
+            std::fprintf(stderr, "ERROR: open loaded driver: %s\n", error.c_str());
+            return 1;
+        }
     }
 
     uint32_t filtered_devices = 0;
@@ -252,10 +233,9 @@ int MonitorMain(int argc, wchar_t** argv) {
         }
     }
     if (opt.duration_s != 0) {
-        std::printf("Running for %u second(s), then stopping the session (LWF remains installed).\n\n",
-                    opt.duration_s);
+        std::printf("Running for %u second(s).\n\n", opt.duration_s);
     } else {
-        std::printf("Running until Ctrl+C; stopping the session leaves the LWF installed.\n\n");
+        std::printf("Running until Ctrl+C.\n\n");
     }
     std::fflush(stdout);
 
@@ -423,8 +403,47 @@ int MonitorMain(int argc, wchar_t** argv) {
                 "log lines: %llu, bandwidth records: %llu\n",
                 connections, verdicts.load(), ends, logs, bandwidth_records);
     driver.Cleanup();
-    std::printf("Device closed; LWF remains installed/bound (no SCM changes).\n");
+    std::printf("Device closed.\n");
     return failed.load() ? 1 : 0;
+}
+
+int MonitorMain(int argc, wchar_t** argv) {
+    pmkext::monitor::Options opt;
+    std::string error;
+    if (!pmkext::monitor::ParseOptions(argc, argv, opt, error)) {
+        std::fprintf(stderr, "ERROR: %s\n", error.c_str());
+        return 2;
+    }
+    if (opt.help) {
+        pmkext::monitor::PrintUsage();
+        return 0;
+    }
+    // Help and invalid arguments never touch devices, services or output files.
+    SingleInstanceGuard single_instance;
+    if (!single_instance.Acquire(error)) {
+        std::fprintf(stderr, "ERROR: %s. No device or service state was changed.\n", error.c_str());
+        return 1;
+    }
+    ConsoleRegistration console_handler;
+    if (!console_handler.Register(error)) {
+        std::fprintf(stderr, "ERROR: %s\n", error.c_str());
+        return 1;
+    }
+    OutputFile output;
+    if (!output.Open(opt.out_path)) return 1;
+
+    pmkext::monitor::DriverLoader loader;
+    const int result = RunMonitor(opt, loader);
+    const bool started_here = loader.Started();
+    const bool created_here = loader.Created();
+    if (!loader.Cleanup(error)) {
+        std::fprintf(stderr, "ERROR: driver cleanup: %s\n", error.c_str());
+        return 1;
+    }
+    if (created_here) std::printf("Created service removed%s.\n", started_here ? "; temporary driver unloaded" : "");
+    else if (started_here) std::printf("Monitor-started driver unloaded; existing service retained.\n");
+    else if (result == 0) std::printf("Existing driver left running.\n");
+    return result;
 }
 
 } // namespace

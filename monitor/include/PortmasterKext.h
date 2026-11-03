@@ -209,8 +209,8 @@ public:
     bool Install(const std::wstring& sys_path, std::string& error,
                  bool inbound_udp_pid_fallback = true);
 
-    // Opens the installed device using FILE_FLAG_OVERLAPPED. No IPC server or
-    // external verdict client is started; records go to the local handlers.
+    // Opens the existing device using FILE_FLAG_OVERLAPPED. Preserves the Win32
+    // failure code in GetLastError; no SCM lifecycle or external client is started.
     bool Open(std::string& error);
 
     // Nonzero reads wait for data and support cancellation; no idle polling.

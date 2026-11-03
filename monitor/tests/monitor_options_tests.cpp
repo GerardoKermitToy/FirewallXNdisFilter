@@ -37,7 +37,16 @@ bool TestValidOptions() {
     }
     pmkext::monitor::Options interactive;
     CHECK(Parse({}, interactive, error));
-    CHECK(interactive.duration_s == 0 && !interactive.help && error.empty());
+    CHECK(interactive.duration_s == 0 && !interactive.help && interactive.sys_path.empty() && error.empty());
+    pmkext::monitor::Options explicit_sys;
+    CHECK(Parse({L"--sys", L"C:/path with spaces/filter.sys", L"--duration", L"1"}, explicit_sys, error));
+    CHECK(explicit_sys.sys_path == L"C:/path with spaces/filter.sys");
+    for (const wchar_t* path : {L"", L"--help"}) {
+        pmkext::monitor::Options invalid;
+        CHECK(!Parse({L"--sys", path}, invalid, error));
+    }
+    pmkext::monitor::Options duplicate_sys;
+    CHECK(!Parse({L"--sys", L"a.sys", L"--sys", L"b.sys"}, duplicate_sys, error));
     CHECK(interactive.send_verdicts && interactive.alt_verdict == pmkext::Verdict::PermanentAccept);
     pmkext::monitor::Options interactive_options;
     CHECK(Parse({L"--timestamps", L"--only-logs"}, interactive_options, error));
@@ -141,7 +150,7 @@ int main() {
     const struct { const char* name; bool (*run)(); } tests[] = {
         {"valid monitor arguments without device access", TestValidOptions},
         {"strict numeric/endpoint validation", TestInvalidNumbersAndEndpoints},
-        {"redirects/SCM/suspension/PID filters/updates rejected", TestRejectedCapabilities},
+        {"redirects/suspension/PID filters/updates rejected", TestRejectedCapabilities},
         {"source/destination filters do not alter verdicts", TestFilterAndVerdictSeparation},
     };
     for (const auto& test : tests) {

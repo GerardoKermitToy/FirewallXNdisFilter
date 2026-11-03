@@ -2,6 +2,7 @@
 #include <ntifs.h>
 #include <ndis.h>
 #include <netioapi.h>
+#include <wdmsec.h>
 #include "lwf_contract.h"
 #include "driver_ready.h"
 #include "adapter_info.h"
@@ -60,6 +61,11 @@ extern NTSTATUS HvWrite(const UCHAR*, ULONG);
 
 static NDIS_HANDLE DriverHandle, DeviceHandle;
 static PDEVICE_OBJECT ControlDevice;
+static BOOLEAN StandaloneWfp, StandaloneLinkCreated;
+static UNICODE_STRING ControlDeviceName = RTL_CONSTANT_STRING(L"\\Device\\HyperVXNdisFilter");
+static UNICODE_STRING ControlLinkName = RTL_CONSTANT_STRING(L"\\DosDevices\\HyperVXNdisFilter");
+// Private device security class, not the NetCfg component or a WFP object GUID.
+static const GUID StandaloneDeviceClass = {0x874bec2c, 0x0e77, 0x4ed4, {0xa3, 0x76, 0x14, 0x60, 0x6b, 0xe3, 0xc8, 0x64}};
 static HANDLE ReadyEventHandle;
 static PKEVENT ReadyEvent;
 static KSPIN_LOCK PolicyLock;
@@ -1229,19 +1235,23 @@ Exit:
     if (info != NULL) ExFreePoolWithTag(info, TAG);
     ZwClose(key); return match;
 }
-static void ReadConfiguration(PUNICODE_STRING registry) {
+static BOOLEAN ReadConfiguration(PUNICODE_STRING registry) {
     OBJECT_ATTRIBUTES attributes;
     UNICODE_STRING name = RTL_CONSTANT_STRING(L"Parameters");
     HANDLE service = NULL, parameters = NULL;
+    BOOLEAN standalone = FALSE;
     InitializeObjectAttributes(&attributes, registry, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
-    if (!NT_SUCCESS(ZwOpenKey(&service, KEY_READ, &attributes))) return;
+    if (!NT_SUCCESS(ZwOpenKey(&service, KEY_READ, &attributes))) return FALSE;
     InitializeObjectAttributes(&attributes, &name, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, service, NULL);
     if (NT_SUCCESS(ZwOpenKey(&parameters, KEY_READ, &attributes))) {
         HvConfigure(ReadDword(parameters,L"DecisionTimeoutMs",HV_DEFAULT_DECISION_TIMEOUT_MS),
             ReadDword(parameters,L"CacheTtlMs",60000), ReadDword(parameters,L"FailClosed",HV_DEFAULT_FAIL_CLOSED));
+        // Only exact REG_DWORD=1 opts out of the ordinary NDIS path.
+        standalone = ReadDword(parameters, L"StandaloneWfp", 0) == 1;
         ZwClose(parameters);
     }
     ZwClose(service);
+    return standalone;
 }
 static void SignalDriverReady(void) {
     UNICODE_STRING name = RTL_CONSTANT_STRING(HV_READY_EVENT_KERNEL_NAME);
@@ -1286,8 +1296,8 @@ NTSTATUS hv_initialize(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     NDIS_FILTER_DRIVER_CHARACTERISTICS c = {0};
     NDIS_DEVICE_OBJECT_ATTRIBUTES attributes = {0};
     PDRIVER_DISPATCH dispatch[IRP_MJ_MAXIMUM_FUNCTION + 1] = {0};
-    NDIS_STRING device = RTL_CONSTANT_STRING(L"\\Device\\HyperVXNdisFilter");
-    NDIS_STRING link = RTL_CONSTANT_STRING(L"\\DosDevices\\HyperVXNdisFilter");
+    PDEVICE_OBJECT control = NULL;
+    NDIS_HANDLE filter = NULL, registeredDevice = NULL;
     UNICODE_STRING sddl = RTL_CONSTANT_STRING(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
     NDIS_STATUS status;
     KeInitializeSpinLock(&PolicyLock); ExInitializeFastMutex(&IoMutex);
@@ -1301,53 +1311,69 @@ NTSTATUS hv_initialize(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     status = IoCsqInitializeEx(&ReadCsq, ReadInsert, ReadRemove, ReadPeek,
         HvReadQueueAcquire, HvReadQueueRelease, ReadCancelled);
     if (!NT_SUCCESS(status)) return status;
-    ReadConfiguration(registry);
+    StandaloneWfp = ReadConfiguration(registry);
     status = HvWfpInitialize(driver);
     if (!NT_SUCCESS(status)) return status;
-    c.Header.Type = NDIS_OBJECT_TYPE_FILTER_DRIVER_CHARACTERISTICS;
-    c.Header.Revision = NDIS_FILTER_CHARACTERISTICS_REVISION_2;
-    c.Header.Size = NDIS_SIZEOF_FILTER_DRIVER_CHARACTERISTICS_REVISION_2;
-    c.MajorNdisVersion = 6; c.MinorNdisVersion = 40;
-    c.MajorDriverVersion = 0; c.MinorDriverVersion = 3;
-    c.FriendlyName = Friendly; c.UniqueName = Unique; c.ServiceName = ServiceName;
-    c.AttachHandler = HvFilterAttach; c.DetachHandler = HvFilterDetach;
-    c.RestartHandler = HvFilterRestart; c.PauseHandler = HvFilterPause;
-    c.SendNetBufferListsHandler = HvSend; c.SendNetBufferListsCompleteHandler = HvSendComplete;
-    c.CancelSendNetBufferListsHandler = HvCancelSend;
-    c.ReceiveNetBufferListsHandler = HvReceive; c.ReturnNetBufferListsHandler = HvReturn;
-    c.OidRequestHandler = HvOid; c.OidRequestCompleteHandler = HvOidComplete;
-    c.CancelOidRequestHandler = HvCancelOid; c.NetPnPEventHandler = HvPnp; c.StatusHandler = HvStatus;
-    // Direct OID callbacks remain NULL: NDIS bypasses this non-intercepting LWF.
     driver->DriverUnload = HvUnload;
-    status = NdisFRegisterFilterDriver(driver, driver, &c, &DriverHandle);
-    if (status != NDIS_STATUS_SUCCESS) { HvWfpUninitialize(); return status; }
     dispatch[IRP_MJ_CREATE] = HvDispatch; dispatch[IRP_MJ_CLEANUP] = HvDispatch;
     dispatch[IRP_MJ_CLOSE] = HvDispatch; dispatch[IRP_MJ_READ] = HvDispatch;
     dispatch[IRP_MJ_WRITE] = HvDispatch; dispatch[IRP_MJ_DEVICE_CONTROL] = HvDispatch;
-    attributes.Header.Type = NDIS_OBJECT_TYPE_DEVICE_OBJECT_ATTRIBUTES;
-    attributes.Header.Revision = NDIS_DEVICE_OBJECT_ATTRIBUTES_REVISION_1;
-    attributes.Header.Size = NDIS_SIZEOF_DEVICE_OBJECT_ATTRIBUTES_REVISION_1;
-    attributes.DeviceName = &device; attributes.SymbolicName = &link;
-    attributes.MajorFunctions = dispatch; attributes.DefaultSDDLString = &sddl;
-    status = NdisRegisterDeviceEx(DriverHandle, &attributes, &ControlDevice, &DeviceHandle);
-    if (status != NDIS_STATUS_SUCCESS) {
-        HvWfpStop(); NdisFDeregisterFilterDriver(DriverHandle); HvWfpUninitialize();
-        DriverHandle = NULL; return status;
+    if (StandaloneWfp) {
+        // Explicit SCM-only mode: no NDIS registration or bindings.
+        for (ULONG major = 0; major != RTL_NUMBER_OF(dispatch); ++major)
+            if (dispatch[major] != NULL) driver->MajorFunction[major] = dispatch[major];
+        status = IoCreateDeviceSecure(driver, 0, &ControlDeviceName, FILE_DEVICE_UNKNOWN,
+            FILE_DEVICE_SECURE_OPEN, FALSE, &sddl, &StandaloneDeviceClass, &control);
+        if (!NT_SUCCESS(status)) goto Failed;
+        ControlDevice = control;
+    } else {
+        c.Header.Type = NDIS_OBJECT_TYPE_FILTER_DRIVER_CHARACTERISTICS;
+        c.Header.Revision = NDIS_FILTER_CHARACTERISTICS_REVISION_2;
+        c.Header.Size = NDIS_SIZEOF_FILTER_DRIVER_CHARACTERISTICS_REVISION_2;
+        c.MajorNdisVersion = 6; c.MinorNdisVersion = 40;
+        c.MajorDriverVersion = 0; c.MinorDriverVersion = 3;
+        c.FriendlyName = Friendly; c.UniqueName = Unique; c.ServiceName = ServiceName;
+        c.AttachHandler = HvFilterAttach; c.DetachHandler = HvFilterDetach;
+        c.RestartHandler = HvFilterRestart; c.PauseHandler = HvFilterPause;
+        c.SendNetBufferListsHandler = HvSend; c.SendNetBufferListsCompleteHandler = HvSendComplete;
+        c.CancelSendNetBufferListsHandler = HvCancelSend;
+        c.ReceiveNetBufferListsHandler = HvReceive; c.ReturnNetBufferListsHandler = HvReturn;
+        c.OidRequestHandler = HvOid; c.OidRequestCompleteHandler = HvOidComplete;
+        c.CancelOidRequestHandler = HvCancelOid; c.NetPnPEventHandler = HvPnp; c.StatusHandler = HvStatus;
+        // Direct OID callbacks remain NULL: NDIS bypasses this non-intercepting LWF.
+        status = NdisFRegisterFilterDriver(driver, driver, &c, &filter);
+        if (status != NDIS_STATUS_SUCCESS) goto Failed;
+        DriverHandle = filter;
+        attributes.Header.Type = NDIS_OBJECT_TYPE_DEVICE_OBJECT_ATTRIBUTES;
+        attributes.Header.Revision = NDIS_DEVICE_OBJECT_ATTRIBUTES_REVISION_1;
+        attributes.Header.Size = NDIS_SIZEOF_DEVICE_OBJECT_ATTRIBUTES_REVISION_1;
+        attributes.DeviceName = &ControlDeviceName; attributes.SymbolicName = &ControlLinkName;
+        attributes.MajorFunctions = dispatch; attributes.DefaultSDDLString = &sddl;
+        status = NdisRegisterDeviceEx(DriverHandle, &attributes, &control, &registeredDevice);
+        if (status != NDIS_STATUS_SUCCESS) goto Failed;
+        ControlDevice = control; DeviceHandle = registeredDevice;
     }
     ReadWorkItem = IoAllocateWorkItem(ControlDevice);
     CacheWorkItem = IoAllocateWorkItem(ControlDevice);
     if (ReadWorkItem == NULL || CacheWorkItem == NULL) [[unlikely]] {
-        if (ReadWorkItem != NULL) {IoFreeWorkItem(ReadWorkItem); ReadWorkItem = NULL;}
-        if (CacheWorkItem != NULL) {IoFreeWorkItem(CacheWorkItem); CacheWorkItem = NULL;}
-        NdisDeregisterDeviceEx(DeviceHandle);
-        HvWfpStop(); NdisFDeregisterFilterDriver(DriverHandle); HvWfpUninitialize();
-        DriverHandle = NULL; return STATUS_INSUFFICIENT_RESOURCES;
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Failed;
+    }
+    ControlDevice->Flags |= DO_BUFFERED_IO;
+    if (StandaloneWfp) {
+        // Publish only after worker setup; a colliding link is never ours to delete.
+        status = IoCreateSymbolicLink(&ControlLinkName, &ControlDeviceName);
+        if (!NT_SUCCESS(status)) goto Failed;
+        StandaloneLinkCreated = TRUE;
     }
     ScheduleRead();
-    ControlDevice->Flags |= DO_BUFFERED_IO;
     ControlDevice->Flags &= ~DO_DEVICE_INITIALIZING;
     SignalDriverReady(); // Publish only after the control device and timer are ready.
     return STATUS_SUCCESS;
+Failed:
+    // WFP may already be classifying: use the full, partial-initialization-safe drain.
+    HvUnload(driver);
+    return status;
 }
 _Use_decl_annotations_
 void HvUnload(PDRIVER_OBJECT driver) {
@@ -1359,12 +1385,18 @@ void HvUnload(PDRIVER_OBJECT driver) {
     KeCancelTimer(&PendingTimer); KeCancelTimer(&CacheTimer); KeFlushQueuedDpcs();
     ExWaitForRundownProtectionRelease(&ReadRundown);
     ExWaitForRundownProtectionRelease(&CacheRundown);
-    IoFreeWorkItem(ReadWorkItem); ReadWorkItem = NULL;
-    IoFreeWorkItem(CacheWorkItem); CacheWorkItem = NULL;
+    if (ReadWorkItem != NULL) {IoFreeWorkItem(ReadWorkItem); ReadWorkItem = NULL;}
+    if (CacheWorkItem != NULL) {IoFreeWorkItem(CacheWorkItem); CacheWorkItem = NULL;}
     HvWfpStop();
-    NdisFDeregisterFilterDriver(DriverHandle);
+    if (DriverHandle != NULL) {NdisFDeregisterFilterDriver(DriverHandle); DriverHandle = NULL;}
     HvWfpUninitialize();
-    NdisDeregisterDeviceEx(DeviceHandle);
+    if (StandaloneWfp) {
+        if (StandaloneLinkCreated) {IoDeleteSymbolicLink(&ControlLinkName); StandaloneLinkCreated = FALSE;}
+        if (ControlDevice != NULL) IoDeleteDevice(ControlDevice);
+    } else if (DeviceHandle != NULL) {
+        NdisDeregisterDeviceEx(DeviceHandle); DeviceHandle = NULL;
+    }
+    ControlDevice = NULL;
     if (ReadyEvent != NULL) {ObDereferenceObject(ReadyEvent); ReadyEvent = NULL;}
     if (ReadyEventHandle != NULL) {ZwClose(ReadyEventHandle); ReadyEventHandle = NULL;}
 }

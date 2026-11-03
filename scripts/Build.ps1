@@ -27,7 +27,7 @@ $include = Join-Path $wdk "Include\$SdkVersion"
 $lib = Join-Path $wdk "Lib\$SdkVersion\km\x64"
 $bin = Join-Path $wdk "bin\$SdkVersion\x64"
 foreach ($required in @("$include\km\ndis.h", "$include\km\fwpsk.h", "$include\km\fwpmk.h",
-                        "$lib\ndis.lib", "$lib\netio.lib", "$lib\fwpkclnt.lib")) {
+                        "$lib\ndis.lib", "$lib\netio.lib", "$lib\fwpkclnt.lib", "$lib\wdmsec.lib")) {
     if (!(Test-Path $required)) { throw "Missing WDK input: $required" }
 }
 $build = Join-Path $root 'build'
@@ -52,7 +52,7 @@ try {
     $resource = Join-Path $build 'driver_version.res'
     & "$bin\rc.exe" /nologo "/I$include\um" "/I$include\shared" "/fo$resource" "$root\driver\version.rc"
     if ($LASTEXITCODE) { throw 'Driver version resource compilation failed.' }
-    & link.exe /NOLOGO /DRIVER /SUBSYSTEM:NATIVE,10.00 /ENTRY:GsDriverEntry /MACHINE:X64 /MANIFEST:NO /NODEFAULTLIB /INCREMENTAL:NO /INTEGRITYCHECK /DYNAMICBASE /NXCOMPAT /OPT:REF /OPT:ICF /DEBUG:FULL '/PDBALTPATH:%_PDB%' /RELEASE "/OUT:$dist\HyperVXNdisFilter.sys" "/PDB:$dist\HyperVXNdisFilter.pdb" $objects $resource "$root\target\x86_64-pc-windows-msvc\release\hyperv_driver.lib" "$lib\ndis.lib" "$lib\netio.lib" "$lib\fwpkclnt.lib" "$lib\ntoskrnl.lib" "$lib\hal.lib" "$lib\BufferOverflowK.lib"
+    & link.exe /NOLOGO /DRIVER /SUBSYSTEM:NATIVE,10.00 /ENTRY:GsDriverEntry /MACHINE:X64 /MANIFEST:NO /NODEFAULTLIB /INCREMENTAL:NO /INTEGRITYCHECK /DYNAMICBASE /NXCOMPAT /OPT:REF /OPT:ICF /DEBUG:FULL '/PDBALTPATH:%_PDB%' /RELEASE "/OUT:$dist\HyperVXNdisFilter.sys" "/PDB:$dist\HyperVXNdisFilter.pdb" $objects $resource "$root\target\x86_64-pc-windows-msvc\release\hyperv_driver.lib" "$lib\ndis.lib" "$lib\netio.lib" "$lib\fwpkclnt.lib" "$lib\wdmsec.lib" "$lib\ntoskrnl.lib" "$lib\hal.lib" "$lib\BufferOverflowK.lib"
     if ($LASTEXITCODE) { throw 'Kernel image link failed.' }
     $cmake = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
     $ninja = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'

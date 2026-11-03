@@ -73,7 +73,8 @@ const char* ToString(InfoType t);
 // HyperVXNdisFilter captures an IP packet, so its payload_layer is always 3.
 const char* PayloadLayerToString(uint8_t layer);
 const char* ProtocolToString(uint8_t proto);
-// 0 means guest outbound (host receive), 1 means guest inbound (host send).
+// 0=guest outbound (NDIS receive / forwarding from target), 1=guest inbound
+// (NDIS send / forwarding towards target). Both paths use the same wire API.
 const char* DirectionToString(uint8_t dir);
 
 std::string FormatIpv4(const uint8_t ip[4]);
@@ -88,7 +89,7 @@ struct Connection {
     bool     ipv6 = false;
     uint64_t id = 0;
     uint32_t interface_index = 0;
-    uint8_t  direction = 0;  // Guest outbound=0/inbound=1; local=guest, opposite host NDIS path.
+    uint8_t  direction = 0;  // NDIS: guest out=0/in=1. IPFORWARD: source-relative=0, local=source.
     uint8_t  protocol = 0;
     uint8_t  local_ip[16] = {};
     uint8_t  remote_ip[16] = {};

@@ -26,7 +26,8 @@ $wdk = "${env:ProgramFiles(x86)}\Windows Kits\10"
 $include = Join-Path $wdk "Include\$SdkVersion"
 $lib = Join-Path $wdk "Lib\$SdkVersion\km\x64"
 $bin = Join-Path $wdk "bin\$SdkVersion\x64"
-foreach ($required in @("$include\km\ndis.h", "$lib\ndis.lib", "$lib\netio.lib")) {
+foreach ($required in @("$include\km\ndis.h", "$include\km\fwpsk.h", "$include\km\fwpmk.h",
+                        "$lib\ndis.lib", "$lib\netio.lib", "$lib\fwpkclnt.lib")) {
     if (!(Test-Path $required)) { throw "Missing WDK input: $required" }
 }
 $build = Join-Path $root 'build'
@@ -41,13 +42,17 @@ try {
     $env:CARGO_ENCODED_RUSTFLAGS = $null
     & cargo build --release --target x86_64-pc-windows-msvc -p hyperv-driver --locked
     if ($LASTEXITCODE) { throw 'Rust driver build failed.' }
-    $object = Join-Path $build 'ndis_shim.obj'
-    & cl.exe /nologo /c /TP /std:c++20 /GR- /EHs-c- /O2 /W4 /WX /wd4324 /GS /kernel /Zl /Zi /D_AMD64_ /DAMD64 /DNDIS640 /DNDIS_SUPPORT_NDIS640=1 /D_WIN64 /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /DNTDDI_VERSION=0x0A00000C "/I$include\km" "/I$include\shared" "/I$include\ucrt" "/Fo$object" "/Fd$build\shim.pdb" "$root\driver\shim\ndis_shim.cpp"
-    if ($LASTEXITCODE) { throw 'WDK ABI shim compilation failed.' }
+    $objects = @()
+    foreach ($source in @('ndis_shim', 'wfp_forward')) {
+        $object = Join-Path $build "$source.obj"
+        & cl.exe /nologo /c /TP /std:c++20 /GR- /EHs-c- /O2 /W4 /WX /wd4324 /GS /kernel /Zl /Zi /D_AMD64_ /DAMD64 /DNDIS640 /DNDIS_SUPPORT_NDIS640=1 /D_WIN64 /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /DNTDDI_VERSION=0x0A00000C "/I$include\km" "/I$include\shared" "/I$include\ucrt" "/Fo$object" "/Fd$build\shim.pdb" "$root\driver\shim\$source.cpp"
+        if ($LASTEXITCODE) { throw "WDK ABI shim compilation failed: $source" }
+        $objects += $object
+    }
     $resource = Join-Path $build 'driver_version.res'
     & "$bin\rc.exe" /nologo "/I$include\um" "/I$include\shared" "/fo$resource" "$root\driver\version.rc"
     if ($LASTEXITCODE) { throw 'Driver version resource compilation failed.' }
-    & link.exe /NOLOGO /DRIVER /SUBSYSTEM:NATIVE,10.00 /ENTRY:GsDriverEntry /MACHINE:X64 /MANIFEST:NO /NODEFAULTLIB /INCREMENTAL:NO /INTEGRITYCHECK /DYNAMICBASE /NXCOMPAT /OPT:REF /OPT:ICF /DEBUG:FULL '/PDBALTPATH:%_PDB%' /RELEASE "/OUT:$dist\HyperVXNdisFilter.sys" "/PDB:$dist\HyperVXNdisFilter.pdb" $object $resource "$root\target\x86_64-pc-windows-msvc\release\hyperv_driver.lib" "$lib\ndis.lib" "$lib\netio.lib" "$lib\ntoskrnl.lib" "$lib\hal.lib" "$lib\BufferOverflowK.lib"
+    & link.exe /NOLOGO /DRIVER /SUBSYSTEM:NATIVE,10.00 /ENTRY:GsDriverEntry /MACHINE:X64 /MANIFEST:NO /NODEFAULTLIB /INCREMENTAL:NO /INTEGRITYCHECK /DYNAMICBASE /NXCOMPAT /OPT:REF /OPT:ICF /DEBUG:FULL '/PDBALTPATH:%_PDB%' /RELEASE "/OUT:$dist\HyperVXNdisFilter.sys" "/PDB:$dist\HyperVXNdisFilter.pdb" $objects $resource "$root\target\x86_64-pc-windows-msvc\release\hyperv_driver.lib" "$lib\ndis.lib" "$lib\netio.lib" "$lib\fwpkclnt.lib" "$lib\ntoskrnl.lib" "$lib\hal.lib" "$lib\BufferOverflowK.lib"
     if ($LASTEXITCODE) { throw 'Kernel image link failed.' }
     $cmake = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
     $ninja = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'

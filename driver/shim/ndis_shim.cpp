@@ -6,6 +6,9 @@
 #include "driver_ready.h"
 #include "adapter_info.h"
 #include "target_config.h"
+#include "nbl_context.h"
+#include "packet_snapshot.h"
+#include "wfp_forward.h"
 
 // C++20 branch attributes are hints only; retain the Rust/NDIS C ABI.
 extern "C" {
@@ -21,20 +24,12 @@ extern "C" {
 C_ASSERT(NDIS_MAX_PHYS_ADDRESS_LENGTH == HV_ADAPTER_INFO_MAC_CAPACITY);
 
 typedef struct _HV_ADAPTER HV_ADAPTER;
-typedef struct _HV_TOKEN {
-    LIST_ENTRY Link;
-    HV_ADAPTER* Adapter;
-    PNET_BUFFER_LIST Nbl;
-    NDIS_PORT_NUMBER Port;
-    ULONG Flags, Direction;
-    BOOLEAN Copied, Forwarded;
-} HV_TOKEN;
 struct _HV_ADAPTER {
     NDIS_HANDLE Filter, NblPool, NbPool;
     NDIS_SPIN_LOCK Lock;
     PNDIS_RW_LOCK_EX ClassificationLock;
     EX_RUNDOWN_REF OidRundown;
-    LIST_ENTRY Tokens[HV_TOKEN_BUCKET_COUNT], AdapterLink;
+    LIST_ENTRY AdapterLink;
     HV_ADAPTER_INFO Info; // Protected by AdapterInfoLock; no borrowed NDIS pointers.
     UINT64 Id; // Diagnostic module ID only; policy uses InterfaceIndex.
     UINT64 Active; // Callback guards plus retained/forwarded NBL ownership.
@@ -54,7 +49,12 @@ extern void HvConnect(void);
 extern void HvDisconnect(void);
 extern void HvCancel(ULONG, ULONG_PTR);
 extern int HvClassify(ULONG_PTR, ULONG, ULONG, ULONG_PTR, ULONG);
+extern int HvClassifyIp(ULONG_PTR, ULONG, ULONG, ULONG, ULONG, ULONG);
 extern void HvResourceDrop(void);
+#ifdef HV_WFP_FRAGMENT_PERMIT_DIAGNOSTIC
+extern void HvWfpFragmentDiagnostic(ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG);
+static volatile LONG ForwardDiagnosticCounts[3];
+#endif
 extern ULONG HvRead(UCHAR*, ULONG);
 extern NTSTATUS HvWrite(const UCHAR*, ULONG);
 
@@ -180,7 +180,12 @@ static void OpenClassificationSession(void) {
         ExReInitializeRundownProtection(&ClassificationRundown);
         (void)HvSessionGateReopen(&ClassificationClosed);
     }
+#ifdef HV_WFP_FRAGMENT_PERMIT_DIAGNOSTIC
+    for (ULONG i = 0; i != RTL_NUMBER_OF(ForwardDiagnosticCounts); ++i)
+        InterlockedExchange(&ForwardDiagnosticCounts[i], 0);
+#endif
     HvConnect();
+    HvWfpReportStatus();
 }
 static void CancelReads(PFILE_OBJECT file) {
     PIRP irp;
@@ -303,7 +308,7 @@ static void ReleaseActive(HV_ADAPTER* a, UINT64 count) {
     if (!HvSubtractU64(a->Active, count, &a->Active)) [[unlikely]] hv_bugcheck();
     if (a->Active == 0 && a->PausePending) { a->PausePending = FALSE; complete = TRUE; }
     NdisReleaseSpinLock(&a->Lock);
-    // Last access to a: PauseComplete may synchronously cause detach/free.
+    // Last adapter access: PauseComplete may synchronously complete detach.
     if (complete) NdisFPauseComplete(filter);
 }
 static void SetFilterRunning(HV_ADAPTER* a, BOOLEAN running) {
@@ -411,69 +416,85 @@ Fail:
     FreeReceiveCopy(copy);
     return NULL;
 }
-static PLIST_ENTRY TokenBucket(HV_ADAPTER* a, PNET_BUFFER_LIST nbl, ULONG direction) {
-    return &a->Tokens[HvTokenBucketIndex((ULONG_PTR)nbl, direction)];
-}
-static BOOLEAN TokensEmpty(HV_ADAPTER* a) {
-    ULONG i;
-    for (i = 0; i < HV_TOKEN_BUCKET_COUNT; ++i) if (!IsListEmpty(&a->Tokens[i])) return FALSE;
-    return TRUE;
-}
-static void ReleaseToken(HV_TOKEN* t) {
-    HV_ADAPTER* a = t->Adapter;
-    hv_free(t, sizeof(*t));
-    ReleaseActive(a, 1);
-}
-static HV_TOKEN* CreateToken(HV_ADAPTER* a, PNET_BUFFER_LIST nbl, NDIS_PORT_NUMBER port,
-    ULONG flags, ULONG direction, BOOLEAN resources) {
-    HV_TOKEN* t;
+static PNET_BUFFER_LIST CreateNdisPacket(HV_ADAPTER* a, PNET_BUFFER_LIST original,
+    NDIS_PORT_NUMBER port, ULONG flags, ULONG direction, BOOLEAN resources) {
     NdisAcquireSpinLock(&a->Lock);
-    if (!a->Running) [[unlikely]] { NdisReleaseSpinLock(&a->Lock); return NULL; }
+    if (!a->Running) { NdisReleaseSpinLock(&a->Lock); return NULL; }
     RetainActiveLocked(a);
     NdisReleaseSpinLock(&a->Lock);
-    // Tokens grow fallibly without a count or byte quota.
-    // Allocation failure preserves the existing drop path.
-    t = static_cast<HV_TOKEN*>(hv_allocate(sizeof(*t)));
-    if (t == NULL) [[unlikely]] { ReleaseActive(a, 1); return NULL; }
-    RtlZeroMemory(t, sizeof(*t));
-    t->Adapter = a; t->Nbl = nbl; t->Port = port; t->Flags = flags;
-    t->Direction = direction;
-    if (resources) {
-        t->Nbl = CopyReceive(a, nbl);
-        if (t->Nbl == NULL) { ReleaseToken(t); return NULL; }
-        t->Copied = TRUE;
-        // The new storage has no shared-memory/header-split/queue assertions.
-        t->Flags = 0;
+    PNET_BUFFER_LIST nbl = resources ? CopyReceive(a, original) : original;
+    if (nbl == NULL) { ReleaseActive(a, 1); return NULL; }
+    HV_NBL_CONTEXT* context = AllocatePacketContext(nbl);
+    if (context == NULL) {
+        if (resources) FreeReceiveCopy(nbl);
+        ReleaseActive(a, 1);
+        return NULL;
     }
-    NdisAcquireSpinLock(&a->Lock);
-    InsertTailList(TokenBucket(a, t->Nbl, direction), &t->Link);
-    NdisReleaseSpinLock(&a->Lock);
-    return t;
+    context->Adapter = a;
+    context->Port = port;
+    context->Flags = resources ? 0 : flags;
+    context->Direction = direction;
+    context->Owner = HvOwnerNdis;
+    context->Copied = resources;
+    return nbl;
 }
-void hv_finish(ULONG_PTR token, ULONG finish) {
-    HV_TOKEN* t = (HV_TOKEN*)token;
-    HV_ADAPTER* a = t->Adapter;
-    PNET_BUFFER_LIST nbl = t->Nbl;
-    ULONG flags;
-    BOOLEAN allow;
-    HV_FINISH_ROUTE route;
+static void FreeForwardPacket(PNET_BUFFER_LIST nbl) {
+    HV_PACKET_OWNER owner = PacketContext(nbl)->Owner;
+    FreePacketContext(nbl);
+    if (owner == HvOwnerWfpReassembled) FwpsFreeNetBufferList0(nbl);
+    else FwpsFreeCloneNetBufferList0(nbl, 0);
+    HvWfpReleasePacket();
+}
+static void NTAPI ForwardInjected(void* context, PNET_BUFFER_LIST nbl, BOOLEAN dispatchLevel) {
+    UNREFERENCED_PARAMETER(dispatchLevel);
+    if (context != nbl) hv_bugcheck();
+    if (!NT_SUCCESS((NTSTATUS)NET_BUFFER_LIST_STATUS(nbl))) {
+        const HV_NBL_CONTEXT* packet = PacketContext(nbl);
+        HvWfpReportInjectionFailure((NTSTATUS)NET_BUFFER_LIST_STATUS(nbl), packet->Ipv6,
+            packet->Flags, packet->ForwardInterface, TRUE);
+    }
+    FreeForwardPacket(nbl);
+}
+void hv_finish(ULONG_PTR packet, ULONG finish) {
+    auto* nbl = reinterpret_cast<PNET_BUFFER_LIST>(packet);
+    HV_NBL_CONTEXT* context = PacketContext(nbl);
+    if (context->Owner != HvOwnerNdis) {
+        if (finish == 0 && !Stopping) {
+            NTSTATUS status = HvWfpInject(nbl, context->Ipv6, context->Compartment,
+                context->ForwardInterface, context->ForwardSubInterface, context->Flags,
+                context->Segmented, ForwardInjected, nbl);
+            if (NT_SUCCESS(status)) return; // Inline completion may already have freed the NBL.
+            HvWfpReportInjectionFailure(status, context->Ipv6, context->Flags,
+                context->ForwardInterface, FALSE);
+        }
+        FreeForwardPacket(nbl);
+        return;
+    }
+    HV_ADAPTER* a = context->Adapter;
     NdisAcquireSpinLock(&a->Lock);
-    allow = finish == 0 && a->Running;
-    if (allow) t->Forwarded = TRUE;
-    else RemoveEntryList(&t->Link);
+    BOOLEAN allow = finish == 0 && a->Running;
+    if (allow) context->Forwarded = TRUE;
     NdisReleaseSpinLock(&a->Lock);
-    route = HvFinishRoute(t->Direction, t->Copied, allow);
+    HV_FINISH_ROUTE route = HvFinishRoute(context->Direction, context->Copied, allow);
+    ULONG flags;
     switch (route) {
     case HvRouteSend:
-        flags = t->Flags & ~NDIS_SEND_FLAGS_DISPATCH_LEVEL;
+        flags = context->Flags & ~NDIS_SEND_FLAGS_DISPATCH_LEVEL;
         if (KeGetCurrentIrql() == DISPATCH_LEVEL) flags |= NDIS_SEND_FLAGS_DISPATCH_LEVEL;
-        NdisFSendNetBufferLists(a->Filter, nbl, t->Port, flags);
-        return; // Synchronous completion can already have freed t.
+        NdisFSendNetBufferLists(a->Filter, nbl, context->Port, flags);
+        return;
     case HvRouteIndicateReceive:
-        flags = t->Flags & ~(NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL | NDIS_RECEIVE_FLAGS_RESOURCES);
+        flags = context->Flags & ~(NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL | NDIS_RECEIVE_FLAGS_RESOURCES);
         if (KeGetCurrentIrql() == DISPATCH_LEVEL) flags |= NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL;
-        NdisFIndicateReceiveNetBufferLists(a->Filter, nbl, t->Port, 1, flags);
-        return; // An upper return may already have freed t.
+        NdisFIndicateReceiveNetBufferLists(a->Filter, nbl, context->Port, 1, flags);
+        return;
+    default:
+        break;
+    }
+    // Upper/lower completion may free the original immediately. Remove only our
+    // context before transferring it back, and retain the module until afterward.
+    FreePacketContext(nbl);
+    switch (route) {
     case HvRouteCompleteSend:
         NET_BUFFER_LIST_STATUS(nbl) = finish == 2 ? NDIS_STATUS_SEND_ABORTED : NDIS_STATUS_SUCCESS;
         NdisFSendNetBufferListsComplete(a->Filter, nbl, SendCompleteFlags());
@@ -484,70 +505,189 @@ void hv_finish(ULONG_PTR token, ULONG finish) {
     case HvRouteFreeReceive:
         FreeReceiveCopy(nbl);
         break;
+    default:
+        hv_bugcheck();
     }
-    ReleaseToken(t);
+    ReleaseActive(a, 1);
 }
-void* hv_first_nb(ULONG_PTR token) { return NET_BUFFER_LIST_FIRST_NB(((HV_TOKEN*)token)->Nbl); }
+void* hv_first_nb(ULONG_PTR packet) { return NET_BUFFER_LIST_FIRST_NB(reinterpret_cast<PNET_BUFFER_LIST>(packet)); }
 void* hv_next_nb(PNET_BUFFER nb) { return NET_BUFFER_NEXT_NB(nb); }
-ULONG hv_snapshot(PNET_BUFFER nb, ULONG_PTR token, UCHAR* out, ULONG cap,
-    ULONG* copied, ULONG* trusted, ULONG* frameLength, ULONG* offload) {
-    HV_TOKEN* t = (HV_TOKEN*)token;
-    ULONG n = min(cap, NET_BUFFER_DATA_LENGTH(nb));
-    void* data;
-    *copied = 0; *trusted = 0; *frameLength = NET_BUFFER_DATA_LENGTH(nb);
-    *offload = NET_BUFFER_LIST_INFO(t->Nbl, TcpRecvSegCoalesceInfo) != NULL ||
-        (t->Direction == HV_DIRECTION_SEND ?
-            NET_BUFFER_LIST_INFO(t->Nbl, TcpLargeSendNetBufferListInfo) != NULL :
-            NET_BUFFER_LIST_INFO(t->Nbl, TcpReceiveBytesTransferred) != NULL);
-    if (n == 0) [[unlikely]] return 0;
-    data = NdisGetDataBuffer(nb, n, out, 1, 0);
-    if (data == NULL) [[unlikely]] return 0;
-    if (data != out) RtlCopyMemory(out, data, n);
-    *copied = n; *trusted = n; return 1;
-}
-static HV_TOKEN* TakeForwarded(HV_ADAPTER* a, PNET_BUFFER_LIST nbl, ULONG direction) {
-    HV_TOKEN* t = NULL;
-    LIST_ENTRY* entry;
-    LIST_ENTRY* bucket = TokenBucket(a, nbl, direction);
-    NdisAcquireSpinLock(&a->Lock);
-    for (entry = bucket->Flink; entry != bucket; entry = entry->Flink) {
-        HV_TOKEN* found = CONTAINING_RECORD(entry, HV_TOKEN, Link);
-        if (found->Nbl == nbl && found->Direction == direction && found->Forwarded) {
-            t = found; RemoveEntryList(entry); break;
-        }
+static ULONG SnapshotOffload(ULONG_PTR packet) {
+    auto* nbl = reinterpret_cast<PNET_BUFFER_LIST>(packet);
+    const HV_NBL_CONTEXT* context = PacketContext(nbl);
+    ULONG offload = NET_BUFFER_LIST_INFO(nbl, TcpRecvSegCoalesceInfo) != NULL;
+    if (context->Owner == HvOwnerNdis) {
+        offload = offload != 0 || (context->Direction == HV_DIRECTION_SEND ?
+            NET_BUFFER_LIST_INFO(nbl, TcpLargeSendNetBufferListInfo) != NULL :
+            NET_BUFFER_LIST_INFO(nbl, TcpReceiveBytesTransferred) != NULL);
+    } else {
+        offload = offload != 0 || context->Segmented ||
+            NET_BUFFER_LIST_INFO(nbl, TcpLargeSendNetBufferListInfo) != NULL ||
+            NET_BUFFER_LIST_INFO(nbl, TcpReceiveBytesTransferred) != NULL;
     }
-    NdisReleaseSpinLock(&a->Lock);
-    NT_ASSERT(t != NULL);
-    return t;
+    return offload;
+}
+const UCHAR* hv_snapshot_view(PNET_BUFFER nb, ULONG_PTR packet, UCHAR* storage, ULONG cap,
+    ULONG* copied, ULONG* trusted, ULONG* frameLength, ULONG* offload) {
+    const UCHAR* data = HvSnapshotView(nb, storage, cap, copied, frameLength);
+    *trusted = *copied;
+    *offload = SnapshotOffload(packet);
+    return data;
+}
+ULONG hv_snapshot(PNET_BUFFER nb, ULONG_PTR packet, UCHAR* out, ULONG cap,
+    ULONG* copied, ULONG* trusted, ULONG* frameLength, ULONG* offload) {
+    ULONG result = HvSnapshotCopy(nb, out, cap, copied, frameLength);
+    *trusted = *copied;
+    *offload = SnapshotOffload(packet);
+    return result;
+}
+struct HV_FORWARD_VALUES { ULONG SourceIndex, DestinationIndex, DestinationSubIndex, Flags, Compartment; };
+static BOOLEAN ForwardU32(const FWPS_INCOMING_VALUES0* values, ULONG field, ULONG* out) {
+    if (field >= values->valueCount || values->incomingValue[field].value.type != FWP_UINT32) return FALSE;
+    *out = values->incomingValue[field].value.uint32;
+    return TRUE;
+}
+static BOOLEAN DecodeForward(const FWPS_INCOMING_VALUES0* values,
+    const FWPS_INCOMING_METADATA_VALUES0* metadata, BOOLEAN ipv6, HV_FORWARD_VALUES* route) {
+    if (values->incomingValue == NULL ||
+        !ForwardU32(values, ipv6 ? FWPS_FIELD_IPFORWARD_V6_SOURCE_INTERFACE_INDEX : FWPS_FIELD_IPFORWARD_V4_SOURCE_INTERFACE_INDEX, &route->SourceIndex) ||
+        !ForwardU32(values, ipv6 ? FWPS_FIELD_IPFORWARD_V6_DESTINATION_INTERFACE_INDEX : FWPS_FIELD_IPFORWARD_V4_DESTINATION_INTERFACE_INDEX, &route->DestinationIndex) ||
+        !ForwardU32(values, ipv6 ? FWPS_FIELD_IPFORWARD_V6_FLAGS : FWPS_FIELD_IPFORWARD_V4_FLAGS, &route->Flags) ||
+        route->SourceIndex == 0 || route->DestinationIndex == 0) return FALSE;
+    if ((route->Flags & FWP_CONDITION_FLAG_IS_INBOUND_PASS_THRU) != 0 &&
+        !ForwardU32(values, ipv6 ? FWPS_FIELD_IPFORWARD_V6_DESTINATION_SUB_INTERFACE_INDEX :
+            FWPS_FIELD_IPFORWARD_V4_DESTINATION_SUB_INTERFACE_INDEX, &route->DestinationSubIndex)) return FALSE;
+    route->Compartment = metadata != NULL &&
+        (metadata->currentMetadataValues & FWPS_METADATA_FIELD_COMPARTMENT_ID) != 0 ?
+        metadata->compartmentId : UNSPECIFIED_COMPARTMENT_ID;
+    return TRUE;
+}
+static PNET_BUFFER_LIST CreateForwardPacket(PNET_BUFFER_LIST original,
+    const HV_FORWARD_VALUES* route, BOOLEAN ipv6) {
+    BOOLEAN grouped = (route->Flags & FWP_CONDITION_FLAG_IS_FRAGMENT_GROUP) != 0;
+    BOOLEAN segmented = NET_BUFFER_LIST_INFO(original, TcpLargeSendNetBufferListInfo) != NULL ||
+        NET_BUFFER_LIST_INFO(original, TcpRecvSegCoalesceInfo) != NULL ||
+        NET_BUFFER_LIST_INFO(original, TcpReceiveBytesTransferred) != NULL;
+    if ((!grouped && NET_BUFFER_LIST_NEXT_NBL(original) != NULL) || !HvWfpRetainPacket()) return NULL;
+    PNET_BUFFER_LIST nbl = NULL;
+    NTSTATUS status;
+    if (grouped) status = FwpsReassembleForwardFragmentGroup0(ipv6 ? AF_INET6 : AF_INET,
+        original, NULL, 0, 0, &nbl);
+    else status = FwpsAllocateCloneNetBufferList0(original, NULL, NULL, 0, &nbl);
+    if (!NT_SUCCESS(status)) { HvWfpReleasePacket(); return NULL; }
+    HV_NBL_CONTEXT* context = AllocatePacketContext(nbl);
+    if (context == NULL) {
+        if (grouped) FwpsFreeNetBufferList0(nbl);
+        else FwpsFreeCloneNetBufferList0(nbl, 0);
+        HvWfpReleasePacket();
+        return NULL;
+    }
+    context->Owner = grouped ? HvOwnerWfpReassembled : HvOwnerWfpClone;
+    context->Ipv6 = ipv6;
+    // A logical segmentation/coalescing buffer is not a complete datagram.
+    // Preserve this fact before cloning without copying opaque OOB metadata.
+    context->Segmented = segmented;
+    context->ForwardInterface = route->DestinationIndex;
+    context->ForwardSubInterface = route->DestinationSubIndex;
+    context->Flags = route->Flags;
+    context->Compartment = route->Compartment;
+    return nbl;
+}
+void NTAPI HvForwardClassify(const FWPS_INCOMING_VALUES0* values,
+    const FWPS_INCOMING_METADATA_VALUES0* metadata, void* layerData,
+    const FWPS_FILTER0* filter, UINT64 flowContext, FWPS_CLASSIFY_OUT0* out) {
+    HV_FORWARD_VALUES route = {};
+    UNREFERENCED_PARAMETER(filter); UNREFERENCED_PARAMETER(flowContext);
+    if (!(out->rights & FWPS_RIGHT_ACTION_WRITE)) return;
+    out->actionType = FWP_ACTION_BLOCK;
+    out->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
+    if (values == NULL || layerData == NULL ||
+        (values->layerId != FWPS_LAYER_IPFORWARD_V4 && values->layerId != FWPS_LAYER_IPFORWARD_V6)) goto Reject;
+    {
+        BOOLEAN ipv6 = values->layerId == FWPS_LAYER_IPFORWARD_V6;
+        if (HvWfpIsSelfInjected(static_cast<PNET_BUFFER_LIST>(layerData), ipv6)) {
+            out->actionType = FWP_ACTION_PERMIT;
+            out->flags &= ~FWPS_CLASSIFY_OUT_FLAG_ABSORB;
+            return;
+        }
+        if (Stopping || !DecodeForward(values, metadata, ipv6, &route)) goto Reject;
+#ifdef HV_WFP_FRAGMENT_PERMIT_DIAGNOSTIC
+        // Opt-in diagnostic only: bypass policy/clone/injection for individual IPv4
+        // fragments. Leave fragment groups on the normal reassembly/verdict path.
+        if (!ipv6) {
+            auto* original = static_cast<PNET_BUFFER_LIST>(layerData);
+            PNET_BUFFER nb = NET_BUFFER_LIST_FIRST_NB(original);
+            ULONG length = nb == NULL ? 0 : NET_BUFFER_DATA_LENGTH(nb);
+            UCHAR header[20];
+            const auto* ip = nb == NULL || length < sizeof(header) ? NULL :
+                static_cast<const UCHAR*>(NdisGetDataBuffer(nb, sizeof(header), header, 1, 0));
+            BOOLEAN grouped = (route.Flags & FWP_CONDITION_FLAG_IS_FRAGMENT_GROUP) != 0;
+            BOOLEAN permit = HvForwardDiagnosticIpv4Fragment(ip, length, grouped);
+            ULONG kind = permit ? 0u : grouped ? 1u : 2u;
+            if (permit || grouped || length > 1500) {
+                ULONG count = (ULONG)InterlockedIncrement(&ForwardDiagnosticCounts[kind]);
+                if (count <= 32) HvWfpFragmentDiagnostic(kind, route.Flags, route.SourceIndex,
+                    route.DestinationIndex, length, NET_BUFFER_LIST_NEXT_NBL(original) != NULL, count);
+            }
+            if (permit) {
+                out->actionType = FWP_ACTION_PERMIT;
+                out->flags &= ~FWPS_CLASSIFY_OUT_FLAG_ABSORB;
+                return;
+            }
+        }
+#endif
+        BOOLEAN session = ExAcquireRundownProtection(&ClassificationRundown);
+        PNET_BUFFER_LIST nbl = CreateForwardPacket(static_cast<PNET_BUFFER_LIST>(layerData), &route, ipv6);
+        int result = nbl == NULL ? 1 : HvClassifyIp((ULONG_PTR)nbl, route.SourceIndex, HV_FORWARD_SOURCE_DIRECTION,
+            ipv6 ? 6u : 4u,
+            (route.Flags & (FWP_CONDITION_FLAG_IS_FRAGMENT_GROUP | FWP_CONDITION_FLAG_IS_FRAGMENT |
+                FWP_CONDITION_FLAG_IS_REASSEMBLED)) == 0 ? 1u : 0u, session ? 1u : 0u);
+        if (nbl == NULL) HvResourceDrop();
+        else HvFinishClassifyPacket(nbl, result, [out](PNET_BUFFER_LIST owned, ULONG decision) {
+            if (decision == 0 && !Stopping) {
+                out->actionType = FWP_ACTION_PERMIT;
+                out->flags &= ~FWPS_CLASSIFY_OUT_FLAG_ABSORB;
+            }
+            FreeForwardPacket(owned);
+        });
+        // Pending publication is the last NBL access. A verdict may already have
+        // injected/freed it; the original remains BLOCK|ABSORB in every such case.
+        if (out->actionType != FWP_ACTION_PERMIT) out->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+        if (session) ExReleaseRundownProtection(&ClassificationRundown);
+        return;
+    }
+Reject:
+    HvResourceDrop();
+    out->rights &= ~FWPS_RIGHT_ACTION_WRITE;
 }
 static void ClassifyChain(HV_ADAPTER* a, PNET_BUFFER_LIST chain, NDIS_PORT_NUMBER port,
     ULONG flags, ULONG direction, BOOLEAN resources, BOOLEAN admitted, BOOLEAN session) {
     while (chain != NULL) {
-        PNET_BUFFER_LIST nbl = chain;
-        HV_TOKEN* t = NULL;
+        PNET_BUFFER_LIST original = chain;
+        PNET_BUFFER_LIST nbl = NULL;
         LOCK_STATE_EX state;
         int result = 1;
-        chain = NET_BUFFER_LIST_NEXT_NBL(nbl);
-        // RESOURCES originals and their chain must be unchanged at callback exit.
-        if (!resources) NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
+        chain = NET_BUFFER_LIST_NEXT_NBL(original);
+        if (!resources) NET_BUFFER_LIST_NEXT_NBL(original) = NULL;
         if (HvClassifyAdmission(admitted, session)) {
             NdisAcquireRWLockRead(a->ClassificationLock, &state, 0);
-            t = CreateToken(a, nbl, port, flags, direction, resources);
-            if (t != NULL) [[likely]] {
+            nbl = CreateNdisPacket(a, original, port, flags, direction, resources);
+            if (nbl != NULL) {
                 ULONG_PTR cancel = direction == HV_DIRECTION_SEND ?
-                    (ULONG_PTR)NDIS_GET_NET_BUFFER_LIST_CANCEL_ID(nbl) : 0;
-                result = HvClassify((ULONG_PTR)t, a->InterfaceIndex, direction, cancel,
-                    session ? 1u : 0u);
+                    (ULONG_PTR)NDIS_GET_NET_BUFFER_LIST_CANCEL_ID(original) : 0;
+                result = HvClassify((ULONG_PTR)nbl, a->InterfaceIndex, direction, cancel, session ? 1u : 0u);
             }
             NdisReleaseRWLock(a->ClassificationLock, &state);
         }
-        if (t == NULL) {
+        if (nbl == NULL) {
             HvResourceDrop();
             if (direction == HV_DIRECTION_SEND) {
-                NET_BUFFER_LIST_STATUS(nbl) = admitted ? NDIS_STATUS_RESOURCES : NDIS_STATUS_PAUSED;
-                NdisFSendNetBufferListsComplete(a->Filter, nbl, SendCompleteFlags());
-            } else if (!resources) NdisFReturnNetBufferLists(a->Filter, nbl, ReturnFlags());
-        } else if (result >= 0) hv_finish((ULONG_PTR)t, (ULONG)result);
+                NET_BUFFER_LIST_STATUS(original) = admitted ? NDIS_STATUS_RESOURCES : NDIS_STATUS_PAUSED;
+                NdisFSendNetBufferListsComplete(a->Filter, original, SendCompleteFlags());
+            } else if (!resources) NdisFReturnNetBufferLists(a->Filter, original, ReturnFlags());
+        } else HvFinishClassifyPacket(nbl, result, [](PNET_BUFFER_LIST owned, ULONG decision) {
+            hv_finish((ULONG_PTR)owned, decision);
+        });
     }
 }
 _Use_decl_annotations_
@@ -564,11 +704,14 @@ void HvSendComplete(NDIS_HANDLE context, PNET_BUFFER_LIST chain, ULONG flags) {
     NdisAcquireSpinLock(&a->Lock); RetainActiveLocked(a); NdisReleaseSpinLock(&a->Lock);
     while (chain != NULL) {
         PNET_BUFFER_LIST nbl = chain;
-        HV_TOKEN* t;
-        chain = NET_BUFFER_LIST_NEXT_NBL(nbl); NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
-        t = TakeForwarded(a, nbl, HV_DIRECTION_SEND);
+        chain = NET_BUFFER_LIST_NEXT_NBL(nbl);
+        NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
+        HV_NBL_CONTEXT* packet = PacketContext(nbl);
+        if (packet->Adapter != a || packet->Owner != HvOwnerNdis || !packet->Forwarded ||
+            packet->Direction != HV_DIRECTION_SEND) hv_bugcheck();
+        FreePacketContext(nbl);
         NdisFSendNetBufferListsComplete(a->Filter, nbl, flags);
-        if (t != NULL) [[likely]] ReleaseToken(t);
+        ReleaseActive(a, 1);
     }
     ReleaseActive(a, 1);
 }
@@ -596,12 +739,16 @@ void HvReturn(NDIS_HANDLE context, PNET_BUFFER_LIST chain, ULONG flags) {
     NdisAcquireSpinLock(&a->Lock); RetainActiveLocked(a); NdisReleaseSpinLock(&a->Lock);
     while (chain != NULL) {
         PNET_BUFFER_LIST nbl = chain;
-        HV_TOKEN* t;
-        chain = NET_BUFFER_LIST_NEXT_NBL(nbl); NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
-        t = TakeForwarded(a, nbl, HV_DIRECTION_RECEIVE);
-        if (t != NULL && t->Copied) FreeReceiveCopy(nbl);
+        chain = NET_BUFFER_LIST_NEXT_NBL(nbl);
+        NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
+        HV_NBL_CONTEXT* packet = PacketContext(nbl);
+        if (packet->Adapter != a || packet->Owner != HvOwnerNdis || !packet->Forwarded ||
+            packet->Direction != HV_DIRECTION_RECEIVE) hv_bugcheck();
+        BOOLEAN copied = packet->Copied;
+        FreePacketContext(nbl);
+        if (copied) FreeReceiveCopy(nbl);
         else NdisFReturnNetBufferLists(a->Filter, nbl, flags);
-        if (t != NULL) [[likely]] ReleaseToken(t);
+        ReleaseActive(a, 1);
     }
     ReleaseActive(a, 1);
 }
@@ -610,7 +757,7 @@ static void Invalidate(HV_ADAPTER* a) {
     NdisAcquireRWLockWrite(a->ClassificationLock, &state, 0);
     HvInvalidate(a->InterfaceIndex, TRUE);
     NdisReleaseRWLock(a->ClassificationLock, &state);
-    HvDrain(); // No NDIS call under the classification/policy locks.
+    HvDrain(); // No NDIS call or retired-cache free under classification/policy locks.
 }
 static void HvOidCopyResult(PNDIS_OID_REQUEST original, PNDIS_OID_REQUEST clone) {
     switch (clone->RequestType) {
@@ -849,7 +996,6 @@ NDIS_STATUS HvFilterAttach(NDIS_HANDLE filter, NDIS_HANDLE context, PNDIS_FILTER
     NDIS_STATUS status = NDIS_STATUS_RESOURCES;
     GUID interfaceGuid;
     KIRQL irql;
-    ULONG bucket;
     UNREFERENCED_PARAMETER(context);
     // No fallback by friendly name, media type or wildcard. Missing/stale target
     // configuration means no adapter attaches; optional LWFs are bypassed by NDIS.
@@ -861,7 +1007,6 @@ NDIS_STATUS HvFilterAttach(NDIS_HANDLE filter, NDIS_HANDLE context, PNDIS_FILTER
     a->Id = (UINT64)InterlockedIncrement64(&NextAdapter);
     CaptureAttachInfo(a, p, &interfaceGuid);
     NdisAllocateSpinLock(&a->Lock);
-    for (bucket = 0; bucket < HV_TOKEN_BUCKET_COUNT; ++bucket) InitializeListHead(&a->Tokens[bucket]);
     ExInitializeRundownProtection(&a->OidRundown);
     a->ClassificationLock = NdisAllocateRWLock(filter);
     if (a->ClassificationLock == NULL) [[unlikely]] goto FreeLock;
@@ -878,7 +1023,11 @@ NDIS_STATUS HvFilterAttach(NDIS_HANDLE filter, NDIS_HANDLE context, PNDIS_FILTER
     nbPool.PoolTag = TAG;
     a->NbPool = NdisAllocateNetBufferPool(filter, &nbPool);
     if (a->NbPool == NULL) [[unlikely]] goto FreeNblPool;
-    if (!HvAttach(a->InterfaceIndex)) goto FreeNbPool;
+    {
+        ULONG attached = HvAttach(a->InterfaceIndex);
+        HvDrain();
+        if (!attached) goto FreeNbPool;
+    }
     attributes.Header.Type = NDIS_OBJECT_TYPE_FILTER_ATTRIBUTES;
     attributes.Header.Revision = NDIS_FILTER_ATTRIBUTES_REVISION_1;
     attributes.Header.Size = NDIS_SIZEOF_FILTER_ATTRIBUTES_REVISION_1;
@@ -891,6 +1040,7 @@ NDIS_STATUS HvFilterAttach(NDIS_HANDLE filter, NDIS_HANDLE context, PNDIS_FILTER
         return status;
     }
     HvDetach(a->InterfaceIndex);
+    HvDrain();
 FreeNbPool:
     NdisFreeNetBufferPool(a->NbPool);
 FreeNblPool:
@@ -930,13 +1080,14 @@ _Use_decl_annotations_
 void HvFilterDetach(NDIS_HANDLE context) {
     HV_ADAPTER* a = static_cast<HV_ADAPTER*>(context);
     KIRQL irql;
-    if (a->Running || a->Active != 0 || !TokensEmpty(a)) hv_bugcheck();
+    if (a->Running || a->Active != 0) hv_bugcheck();
     KeAcquireSpinLock(&AdapterInfoLock, &irql);
     RemoveEntryList(&a->AdapterLink);
     if (!HvSubtractU64(AdapterCount, 1, &AdapterCount)) hv_bugcheck();
     KeReleaseSpinLock(&AdapterInfoLock, irql);
     ExWaitForRundownProtectionRelease(&a->OidRundown);
     HvDetach(a->InterfaceIndex);
+    HvDrain();
     NdisFreeNetBufferPool(a->NbPool); NdisFreeNetBufferListPool(a->NblPool);
     NdisFreeRWLock(a->ClassificationLock); NdisFreeSpinLock(&a->Lock); ExFreePoolWithTag(a, TAG);
 }
@@ -1151,6 +1302,8 @@ NTSTATUS hv_initialize(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
         HvReadQueueAcquire, HvReadQueueRelease, ReadCancelled);
     if (!NT_SUCCESS(status)) return status;
     ReadConfiguration(registry);
+    status = HvWfpInitialize(driver);
+    if (!NT_SUCCESS(status)) return status;
     c.Header.Type = NDIS_OBJECT_TYPE_FILTER_DRIVER_CHARACTERISTICS;
     c.Header.Revision = NDIS_FILTER_CHARACTERISTICS_REVISION_2;
     c.Header.Size = NDIS_SIZEOF_FILTER_DRIVER_CHARACTERISTICS_REVISION_2;
@@ -1167,7 +1320,7 @@ NTSTATUS hv_initialize(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     // Direct OID callbacks remain NULL: NDIS bypasses this non-intercepting LWF.
     driver->DriverUnload = HvUnload;
     status = NdisFRegisterFilterDriver(driver, driver, &c, &DriverHandle);
-    if (status != NDIS_STATUS_SUCCESS) return status;
+    if (status != NDIS_STATUS_SUCCESS) { HvWfpUninitialize(); return status; }
     dispatch[IRP_MJ_CREATE] = HvDispatch; dispatch[IRP_MJ_CLEANUP] = HvDispatch;
     dispatch[IRP_MJ_CLOSE] = HvDispatch; dispatch[IRP_MJ_READ] = HvDispatch;
     dispatch[IRP_MJ_WRITE] = HvDispatch; dispatch[IRP_MJ_DEVICE_CONTROL] = HvDispatch;
@@ -1177,13 +1330,17 @@ NTSTATUS hv_initialize(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     attributes.DeviceName = &device; attributes.SymbolicName = &link;
     attributes.MajorFunctions = dispatch; attributes.DefaultSDDLString = &sddl;
     status = NdisRegisterDeviceEx(DriverHandle, &attributes, &ControlDevice, &DeviceHandle);
-    if (status != NDIS_STATUS_SUCCESS) {NdisFDeregisterFilterDriver(DriverHandle); DriverHandle = NULL; return status;}
+    if (status != NDIS_STATUS_SUCCESS) {
+        HvWfpStop(); NdisFDeregisterFilterDriver(DriverHandle); HvWfpUninitialize();
+        DriverHandle = NULL; return status;
+    }
     ReadWorkItem = IoAllocateWorkItem(ControlDevice);
     CacheWorkItem = IoAllocateWorkItem(ControlDevice);
     if (ReadWorkItem == NULL || CacheWorkItem == NULL) [[unlikely]] {
         if (ReadWorkItem != NULL) {IoFreeWorkItem(ReadWorkItem); ReadWorkItem = NULL;}
         if (CacheWorkItem != NULL) {IoFreeWorkItem(CacheWorkItem); CacheWorkItem = NULL;}
-        NdisDeregisterDeviceEx(DeviceHandle); NdisFDeregisterFilterDriver(DriverHandle);
+        NdisDeregisterDeviceEx(DeviceHandle);
+        HvWfpStop(); NdisFDeregisterFilterDriver(DriverHandle); HvWfpUninitialize();
         DriverHandle = NULL; return STATUS_INSUFFICIENT_RESOURCES;
     }
     ScheduleRead();
@@ -1204,7 +1361,9 @@ void HvUnload(PDRIVER_OBJECT driver) {
     ExWaitForRundownProtectionRelease(&CacheRundown);
     IoFreeWorkItem(ReadWorkItem); ReadWorkItem = NULL;
     IoFreeWorkItem(CacheWorkItem); CacheWorkItem = NULL;
+    HvWfpStop();
     NdisFDeregisterFilterDriver(DriverHandle);
+    HvWfpUninitialize();
     NdisDeregisterDeviceEx(DeviceHandle);
     if (ReadyEvent != NULL) {ObDereferenceObject(ReadyEvent); ReadyEvent = NULL;}
     if (ReadyEventHandle != NULL) {ZwClose(ReadyEventHandle); ReadyEventHandle = NULL;}

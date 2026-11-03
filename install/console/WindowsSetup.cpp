@@ -182,6 +182,7 @@ public:
     }
     ~WindowsSystem() override {
         network_.reset();
+        store_files_.clear();
         files_.clear();
         CoUninitialize();
     }
@@ -244,7 +245,8 @@ public:
     void ValidatePackage(const std::filesystem::path& package) override {
         package_ = std::filesystem::canonical(package);
         files_ = LockAndVerifyPackage(package_);
-        Print(L"Package signatures, catalog membership and target-restricted INF verified.\n");
+        store_files_ = LockMatchingWindowsDriverPackages(files_);
+        Print(L"Package signatures, catalog membership, target-restricted INF and existing Driver Store files verified.\n");
     }
 
     void VerifyConfiguration(const Targets& targets) override {
@@ -333,11 +335,9 @@ public:
     }
 
     Change InstallComponent(const std::filesystem::path&) override {
-        if (!network_ || files_.size() != 4) throw Error{L"Installation was not preflighted or locked."};
-        if (!SetupCopyOEMInfW((package_ / L"HyperVXNdisFilter.inf").c_str(), package_.c_str(), SPOST_PATH,
-                              0, nullptr, 0, nullptr, nullptr)) {
-            throw Error{L"Stage the validated driver-store package: " + ErrorCode(GetLastError())};
-        }
+        if (!network_ || files_.size() != kPackageFiles.size()) throw Error{L"Installation was not preflighted or locked."};
+        auto staged = StageVerifiedWindowsDriverPackage(package_, files_);
+        for (auto& file : staged) store_files_.push_back(std::move(file));
         ComPtr<INetCfgClassSetup> setup;
         Check(network_->config->QueryNetCfgClass(&GUID_DEVCLASS_NETSERVICE, IID_PPV_ARGS(&setup)), L"Get NetService setup class");
         OBO_TOKEN token{};
@@ -424,7 +424,7 @@ private:
 
     std::unique_ptr<Network> network_;
     std::filesystem::path package_;
-    std::vector<Handle> files_;
+    std::vector<Handle> files_, store_files_;
 };
 
 } // namespace

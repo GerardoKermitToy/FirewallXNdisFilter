@@ -89,15 +89,6 @@ int main() {
     CHECK(HvSubtractU64(value, ULLONG_MAX, &value) && value == 0);
     CHECK(!HvSubtractU64(value, 1, &value) && value == 0);
 
-    unsigned buckets[HV_TOKEN_BUCKET_COUNT]{};
-    for (unsigned i = 0; i < 10000; ++i) {
-        const auto send = HvTokenBucketIndex(static_cast<unsigned long long>(i) * 16, HV_DIRECTION_SEND);
-        const auto receive = HvTokenBucketIndex(static_cast<unsigned long long>(i) * 16, HV_DIRECTION_RECEIVE);
-        CHECK(send < HV_TOKEN_BUCKET_COUNT && receive < HV_TOKEN_BUCKET_COUNT && send != receive);
-        ++buckets[send];
-    }
-    for (unsigned count : buckets) CHECK(count != 0); // Buckets, not a distinct-token limit.
-
     for (int copied : {0, 1}) {
         CHECK(HvFinishRoute(HV_DIRECTION_SEND, copied, 1) == HvRouteSend);
         CHECK(HvFinishRoute(HV_DIRECTION_SEND, copied, 0) == HvRouteCompleteSend);

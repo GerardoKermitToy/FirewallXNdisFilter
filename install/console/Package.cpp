@@ -4,6 +4,8 @@
 #include <wintrust.h>
 #include <softpub.h>
 #include <mscat.h>
+#include <algorithm>
+#include <cstring>
 #include <map>
 
 namespace hyperv_xndis_filter::setup {
@@ -259,6 +261,28 @@ void VerifyCatalogMember(CatalogAdmin& admin, const std::filesystem::path& catal
     VerifyTrust(data, member.filename().wstring());
 }
 
+bool SameFileContents(HANDLE first, HANDLE second) {
+    LARGE_INTEGER first_size{}, second_size{}, start{};
+    if (!GetFileSizeEx(first, &first_size) || !GetFileSizeEx(second, &second_size) ||
+        !SetFilePointerEx(first, start, nullptr, FILE_BEGIN) || !SetFilePointerEx(second, start, nullptr, FILE_BEGIN)) {
+        throw Error{L"Read package file identity: " + ErrorCode(GetLastError())};
+    }
+    if (first_size.QuadPart < 0 || first_size.QuadPart != second_size.QuadPart) return false;
+    std::array<BYTE, 16 * 1024> a{}, b{};
+    auto remaining = static_cast<ULONGLONG>(first_size.QuadPart);
+    while (remaining) {
+        const DWORD size = static_cast<DWORD>(std::min<ULONGLONG>(remaining, a.size()));
+        DWORD read_a = 0, read_b = 0;
+        if (!ReadFile(first, a.data(), size, &read_a, nullptr) ||
+            !ReadFile(second, b.data(), size, &read_b, nullptr)) {
+            throw Error{L"Compare package files: " + ErrorCode(GetLastError())};
+        }
+        if (read_a != size || read_b != size || std::memcmp(a.data(), b.data(), size) != 0) return false;
+        remaining -= size;
+    }
+    return true;
+}
+
 } // namespace
 
 void ValidateInfFile(const std::filesystem::path& path) {
@@ -291,12 +315,9 @@ void ValidateRemovalInfFile(const std::filesystem::path& path) {
     inf.RequireRemovalIdentity();
 }
 
-std::vector<Handle> LockAndVerifyPackage(const std::filesystem::path& package) {
-    constexpr std::array<const wchar_t*, 4> names = {
-        L"HyperVXNdisFilter.inf", kDriverFileName, L"HyperVXNdisFilterNotify.dll", L"HyperVXNdisFilter.cat"
-    };
+std::vector<Handle> LockPackageFiles(const std::filesystem::path& package) {
     std::vector<Handle> files;
-    for (const auto name : names) {
+    for (const auto name : kPackageFiles) {
         const auto path = package / name;
         // Keep read-only, non-delete-sharing handles alive through installation,
         // so the files checked here cannot be replaced before SetupCopyOEMInf.
@@ -308,11 +329,30 @@ std::vector<Handle> LockAndVerifyPackage(const std::filesystem::path& package) {
             (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) throw Error{L"A package input is not a regular file."};
         files.push_back(std::move(file));
     }
-    ValidateInfFile(package / names[0]);
-    for (size_t i = 1; i < names.size(); ++i) VerifyFileSignature(package / names[i], files[i].get());
+    return files;
+}
+
+std::vector<Handle> LockAndVerifyPackage(const std::filesystem::path& package) {
+    auto files = LockPackageFiles(package);
+    ValidateInfFile(package / kPackageFiles[0]);
+    for (size_t i = 1; i < kPackageFiles.size(); ++i) VerifyFileSignature(package / kPackageFiles[i], files[i].get());
     CatalogAdmin admin;
-    for (size_t i = 0; i < names.size() - 1; ++i) {
-        VerifyCatalogMember(admin, package / names[3], package / names[i], files[i].get());
+    for (size_t i = 0; i < kPackageFiles.size() - 1; ++i) {
+        VerifyCatalogMember(admin, package / kPackageFiles[3], package / kPackageFiles[i], files[i].get());
+    }
+    return files;
+}
+
+std::vector<Handle> LockMatchingPackage(const std::filesystem::path& package, const std::vector<Handle>& expected) {
+    if (expected.size() != kPackageFiles.size()) throw Error{L"Source package was not locked and validated."};
+    auto files = LockPackageFiles(package);
+    for (size_t i = 0; i < kPackageFiles.size(); ++i) {
+        // INF/version/signature equality alone cannot prove which SYS will load.
+        // Compare every byte, including the catalog, and retain both file locks.
+        if (!SameFileContents(expected[i].get(), files[i].get())) {
+            throw Error{L"Driver Store package differs from the validated source: " + (package / kPackageFiles[i]).wstring() +
+                        L". Installation stopped before NetCfg activation. Explicitly remove the old HyperVXNdisFilter packages with Uninstall.exe before retrying; no package was overwritten or purged."};
+        }
     }
     return files;
 }

@@ -217,8 +217,9 @@ int MonitorMain(int argc, wchar_t** argv) {
         Emit("%s[WARN] Adapter information unavailable: %s\n",
              TimePrefix(opt.timestamps).c_str(), error.c_str());
     }
-    std::printf("CONN: one NBL decision, direction=0 outbound/1 inbound from the guest side.\n"
+    std::printf("CONN: one shared NBL decision; NDIS direction=0 outbound/1 inbound from the guest side.\n"
                 "Local=guest endpoint, remote=peer; host receive=outbound, host send=inbound; no process/thread identity.\n"
+                "Global IPFORWARD: source interface index, direction=0, local=IP source; shared verdict API; requires BFE.\n"
                 "Payload is the complete layer-3 logical IP packet, up to 1 MiB without truncation.\n"
                 "TCP/UDP cache only: four tables per host interface, TCP/UDP x IPv4/IPv6; key=IP+port.\n"
                 "TCP and UDP use separate caches; both directions share tuples within each.\n"

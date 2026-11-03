@@ -98,7 +98,9 @@ impl Packet {
         Ok(())
     }
     pub fn orient(&mut self, path: NdisPath) {
-        let direction = path.direction();
+        self.orient_direction(path.direction());
+    }
+    pub fn orient_direction(&mut self, direction: Direction) {
         self.connection.direction = direction;
         let (local_ip, remote_ip, local_port, remote_port) = match direction {
             Direction::Outbound => (
@@ -132,7 +134,7 @@ fn be16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
 }
 
-// Only read policy fields from the copied NDIS host-memory prefix. Both headers
+// Only read policy fields from the readable NDIS host-memory prefix. Both headers
 // and payload remain untrusted network input and all offsets are checked.
 // None means a non-IP Ethernet control frame, outside the legacy L3 wire API.
 // Hints favor valid IPv4 TCP/UDP, without excluding other traffic or errors.
@@ -163,12 +165,31 @@ pub fn parse(
     if unlikely(!matches!(ether_type, 0x0800 | 0x86dd)) {
         return Ok(None);
     }
-    let ip = &trusted[offset..];
-    let logical = frame_len.checked_sub(offset).ok_or(ParseError::Truncated)?;
-    let mut p = Packet::EMPTY;
+    let mut p = parse_ip(
+        &trusted[offset..],
+        trusted.len() - offset,
+        frame_len.checked_sub(offset).ok_or(ParseError::Truncated)?,
+        ether_type == 0x86dd,
+        offload,
+    )?;
     p.flow.l2[..offset].copy_from_slice(&trusted[..offset]);
     p.flow.l2_len = offset as u8;
-    let (mut transport, mut proto, fragmented, ip_len) = if likely(ether_type == 0x0800) {
+    Ok(Some(p))
+}
+
+// IPFORWARD starts at the IP header. Share all length/transport validation with
+// Ethernet input without inventing a link header or changing captured bytes.
+pub fn parse_ip(
+    data: &[u8],
+    trusted_len: usize,
+    packet_len: usize,
+    ipv6: bool,
+    offload: bool,
+) -> Result<Packet, ParseError> {
+    let ip = &data[..trusted_len.min(data.len())];
+    let logical = packet_len;
+    let mut p = Packet::EMPTY;
+    let (mut transport, mut proto, fragmented, ip_len) = if likely(!ipv6) {
         if unlikely(ip.len() < 20) {
             return Err(ParseError::Truncated);
         }
@@ -284,7 +305,7 @@ pub fn parse(
     p.connection.local_port = p.flow.source_port;
     p.connection.remote_port = p.flow.destination_port;
     p.payload_len = ip_len as u32;
-    Ok(Some(p))
+    Ok(p)
 }
 
 #[cfg(test)]
@@ -302,6 +323,57 @@ mod tests {
         b[36..38].copy_from_slice(&53u16.to_be_bytes());
         b[38..40].copy_from_slice(&8u16.to_be_bytes());
         b
+    }
+    #[test]
+    fn raw_ip_uses_the_same_parser_without_a_synthetic_ethernet_header() {
+        for ipv6 in [false, true] {
+            let mut frame = udp();
+            if ipv6 {
+                frame = [0; 64];
+                frame[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+                frame[14] = 0x60;
+                frame[18..20].copy_from_slice(&8u16.to_be_bytes());
+                frame[20] = 17;
+                frame[22..38].copy_from_slice(&[0x20; 16]);
+                frame[38..54].copy_from_slice(&[0x30; 16]);
+                frame[54..56].copy_from_slice(&1234u16.to_be_bytes());
+                frame[56..58].copy_from_slice(&53u16.to_be_bytes());
+                frame[58..60].copy_from_slice(&8u16.to_be_bytes());
+            }
+            let ethernet = parse(&frame, frame.len(), frame.len(), false)
+                .unwrap()
+                .unwrap();
+            let ip = &frame[14..];
+            let raw = parse_ip(ip, ip.len(), ip.len(), ipv6, false).unwrap();
+            assert_eq!(raw.flow.l2_len, 0);
+            assert_eq!(raw.payload_len, ethernet.payload_len);
+            assert_eq!(raw.ip_len, ethernet.ip_len);
+            assert_eq!(raw.cacheable, ethernet.cacheable);
+            assert!(raw.cacheable);
+            for direction in [Direction::Outbound, Direction::Inbound] {
+                let mut raw = raw;
+                let mut ethernet = ethernet;
+                raw.orient_direction(direction);
+                ethernet.orient_direction(direction);
+                assert_eq!(raw.connection, ethernet.connection);
+                let layout = raw.capture_layout().unwrap();
+                assert_eq!(layout.frame_start, connection_header_len(&raw.connection));
+                assert_eq!(layout.frame_len, raw.payload_len as usize);
+                assert_eq!(layout.record_len, layout.frame_start + layout.frame_len);
+            }
+            assert_eq!(
+                parse_ip(ip, ip.len(), ip.len(), !ipv6, false).unwrap_err(),
+                ParseError::Malformed
+            );
+            assert_eq!(
+                parse_ip(ip, 19, ip.len(), ipv6, false).unwrap_err(),
+                ParseError::Truncated
+            );
+            assert_eq!(
+                parse_ip(ip, ip.len(), 19, ipv6, false).unwrap_err(),
+                ParseError::Truncated
+            );
+        }
     }
     #[test]
     fn ipv4_udp_network_payload_and_ports() {

@@ -62,12 +62,12 @@ fn capture(packet: &Packet, frame: &[u8]) -> Vec<u8> {
     data
 }
 
-fn submit(engine: &mut Engine, packet: Packet, path: NdisPath, token: usize, frame: &[u8]) -> u64 {
+fn submit(engine: &mut Engine, packet: Packet, path: NdisPath, nbl: usize, frame: &[u8]) -> u64 {
     let data = capture(&packet, frame);
     let Submission::Pending(id) = engine.submit(
         101,
         packet,
-        token,
+        nbl,
         (path == NdisPath::Send).then_some(0),
         100,
         Some(data),
@@ -161,7 +161,7 @@ fn guest_wire_direction_and_endpoints_survive_allow_and_drop() {
                 );
                 assert_eq!(&event[36..], &bytes[14..]);
                 let action = engine.verdict(id, verdict, 101).unwrap();
-                assert_eq!(action.token, 7);
+                assert_eq!(action.nbl, 7);
                 assert_eq!(
                     action.finish,
                     if verdict.allows() {
@@ -187,7 +187,7 @@ fn tcp_reply_reuses_the_same_normalized_tuple_cache_entry() {
         let response = reply(&request);
         let incoming = parse(&response, NdisPath::Send);
         let action = engine.preflight(101, &incoming, 2, 102).unwrap_err();
-        assert_eq!(action.token, 2);
+        assert_eq!(action.nbl, 2);
         assert_eq!(
             action.finish,
             if verdict.allows() {

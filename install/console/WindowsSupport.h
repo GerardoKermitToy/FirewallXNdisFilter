@@ -79,6 +79,13 @@ void ValidateRemovalInfFile(const std::filesystem::path& inf);
 bool IsPublishedInfName(const std::wstring& name);
 std::vector<std::wstring> ReadWindowsDriverPackages();
 Change RemoveWindowsDriverPackage(const std::wstring& published_inf);
+inline constexpr std::array<const wchar_t*, 4> kPackageFiles = {
+    L"HyperVXNdisFilter.inf", kDriverFileName, L"HyperVXNdisFilterNotify.dll", L"HyperVXNdisFilter.cat"
+};
+std::vector<Handle> LockPackageFiles(const std::filesystem::path& package);
 std::vector<Handle> LockAndVerifyPackage(const std::filesystem::path& package);
+std::vector<Handle> LockMatchingPackage(const std::filesystem::path& package, const std::vector<Handle>& expected);
+std::vector<Handle> LockMatchingWindowsDriverPackages(const std::vector<Handle>& expected);
+std::vector<Handle> StageVerifiedWindowsDriverPackage(const std::filesystem::path& package, const std::vector<Handle>& expected);
 
 } // namespace hyperv_xndis_filter::setup

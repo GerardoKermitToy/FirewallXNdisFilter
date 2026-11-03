@@ -24,7 +24,7 @@ pub enum Finish {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Action {
-    pub token: usize,
+    pub nbl: usize,
     pub finish: Finish,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +40,8 @@ pub enum VerdictError {
 struct Interface {
     interface_index: u32,
     running: bool,
+    ndis_attached: bool,
+    forwarding: bool,
     dirty: bool,
     candidate: bool,
     caches: Caches,
@@ -47,7 +49,7 @@ struct Interface {
 #[derive(Clone, Copy)]
 struct Pending {
     id: u64,
-    token: usize,
+    nbl: usize,
     cancel: Option<usize>,
     deadline: u64,
     interface_index: u32,
@@ -332,7 +334,7 @@ impl Engine {
             self.queued_bytes -= event.data.len();
             if let Some(handle) = event.pending {
                 // SAFETY: a pending node is retained until BOTH its event has
-                // left the queue and its NBL token has been claimed. No event
+                // left the queue and its NBL has been claimed. No event
                 // handle escapes; there is exactly one event per pending node.
                 let pending = unsafe { self.pending.get_mut(handle) };
                 pending.event = None;
@@ -348,7 +350,7 @@ impl Engine {
         self.clear_events();
         self.clear_cache();
         self.clear_bandwidth();
-        self.log(3, "HyperVXNdisFilter LWF: full IP packets; no process ID; direction=0 outbound/1 inbound from guest side (host receive/send); no TID, redirects, UpdateV4/V6 or synthetic END");
+        self.log(3, "HyperVXNdisFilter: shared NDIS/IPFORWARD verdicts and traffic data; full IP packets, interface index, no PID, redirects, UpdateV4/V6 or synthetic END");
     }
     // Complete actions using take_due() after dropping the lock.
     pub fn disconnect(&mut self) {
@@ -359,30 +361,79 @@ impl Engine {
         self.clear_bandwidth();
     }
     pub fn attach(&mut self, interface_index: u32) -> bool {
-        if interface_index == 0
-            || self
-                .interfaces
-                .iter()
-                .any(|s| s.interface_index == interface_index)
-        {
+        if interface_index == 0 {
             return false;
+        }
+        if let Some(interface) = self
+            .interfaces
+            .iter_mut()
+            .find(|s| s.interface_index == interface_index)
+        {
+            if interface.ndis_attached {
+                return false;
+            }
+            interface.ndis_attached = true;
+            interface.running = false;
+            return true;
         }
         self.interfaces
             .try_push_back(Interface {
                 interface_index,
                 running: false,
+                ndis_attached: true,
+                forwarding: false,
                 dirty: false,
                 candidate: false,
                 caches: Caches::new(self.cache_allocator),
             })
             .is_ok()
     }
-    pub fn restart(&mut self, interface_index: u32) -> bool {
+    // WFP observes any source interface. Reuse the same policy/cache row; no
+    // NETIO inventory, network-lifecycle callback or parallel flow store exists.
+    pub fn ensure_forward(&mut self, interface_index: u32) -> bool {
+        if interface_index == 0 {
+            return false;
+        }
         if let Some(interface) = self
             .interfaces
             .iter_mut()
-            .find(|s| s.interface_index == interface_index && interface_index != 0)
+            .find(|s| s.interface_index == interface_index)
         {
+            interface.forwarding = true;
+            return true;
+        }
+        self.interfaces
+            .try_push_back(Interface {
+                interface_index,
+                running: false,
+                ndis_attached: false,
+                forwarding: true,
+                dirty: false,
+                candidate: false,
+                caches: Caches::new(self.cache_allocator),
+            })
+            .is_ok()
+    }
+    // Driver shutdown only, never an interface-change notification. Release
+    // forward-only rows using the same unlocked cache reclamation as NDIS.
+    pub fn stop_forward(&mut self) {
+        while let Some(handle) = self.interfaces.find(|s| s.forwarding) {
+            let index = unsafe { self.interfaces.get(handle) }.interface_index;
+            self.invalidate(index, false);
+            let interface = unsafe { self.interfaces.get_mut(handle) };
+            interface.forwarding = false;
+            if !interface.ndis_attached {
+                interface.interface_index = 0;
+                if !interface.dirty {
+                    unsafe { self.interfaces.remove(handle) };
+                }
+            }
+        }
+    }
+    pub fn restart(&mut self, interface_index: u32) -> bool {
+        if let Some(interface) = self.interfaces.iter_mut().find(|s| {
+            s.interface_index == interface_index && interface_index != 0 && s.ndis_attached
+        }) {
             interface.running = true;
             true
         } else {
@@ -419,17 +470,19 @@ impl Engine {
         {
             // SAFETY: handle was found in this list, with exclusive engine access.
             let interface = unsafe { self.interfaces.get_mut(handle) };
-            interface.interface_index = 0;
-            if !interface.dirty {
-                // Empty cache banks have nothing to free under PolicyLock.
-                unsafe { self.interfaces.remove(handle) };
+            interface.ndis_attached = false;
+            if !interface.forwarding {
+                interface.interface_index = 0;
+                if !interface.dirty {
+                    unsafe { self.interfaces.remove(handle) };
+                }
             }
         }
     }
     fn running(&self, interface_index: u32) -> bool {
         self.interfaces
             .iter()
-            .any(|s| s.interface_index == interface_index && s.running)
+            .any(|s| s.interface_index == interface_index && (s.running || s.forwarding))
     }
     // Immediately disable all old tables; retire one bank at a time outside the
     // driver lock rather than returning a large per-interface array on its stack.
@@ -528,7 +581,9 @@ impl Engine {
             return None;
         }
         self.interfaces.find(|interface| {
-            interface.interface_index == interface_index && interface.running && !interface.dirty
+            interface.interface_index == interface_index
+                && (interface.running || interface.forwarding)
+                && !interface.dirty
         })
     }
     pub fn cache_plan(&self, id: u64, verdict: Verdict, now: u64) -> Option<CachePlan> {
@@ -609,7 +664,7 @@ impl Engine {
         &mut self,
         interface_index: u32,
         packet: &Packet,
-        token: usize,
+        nbl: usize,
         now: u64,
         work: &mut BandwidthWork,
     ) -> Option<Action> {
@@ -631,7 +686,7 @@ impl Engine {
         self.stats.received = self.stats.received.saturating_add(1);
         self.account(interface_index, packet, allow, work);
         Some(Action {
-            token,
+            nbl,
             finish: if allow { Finish::Allow } else { Finish::Drop },
         })
     }
@@ -641,21 +696,21 @@ impl Engine {
         &mut self,
         interface_index: u32,
         packet: &Packet,
-        token: usize,
+        nbl: usize,
         now: u64,
     ) -> Result<bool, Action> {
         let mut work = BandwidthWork::prepare(self.bandwidth_plan());
-        self.preflight_with_work(interface_index, packet, token, now, &mut work)
+        self.preflight_with_work(interface_index, packet, nbl, now, &mut work)
     }
     pub fn preflight_with_work(
         &mut self,
         interface_index: u32,
         packet: &Packet,
-        token: usize,
+        nbl: usize,
         now: u64,
         work: &mut BandwidthWork,
     ) -> Result<bool, Action> {
-        if let Some(action) = self.immediate(interface_index, packet, token, now, work) {
+        if let Some(action) = self.immediate(interface_index, packet, nbl, now, work) {
             Err(action)
         } else {
             Ok(self.event_room(packet))
@@ -665,46 +720,38 @@ impl Engine {
         &mut self,
         interface_index: u32,
         packet: &Packet,
-        token: usize,
+        nbl: usize,
         work: &mut BandwidthWork,
     ) -> Submission {
         self.stats.overflow = self.stats.overflow.saturating_add(1);
         let finish = self.fallback();
         self.account(interface_index, packet, finish == Finish::Allow, work);
-        Submission::Finish(Action { token, finish })
+        Submission::Finish(Action { nbl, finish })
     }
     pub fn submit(
         &mut self,
         interface_index: u32,
         packet: Packet,
-        token: usize,
+        nbl: usize,
         cancel: Option<usize>,
         now: u64,
         record: Option<Vec<u8>>,
     ) -> Submission {
         let mut work = BandwidthWork::prepare(self.bandwidth_plan());
-        self.submit_with_work(
-            interface_index,
-            packet,
-            token,
-            cancel,
-            now,
-            record,
-            &mut work,
-        )
+        self.submit_with_work(interface_index, packet, nbl, cancel, now, record, &mut work)
     }
     #[allow(clippy::too_many_arguments)]
     pub fn submit_with_work(
         &mut self,
         interface_index: u32,
         packet: Packet,
-        token: usize,
+        nbl: usize,
         cancel: Option<usize>,
         now: u64,
         record: Option<Vec<u8>>,
         work: &mut BandwidthWork,
     ) -> Submission {
-        if let Some(action) = self.immediate(interface_index, &packet, token, now, work) {
+        if let Some(action) = self.immediate(interface_index, &packet, nbl, now, work) {
             return Submission::Finish(action);
         }
         self.stats.received = self.stats.received.saturating_add(1);
@@ -716,12 +763,12 @@ impl Engine {
             self.stats.malformed = self.stats.malformed.saturating_add(1);
             self.account(interface_index, &packet, false, work);
             return Submission::Finish(Action {
-                token,
+                nbl,
                 finish: Finish::Drop,
             });
         }
         if unlikely(!self.has_room(expected) || self.next_id == u64::MAX || record.is_none()) {
-            return self.overflow(interface_index, &packet, token, work);
+            return self.overflow(interface_index, &packet, nbl, work);
         }
         let id = self.next_id;
         let mut data = record.unwrap_or_default();
@@ -738,13 +785,13 @@ impl Engine {
             self.stats.malformed = self.stats.malformed.saturating_add(1);
             self.account(interface_index, &packet, false, work);
             return Submission::Finish(Action {
-                token,
+                nbl,
                 finish: Finish::Drop,
             });
         }
         let Ok(handle) = self.pending.try_push_back(Pending {
             id,
-            token,
+            nbl,
             cancel,
             deadline: now.saturating_add(self.timeout),
             interface_index,
@@ -752,12 +799,12 @@ impl Engine {
             event: None,
             packet,
         }) else {
-            return self.overflow(interface_index, &packet, token, work);
+            return self.overflow(interface_index, &packet, nbl, work);
         };
         let Some(event) = self.push_event(data, Some(handle)) else {
             // SAFETY: the event was not published, so only this new handle exists.
             unsafe { self.pending.remove(handle) };
-            return self.overflow(interface_index, &packet, token, work);
+            return self.overflow(interface_index, &packet, nbl, work);
         };
         // SAFETY: both nodes are live and no handles escape the locked engine.
         unsafe { self.pending.get_mut(handle) }.event = Some(event);
@@ -800,10 +847,7 @@ impl Engine {
             finish == Finish::Allow,
             bandwidth,
         );
-        Action {
-            token: p.token,
-            finish,
-        }
+        Action { nbl: p.nbl, finish }
     }
     pub fn verdict(&mut self, id: u64, verdict: Verdict, now: u64) -> Result<Action, VerdictError> {
         while let Some(retired) = self.take_retired_caches() {
@@ -858,7 +902,7 @@ impl Engine {
             bandwidth,
         ))
     }
-    // One owned token at a time, never an unbounded array on the kernel stack.
+    // One owned nbl at a time, never an unbounded array on the kernel stack.
     pub fn take_due(&mut self, now: u64) -> Option<Action> {
         let mut work = BandwidthWork::prepare(self.bandwidth_plan());
         self.take_due_with_work(now, &mut work)
@@ -931,6 +975,18 @@ impl Engine {
         if let Some(mut data) = allocate_record(len) {
             data.copy_from_slice(&bytes[..len]);
             let _ = self.push_event(data, None);
+        }
+    }
+    pub fn log_args(&mut self, severity: u8, message: fmt::Arguments<'_>) {
+        if !self.online {
+            return;
+        }
+        let mut text = Text {
+            bytes: [0; 400],
+            len: 0,
+        };
+        if text.write_fmt(message).is_ok() {
+            self.log(severity, text.as_str());
         }
     }
     fn clear_bandwidth(&mut self) {
@@ -1130,11 +1186,11 @@ mod tests {
         let mut e = default_engine();
         e.read(&mut [0; MAX_LOG_RECORD]);
         let mut ids = Vec::new();
-        for token in 1..=COUNT {
+        for nbl in 1..=COUNT {
             let mut p = packet();
-            p.flow.source_port = token as u16;
+            p.flow.source_port = nbl as u16;
             p.orient(NdisPath::Receive);
-            let Submission::Pending(id) = e.submit(101, p, token, None, 100, record(&p)) else {
+            let Submission::Pending(id) = e.submit(101, p, nbl, None, 100, record(&p)) else {
                 panic!("small packets must not hit a fixed item limit");
             };
             ids.push(id);
@@ -1165,7 +1221,7 @@ mod tests {
             assert!(event[36..].iter().all(|byte| *byte == 0));
         }
         for &i in &[COUNT - 1, 1, 2048] {
-            assert_eq!(e.verdict(ids[i], Verdict::Drop, 101).unwrap().token, i + 1);
+            assert_eq!(e.verdict(ids[i], Verdict::Drop, 101).unwrap().nbl, i + 1);
             assert!(e.verdict(ids[i], Verdict::PermanentAccept, 102).is_err());
         }
         let mut expired = 0;
@@ -1189,12 +1245,12 @@ mod tests {
             let mut p = packet();
             p.orient(NdisPath::Send);
             let mut prefix = [0; 3];
-            for token in 0..COUNT {
+            for nbl in 0..COUNT {
                 assert!(matches!(
-                    e.submit(101, p, token, Some(42), 100, record(&p)),
+                    e.submit(101, p, nbl, Some(42), 100, record(&p)),
                     Submission::Pending(_)
                 ));
-                if token == 0 {
+                if nbl == 0 {
                     assert_eq!(e.read(&mut prefix), 3);
                 }
             }
@@ -1212,8 +1268,8 @@ mod tests {
                     e.take_due(8100)
                 };
                 let Some(action) = action else { break };
-                assert!(!seen[action.token]);
-                seen[action.token] = true;
+                assert!(!seen[action.nbl]);
+                seen[action.nbl] = true;
                 assert_eq!(
                     action.finish,
                     if mode == 1 {
@@ -1538,7 +1594,7 @@ mod tests {
                 assert_eq!(
                     e.submit(101, p, 7, None, 100, record(&p)),
                     Submission::Finish(Action {
-                        token: 7,
+                        nbl: 7,
                         finish: if fail_closed {
                             Finish::Drop
                         } else {
@@ -1556,7 +1612,7 @@ mod tests {
                 e.events.fail_allocations = false;
                 let id = submit(&mut e, 101, 8);
                 assert_eq!(id, 1);
-                assert_eq!(e.verdict(id, Verdict::Drop, 101).unwrap().token, 8);
+                assert_eq!(e.verdict(id, Verdict::Drop, 101).unwrap().nbl, 8);
                 e.read(&mut [0; 256]);
                 assert!(e.pending.is_empty());
             }
@@ -1677,7 +1733,7 @@ mod tests {
             assert_eq!(
                 e.submit(interface_index, p, 3, None, 103, None),
                 Submission::Finish(Action {
-                    token: 3,
+                    nbl: 3,
                     finish: Finish::Allow
                 })
             );
@@ -1689,7 +1745,7 @@ mod tests {
             assert_eq!(
                 e.take_due(2104),
                 Some(Action {
-                    token: 4,
+                    nbl: 4,
                     finish: Finish::Allow
                 })
             );
@@ -1723,7 +1779,7 @@ mod tests {
         assert_eq!(
             e.preflight(101, &packet(), 2, 102),
             Err(Action {
-                token: 2,
+                nbl: 2,
                 finish: Finish::Allow
             })
         );
@@ -1825,7 +1881,7 @@ mod tests {
         assert_eq!(
             e.take_due(8100),
             Some(Action {
-                token: 1,
+                nbl: 1,
                 finish: Finish::Drop
             })
         );
@@ -1853,14 +1909,14 @@ mod tests {
                     assert_eq!(
                         e.preflight(101, &p, 1, 100),
                         Err(Action {
-                            token: 1,
+                            nbl: 1,
                             finish: Finish::Drop
                         })
                     );
                     assert_eq!(
                         e.submit(101, p, 2, None, 100, None),
                         Submission::Finish(Action {
-                            token: 2,
+                            nbl: 2,
                             finish: Finish::Drop
                         })
                     );
@@ -1880,7 +1936,7 @@ mod tests {
         assert_eq!(
             e.preflight(101, &packet(), 1, 102),
             Err(Action {
-                token: 1,
+                nbl: 1,
                 finish: Finish::Allow
             })
         );
@@ -1897,14 +1953,14 @@ mod tests {
         assert_eq!(
             e.take_due(103),
             Some(Action {
-                token: 2,
+                nbl: 2,
                 finish: Finish::Drop
             })
         );
         assert_eq!(
             e.submit(101, packet(), 3, None, 103, None),
             Submission::Finish(Action {
-                token: 3,
+                nbl: 3,
                 finish: Finish::Drop
             })
         );
@@ -1919,7 +1975,7 @@ mod tests {
         assert_eq!(
             e.submit(101, packet(), 999, None, 100, None),
             Submission::Finish(Action {
-                token: 999,
+                nbl: 999,
                 finish: Finish::Drop
             })
         );
@@ -1927,9 +1983,9 @@ mod tests {
         let mut p = packet();
         p.payload_len = MAX_PAYLOAD as u32;
         const COUNT: usize = 32;
-        for token in 1..=COUNT {
+        for nbl in 1..=COUNT {
             assert!(matches!(
-                e.submit(101, p, token, None, 100, record(&p)),
+                e.submit(101, p, nbl, None, 100, record(&p)),
                 Submission::Pending(_)
             ));
         }
@@ -1964,7 +2020,7 @@ mod tests {
             assert_eq!(
                 e.verdict(id, verdict, 8099),
                 Ok(Action {
-                    token: 1,
+                    nbl: 1,
                     finish: if verdict.allows() {
                         Finish::Allow
                     } else {
@@ -1977,7 +2033,7 @@ mod tests {
                 assert_eq!(
                     e.preflight(101, &packet(), 2, 8100),
                     Err(Action {
-                        token: 2,
+                        nbl: 2,
                         finish: if verdict.allows() {
                             Finish::Allow
                         } else {
@@ -2001,7 +2057,7 @@ mod tests {
         assert_eq!(
             e.take_due(8100),
             Some(Action {
-                token: 1,
+                nbl: 1,
                 finish: Finish::Allow
             })
         );
@@ -2011,14 +2067,14 @@ mod tests {
         assert_eq!(
             e.take_due(101),
             Some(Action {
-                token: 2,
+                nbl: 2,
                 finish: Finish::Allow
             })
         );
         assert_eq!(
             e.submit(101, packet(), 3, None, 102, None),
             Submission::Finish(Action {
-                token: 3,
+                nbl: 3,
                 finish: Finish::Allow
             })
         );
@@ -2091,7 +2147,7 @@ mod tests {
         assert_eq!(e.pending_count(), 1);
         assert!(e.verdict(first, Verdict::Accept, 101).is_err());
         assert!(e.take_due(2099).is_none());
-        assert_eq!(e.take_due(2100).unwrap().token, 2);
+        assert_eq!(e.take_due(2100).unwrap().nbl, 2);
         assert_eq!(e.pending_count(), 0);
         assert!(e.verdict(second, Verdict::Accept, 2100).is_err());
         assert!(e.take_due(u64::MAX).is_none());
@@ -2148,7 +2204,7 @@ mod tests {
             e.submit(other, p, 2, None, 100, record(&p)),
             Submission::Pending(_)
         ));
-        assert_eq!(e.take_due(3000).unwrap().token, 2);
+        assert_eq!(e.take_due(3000).unwrap().nbl, 2);
         assert!(e.take_due(3000).is_none());
         assert_eq!(e.pending_count(), 0);
         assert_eq!(e.cache_counts(), (1, 0));
@@ -2209,9 +2265,9 @@ mod tests {
                     p.flow.ipv6 = ipv6;
                     p.connection.ipv6 = ipv6;
                     p.orient(path);
-                    let token = interface_index as usize;
+                    let nbl = interface_index as usize;
                     let Submission::Pending(id) =
-                        e.submit(interface_index, p, token, None, 100, record(&p))
+                        e.submit(interface_index, p, nbl, None, 100, record(&p))
                     else {
                         panic!("each interface must produce its own event");
                     };
@@ -2230,7 +2286,7 @@ mod tests {
                         interface_index
                     );
                     assert_eq!(bytes[17], path.direction() as u8);
-                    assert_eq!(e.verdict(id, Verdict::Accept, 101).unwrap().token, token);
+                    assert_eq!(e.verdict(id, Verdict::Accept, 101).unwrap().nbl, nbl);
                 }
             }
         }
@@ -2301,7 +2357,7 @@ mod tests {
                         assert_eq!(
                             e.preflight(interface_index, &p, 12, 102),
                             Err(Action {
-                                token: 12,
+                                nbl: 12,
                                 finish: if allow { Finish::Allow } else { Finish::Drop },
                             })
                         );
@@ -2340,7 +2396,7 @@ mod tests {
         );
         let _ = submit(&mut e, k, 2);
         e.disconnect();
-        assert_eq!(e.take_due(101).unwrap().token, 2);
+        assert_eq!(e.take_due(101).unwrap().nbl, 2);
         assert_eq!(e.pending_count(), 0);
         e.configure(2000, 60000, true);
         e.connect();
@@ -2361,7 +2417,7 @@ mod tests {
         assert_eq!(
             e.preflight(101, &packet(), 9, 101),
             Err(Action {
-                token: 9,
+                nbl: 9,
                 finish: Finish::Drop
             })
         );
@@ -2373,12 +2429,12 @@ mod tests {
         assert_eq!(
             e.take_due(101),
             Some(Action {
-                token: 1,
+                nbl: 1,
                 finish: Finish::Drop
             })
         );
         assert_eq!(e.pending_count(), 1);
-        assert_eq!(e.verdict(new, Verdict::Accept, 101).unwrap().token, 2);
+        assert_eq!(e.verdict(new, Verdict::Accept, 101).unwrap().nbl, 2);
         assert_eq!(e.cache_counts(), (0, 0));
     }
 
@@ -2431,13 +2487,13 @@ mod tests {
             e.submit(102, p, 3, Some(0), 100, record(&p)),
             Submission::Pending(_)
         ));
-        assert_eq!(e.cancel(101, 0).unwrap().token, 2);
+        assert_eq!(e.cancel(101, 0).unwrap().nbl, 2);
         assert!(e.cancel(101, 0).is_none());
         assert_eq!(e.pending_count(), 2);
-        assert_eq!(e.cancel(102, 0).unwrap().token, 3);
+        assert_eq!(e.cancel(102, 0).unwrap().nbl, 3);
         assert_eq!(e.pending_count(), 1);
         e.disconnect();
-        assert_eq!(e.take_due(101).unwrap().token, 1);
+        assert_eq!(e.take_due(101).unwrap().nbl, 1);
     }
 
     #[test]
@@ -2469,7 +2525,7 @@ mod tests {
             assert_eq!(
                 e.submit(101, p, 999, None, 100, record(&p)),
                 Submission::Finish(Action {
-                    token: 999,
+                    nbl: 999,
                     finish: e.fallback()
                 })
             );
@@ -2505,7 +2561,7 @@ mod tests {
             let mut received = Vec::new();
             assert_eq!(e.read(&mut chunk), chunk.len());
             received.extend_from_slice(&chunk);
-            assert_eq!(e.take_due(2100).unwrap().token, 7);
+            assert_eq!(e.take_due(2100).unwrap().nbl, 7);
             loop {
                 let n = e.read(&mut chunk);
                 if n == 0 {
@@ -2544,7 +2600,7 @@ mod tests {
         p.payload_len = 70000;
         let _ = e.submit(k, p, 9, None, 100, record(&p));
         assert!(e.queued_bytes > 65536);
-        assert_eq!(e.take_due(2100).unwrap().token, 9);
+        assert_eq!(e.take_due(2100).unwrap().nbl, 9);
         assert_eq!(e.read(&mut [0; 16]), 0);
         assert_eq!(e.queued_bytes, 0);
         assert!(e.events.is_empty());
@@ -2558,10 +2614,10 @@ mod tests {
         p.cacheable = false;
         let size = connection_header_len(&p.connection) + MAX_PAYLOAD;
         const COUNT: usize = 32;
-        for token in 1..=COUNT {
+        for nbl in 1..=COUNT {
             assert!(e.wants_event(101, &p, 100));
             assert!(matches!(
-                e.submit(101, p, token, None, 100, record(&p)),
+                e.submit(101, p, nbl, None, 100, record(&p)),
                 Submission::Pending(_)
             ));
         }
@@ -2589,8 +2645,8 @@ mod tests {
         p.payload_len = MAX_PAYLOAD as u32;
         let size = connection_header_len(&p.connection) + MAX_PAYLOAD;
         let mut ids = Vec::new();
-        for token in 1..=2 {
-            let Submission::Pending(id) = e.submit(101, p, token, None, 100, record(&p)) else {
+        for nbl in 1..=2 {
+            let Submission::Pending(id) = e.submit(101, p, nbl, None, 100, record(&p)) else {
                 panic!("full packet must be queued");
             };
             ids.push(id);
@@ -2639,7 +2695,7 @@ mod tests {
             assert_eq!(
                 e.submit(k, packet(), 77, None, 100, None),
                 Submission::Finish(Action {
-                    token: 77,
+                    nbl: 77,
                     finish: if fail_closed {
                         Finish::Drop
                     } else {
@@ -2664,7 +2720,7 @@ mod tests {
         assert_eq!(
             e.submit(k, p, 88, None, 100, Some(data)),
             Submission::Finish(Action {
-                token: 88,
+                nbl: 88,
                 finish: Finish::Drop
             })
         );
@@ -2683,7 +2739,7 @@ mod tests {
         assert_eq!(
             e.submit(k, p, 1, None, 100, data),
             Submission::Finish(Action {
-                token: 1,
+                nbl: 1,
                 finish: Finish::Allow
             })
         );
@@ -2696,7 +2752,7 @@ mod tests {
         assert_eq!(
             e.submit(k, p, 2, None, 100, data),
             Submission::Finish(Action {
-                token: 2,
+                nbl: 2,
                 finish: Finish::Drop
             })
         );
@@ -2788,18 +2844,18 @@ mod tests {
                 e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
                 e.read(&mut [0; 512]);
 
-                for (token, p, now) in [
+                for (nbl, p, now) in [
                     (2, inbound, 1100),
                     (3, outbound, 2099),
                     (4, inbound, 3098),
                     (5, outbound, 4097),
                 ] {
                     assert!(!e.wants_event(k, &p, now));
-                    let action = e.preflight(k, &p, token, now).unwrap_err();
+                    let action = e.preflight(k, &p, nbl, now).unwrap_err();
                     assert_eq!(
                         action,
                         Action {
-                            token,
+                            nbl,
                             finish: Finish::Allow,
                         }
                     );
@@ -2829,13 +2885,13 @@ mod tests {
                     };
                     e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
                     e.read(&mut [0; 512]);
-                    for (token, now) in [(2, 1100), (3, 2099), (4, 3098)] {
+                    for (nbl, now) in [(2, 1100), (3, 2099), (4, 3098)] {
                         e.clean(now);
                         assert!(!e.wants_event(k, &p, now));
                         assert_eq!(
-                            e.submit(k, p, token, None, now, None),
+                            e.submit(k, p, nbl, None, now, None),
                             Submission::Finish(Action {
-                                token,
+                                nbl,
                                 finish: Finish::Allow
                             })
                         );
@@ -2922,7 +2978,7 @@ mod tests {
             assert_eq!(
                 e.submit(101, p, 2, None, 1100, None),
                 Submission::Finish(Action {
-                    token: 2,
+                    nbl: 2,
                     finish: Finish::Allow
                 })
             );
@@ -3041,7 +3097,7 @@ mod tests {
         assert_eq!(
             e.preflight(102, &packet(), 3, 102),
             Err(Action {
-                token: 3,
+                nbl: 3,
                 finish: Finish::Drop
             })
         );
@@ -3055,7 +3111,7 @@ mod tests {
         assert_eq!(
             e.preflight(102, &packet(), 5, 102),
             Err(Action {
-                token: 5,
+                nbl: 5,
                 finish: Finish::Drop
             })
         );
@@ -3131,7 +3187,7 @@ mod tests {
                     assert_eq!(
                         e.preflight(101, &p, 2, 102),
                         Err(Action {
-                            token: 2,
+                            nbl: 2,
                             finish: Finish::Allow
                         })
                     );
@@ -3156,7 +3212,7 @@ mod tests {
         assert_eq!(
             e.preflight(k, &packet(), 3, 102),
             Err(Action {
-                token: 3,
+                nbl: 3,
                 finish: Finish::Allow
             })
         );
@@ -3214,7 +3270,7 @@ mod tests {
         assert_eq!(
             e.preflight(101, &p, 2, 102),
             Err(Action {
-                token: 2,
+                nbl: 2,
                 finish: Finish::Allow
             })
         );
@@ -3228,14 +3284,14 @@ mod tests {
         assert_eq!(
             e.preflight(101, &p, 4, 104),
             Err(Action {
-                token: 4,
+                nbl: 4,
                 finish: Finish::Drop
             })
         );
         assert_eq!(
             e.preflight(101, &packet(), 5, 104),
             Err(Action {
-                token: 5,
+                nbl: 5,
                 finish: Finish::Allow
             })
         );
@@ -3355,17 +3411,17 @@ mod tests {
         assert_eq!(
             e.take_due(101),
             Some(Action {
-                token: 1,
+                nbl: 1,
                 finish: Finish::Drop
             })
         );
         assert!(e.take_due(101).is_none());
         assert_eq!(
-            e.verdict(other, Verdict::PermanentDrop, 101).unwrap().token,
+            e.verdict(other, Verdict::PermanentDrop, 101).unwrap().nbl,
             2
         );
         assert_eq!(
-            e.verdict(new, Verdict::PermanentAccept, 101).unwrap().token,
+            e.verdict(new, Verdict::PermanentAccept, 101).unwrap().nbl,
             3
         );
         assert_eq!(e.stats().invalidated, 1);

@@ -16,6 +16,7 @@ namespace pmkext::wire {
 constexpr size_t kRecordHeaderSize = 5;
 // Matches protocol/src/lib.rs. Connection prefixes include the record header;
 // their payload is the complete logical IP packet, never a shortened capture.
+// NDIS and IPFORWARD use identical records/IDs; no source tag; IPFORWARD is source-relative.
 constexpr size_t kConnectionIpv4PrefixSize = 36;
 constexpr size_t kConnectionIpv6PrefixSize = 60;
 constexpr size_t kMaxPayloadSize = 1024 * 1024;

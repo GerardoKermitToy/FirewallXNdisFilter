@@ -5,8 +5,6 @@
 // Internal host-vNIC ownership paths, NOT public outbound/inbound values.
 #define HV_DIRECTION_SEND 0u
 #define HV_DIRECTION_RECEIVE 1u
-// Hash buckets have unbounded chains; this is a lookup aid, not a token quota.
-#define HV_TOKEN_BUCKET_COUNT 256u
 #define HV_DEFAULT_DECISION_TIMEOUT_MS 8000
 #define HV_DEFAULT_FAIL_CLOSED 1
 #define HV_PENDING_CHECK_MS 1000
@@ -79,12 +77,6 @@ static inline int HvSubtractU64(unsigned long long left, unsigned long long righ
     if (right > left) return 0;
     *out = left - right;
     return 1;
-}
-static inline unsigned int HvTokenBucketIndex(unsigned long long nbl, unsigned int direction) {
-    unsigned long long hash = nbl >> 4;
-    hash ^= hash >> 17;
-    hash ^= hash >> 9;
-    return (unsigned int)(hash ^ direction) & (HV_TOKEN_BUCKET_COUNT - 1u);
 }
 static HV_FINISH_ROUTE HvFinishRoute(unsigned int direction, int copied, int allow) {
     if (direction == HV_DIRECTION_SEND) return allow ? HvRouteSend : HvRouteCompleteSend;

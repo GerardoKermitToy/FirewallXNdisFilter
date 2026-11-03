@@ -127,6 +127,7 @@ pub fn next_command(bytes: &[u8]) -> Result<(Command, &[u8]), Error> {
     Ok((command, &bytes[size..]))
 }
 
+// NDIS is guest-relative; global IPFORWARD observes its source interface as Outbound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Direction {
@@ -233,7 +234,7 @@ pub fn encode_connection_header(
     w.u32(size as u32)?;
     w.u64(id)?;
     w.u32(interface_index)?;
-    w.u8(c.direction as u8)?; // Guest side, not host NDIS send/receive.
+    w.u8(c.direction as u8)?; // NDIS guest direction or source-relative IPFORWARD; not host send/receive.
     w.u8(c.protocol)?;
     w.bytes(&c.local_ip[..addr_len])?;
     w.bytes(&c.remote_ip[..addr_len])?;

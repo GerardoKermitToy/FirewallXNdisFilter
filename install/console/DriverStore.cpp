@@ -99,6 +99,38 @@ std::vector<std::wstring> ReadWindowsDriverPackages() {
     return packages;
 }
 
+std::vector<Handle> LockMatchingWindowsDriverPackages(const std::vector<Handle>& expected) {
+    if (expected.size() != kPackageFiles.size()) throw Error{L"Source package was not locked and validated."};
+    std::vector<Handle> files;
+    for (const auto& published : ReadWindowsDriverPackages()) {
+        const auto store = ProductStoreInf(InfDirectory() / published);
+        auto locked = LockMatchingPackage(store.parent_path(), expected);
+        for (auto& file : locked) files.push_back(std::move(file));
+    }
+    return files;
+}
+
+std::vector<Handle> StageVerifiedWindowsDriverPackage(const std::filesystem::path& package,
+                                                     const std::vector<Handle>& expected) {
+    // NetCfg installs by component ID, not by the source directory. Refuse any
+    // conflicting candidate before staging and before Install/Apply can load it.
+    auto files = LockMatchingWindowsDriverPackages(expected);
+    std::vector<wchar_t> published(32768);
+    if (!SetupCopyOEMInfW((package / kOriginalInf).c_str(), package.c_str(), SPOST_PATH,
+                         0, published.data(), static_cast<DWORD>(published.size()), nullptr, nullptr)) {
+        throw Error{L"Stage the validated driver-store package: " + ErrorCode(GetLastError())};
+    }
+    const auto end = std::find(published.begin(), published.end(), L'\0');
+    if (end == published.begin() || end == published.end()) throw Error{L"SetupAPI did not identify the staged OEM INF."};
+    const auto store = ProductStoreInf(std::filesystem::path(std::wstring(published.begin(), end)));
+    auto staged = LockMatchingPackage(store.parent_path(), expected);
+    for (auto& file : staged) files.push_back(std::move(file));
+    auto candidates = LockMatchingWindowsDriverPackages(expected);
+    for (auto& file : candidates) files.push_back(std::move(file));
+    WriteText(L"Staged Driver Store files match the validated package: " + store.wstring() + L"\n");
+    return files;
+}
+
 Change RemoveWindowsDriverPackage(const std::wstring& published_inf) {
     if (!IsPublishedInfName(published_inf)) throw Error{L"Expected a published OEM INF basename, not a path."};
     const auto published = InfDirectory() / published_inf;

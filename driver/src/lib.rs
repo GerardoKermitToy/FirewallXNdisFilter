@@ -8,6 +8,8 @@ compile_error!("The driver supports Windows x64 only.");
 
 extern crate alloc;
 
+mod packet_snapshot;
+
 use alloc::vec::Vec;
 use core::{
     alloc::{GlobalAlloc, Layout},
@@ -22,6 +24,7 @@ use hyperv_policy::{
 };
 use hyperv_protocol::{self as wire, Command};
 use likely_stable::unlikely;
+use packet_snapshot::{ParserScratch, Snapshot, SnapshotError};
 
 type Handle = *mut c_void;
 const SUCCESS: i32 = 0;
@@ -42,12 +45,12 @@ unsafe extern "C" {
     fn hv_free(data: *mut u8, size: usize);
     fn hv_cache_allocate(size: usize) -> *mut u8;
     fn hv_cache_free(data: *mut u8, size: usize);
-    fn hv_finish(token: usize, finish: u32);
-    fn hv_first_nb(token: usize) -> Handle;
+    fn hv_finish(nbl: usize, finish: u32);
+    fn hv_first_nb(nbl: usize) -> Handle;
     fn hv_next_nb(nb: Handle) -> Handle;
     fn hv_snapshot(
         nb: Handle,
-        token: usize,
+        nbl: usize,
         out: *mut u8,
         cap: u32,
         copied: *mut u32,
@@ -55,6 +58,16 @@ unsafe extern "C" {
         frame_len: *mut u32,
         offload: *mut u32,
     ) -> u32;
+    fn hv_snapshot_view(
+        nb: Handle,
+        nbl: usize,
+        storage: *mut u8,
+        cap: u32,
+        copied: *mut u32,
+        trusted: *mut u32,
+        frame_len: *mut u32,
+        offload: *mut u32,
+    ) -> *const u8;
     fn hv_bugcheck() -> !;
 }
 struct NonPagedAllocator;
@@ -146,9 +159,9 @@ fn finish_code(finish: Finish) -> i32 {
     finish_value(finish) as i32
 }
 fn finish(a: Action) {
-    // SAFETY: claiming a pending entry transfers its one owned NBL token. The C
-    // shim retains the filter module until its eventual completion/return.
-    unsafe { hv_finish(a.token, finish_value(a.finish)) }
+    // SAFETY: claiming a pending entry transfers its one owned NBL. The C
+    // shim retains its NDIS module or independent WFP packet rundown until finish.
+    unsafe { hv_finish(a.nbl, finish_value(a.finish)) }
 }
 // Old per-interface cache banks move out one at a time, keeping the kernel
 // stack fixed-size. No cache pool allocation/free occurs under PolicyLock.
@@ -201,9 +214,7 @@ pub extern "C" fn HvConfigure(timeout: u32, cache_ttl: u32, fail_closed: u32) {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn HvAttach(interface_index: u32) -> u32 {
-    let result = with_state(|e| e.attach(interface_index) as u32);
-    reclaim_retired();
-    result
+    with_state(|e| e.attach(interface_index) as u32)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn HvRestart(interface_index: u32) -> u32 {
@@ -212,16 +223,20 @@ pub extern "C" fn HvRestart(interface_index: u32) -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn HvInvalidate(interface_index: u32, pause: u32) {
     with_state(|e| e.invalidate(interface_index, pause != 0));
-    reclaim_retired();
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn HvDetach(interface_index: u32) {
     with_state(|e| e.detach(interface_index));
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn HvDrain() {
     reclaim_retired();
     drain();
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvDrain() {
+pub extern "C" fn HvForwardStop() {
+    with_state(|e| e.stop_forward());
+    reclaim_retired();
     drain();
 }
 fn clean_caches() {
@@ -270,21 +285,21 @@ pub extern "C" fn HvCancel(interface_index: u32, cancel: usize) {
     }
 }
 
-// The retained token keeps the first NB stable. Copy Ethernet+IP directly into
-// the record allocation; submit() overwrites Ethernet with the small wire prefix.
-// No packet-sized local arrays or NDIS buffer accesses under the policy lock.
-fn capture_packet(nb: Handle, token: usize, packet: &Packet) -> Result<Option<Vec<u8>>, ()> {
+// Copy the first NB directly into the final record allocation. Ethernet input
+// leaves link-header space for the prefix; IPFORWARD input has no link header.
+// No packet-sized local arrays or buffer accesses under the policy lock.
+fn capture_packet(nb: Handle, nbl: usize, packet: &Packet) -> Result<Option<Vec<u8>>, ()> {
     let layout = packet.capture_layout().ok_or(())?;
     let Some(mut data) = allocate_record(layout.record_len) else {
         return Ok(None);
     };
     let (mut copied, mut trusted, mut frame_len, mut offload) = (0, 0, 0, 0);
     // SAFETY: the C caller owns this NB until HvClassify returns or publishes its
-    // pending token. The destination is an exclusively owned nonpaged allocation.
+    // pending NBL. The destination is an exclusively owned nonpaged allocation.
     let ok = unsafe {
         hv_snapshot(
             nb,
-            token,
+            nbl,
             data[layout.frame_start..].as_mut_ptr(),
             layout.frame_len as u32,
             &mut copied,
@@ -301,12 +316,50 @@ fn capture_packet(nb: Handle, token: usize, packet: &Packet) -> Result<Option<Ve
     Ok(Some(data))
 }
 
-// Return -1 if the engine now owns token; otherwise the caller finishes it after
-// releasing the per-module classification lock. No NDIS calls occur under the
-// global policy lock. Only the host interface index identifies the policy path.
+#[derive(Clone, Copy)]
+enum PacketInput {
+    Ethernet(NdisPath, usize),
+    Ip(wire::Direction, bool, bool),
+}
+impl PacketInput {
+    fn is_forward(self) -> bool {
+        matches!(self, Self::Ip(..))
+    }
+    fn direction(self) -> wire::Direction {
+        match self {
+            Self::Ethernet(path, _) => path.direction(),
+            Self::Ip(direction, _, _) => direction,
+        }
+    }
+    fn cancel(self) -> Option<usize> {
+        match self {
+            Self::Ethernet(NdisPath::Send, cancel) => Some(cancel),
+            _ => None,
+        }
+    }
+    fn parse(
+        self,
+        bytes: &[u8],
+        trusted: usize,
+        length: usize,
+        offload: bool,
+    ) -> Result<Option<Packet>, packet::ParseError> {
+        match self {
+            Self::Ethernet(_, _) => packet::parse(bytes, trusted, length, offload),
+            Self::Ip(_, ipv6, cacheable) => {
+                let mut packet = packet::parse_ip(bytes, trusted, length, ipv6, offload)?;
+                packet.cacheable &= cacheable;
+                Ok(Some(packet))
+            }
+        }
+    }
+}
+
+// Return -1 when policy owns the nbl; otherwise the caller finishes it after
+// releasing the per-module classification lock. Ownership stays in the C shim.
 #[unsafe(no_mangle)]
 pub extern "C" fn HvClassify(
-    token: usize,
+    nbl: usize,
     interface_index: u32,
     path: u32,
     cancel: usize,
@@ -316,42 +369,86 @@ pub extern "C" fn HvClassify(
         with_state(|e| e.malformed());
         return 1;
     };
+    classify(
+        nbl,
+        interface_index,
+        PacketInput::Ethernet(path, cancel),
+        session,
+    )
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn HvClassifyIp(
+    nbl: usize,
+    interface_index: u32,
+    direction: u32,
+    family: u32,
+    cacheable: u32,
+    session: u32,
+) -> i32 {
+    let Some(direction) = wire::Direction::decode(direction) else {
+        with_state(|e| e.malformed());
+        return 1;
+    };
+    if !matches!(family, 4 | 6) || cacheable > 1 {
+        with_state(|e| e.malformed());
+        return 1;
+    }
+    classify(
+        nbl,
+        interface_index,
+        PacketInput::Ip(direction, family == 6, cacheable != 0),
+        session,
+    )
+}
+fn classify(nbl: usize, interface_index: u32, input: PacketInput, session: u32) -> i32 {
     let mut first: Option<Packet> = None;
     let mut saw_non_ip = false;
-    let mut nb = unsafe { hv_first_nb(token) };
+    let mut nb = unsafe { hv_first_nb(nbl) };
     if unlikely(nb.is_null()) {
         with_state(|e| e.malformed());
         return 1;
     }
-    // Parser scratch is nonpaged-heap-backed; packet-sized buffers must not use
-    // the kernel stack on the NDIS callback path.
-    let Some(mut bytes) = allocate_record(SNAPSHOT) else {
-        with_state(|e| e.resource_drop());
-        return 1;
-    };
+    // Borrow a contiguous prefix; lazily reuse nonpaged scratch for split MDLs.
+    // Packet owns every field that survives parsing, including its L2 identity.
+    let mut scratch = ParserScratch::default();
     while !nb.is_null() {
-        let (mut copied, mut trusted, mut frame_len, mut offload) = (0, 0, 0, 0);
-        let ok = unsafe {
-            hv_snapshot(
-                nb,
-                token,
-                bytes.as_mut_ptr(),
-                SNAPSHOT as u32,
-                &mut copied,
-                &mut trusted,
-                &mut frame_len,
-                &mut offload,
-            )
+        let view = scratch.read(
+            |storage| {
+                let mut view = Snapshot::default();
+                view.data = unsafe {
+                    hv_snapshot_view(
+                        nb,
+                        nbl,
+                        storage,
+                        SNAPSHOT as u32,
+                        &mut view.copied,
+                        &mut view.trusted,
+                        &mut view.frame_len,
+                        &mut view.offload,
+                    )
+                };
+                view
+            },
+            allocate_record,
+        );
+        let view = match view {
+            Ok(view) => view,
+            Err(error) => {
+                with_state(|e| match error {
+                    SnapshotError::Resource => e.resource_drop(),
+                    SnapshotError::Malformed => e.malformed(),
+                });
+                return 1;
+            }
         };
-        if unlikely(ok == 0 || copied as usize > SNAPSHOT) {
-            with_state(|e| e.malformed());
-            return 1;
-        }
-        let parsed = packet::parse(
-            &bytes[..copied as usize],
-            trusted as usize,
-            frame_len as usize,
-            offload != 0,
+        // SAFETY: the shim returns the readable bounded NB prefix or our own
+        // scratch. No view escapes parsing or survives pending publication.
+        let data = unsafe { core::slice::from_raw_parts(view.data, view.copied as usize) };
+        let parsed = input.parse(
+            data,
+            view.trusted as usize,
+            view.frame_len as usize,
+            view.offload != 0,
         );
         match parsed {
             Ok(Some(p)) => {
@@ -391,23 +488,38 @@ pub extern "C" fn HvClassify(
         with_state(|e| e.non_ip());
         return 0;
     };
-    packet.orient(path);
+    packet.orient_direction(input.direction());
     if session == 0 {
         // The C shim can close the policy rundown while the LWF remains bound.
         // Do not publish a pending event into a session that is being torn down;
         // use the configured immediate fallback instead.
         return with_state(|e| finish_code(e.fallback()));
     }
-    // Cancellation eligibility is NDIS ownership metadata, not verdict identity.
-    let cancel = (path == NdisPath::Send).then_some(cancel);
+    // Only NDIS sends have a cancel ID; WFP route metadata stays in the shim.
+    let cancel = input.cancel();
     let wants_event = match with_bandwidth(|e, work| {
-        e.preflight_with_work(interface_index, &packet, token, unsafe { hv_now() }, work)
+        if input.is_forward() {
+            if !e.is_online() {
+                return Err(Action {
+                    nbl,
+                    finish: e.fallback(),
+                });
+            }
+            if !e.ensure_forward(interface_index) {
+                e.resource_drop();
+                return Err(Action {
+                    nbl,
+                    finish: Finish::Drop,
+                });
+            }
+        }
+        e.preflight_with_work(interface_index, &packet, nbl, unsafe { hv_now() }, work)
     }) {
         Ok(wants_event) => wants_event,
         Err(action) => return finish_code(action.finish),
     };
     let record = if wants_event {
-        match capture_packet(unsafe { hv_first_nb(token) }, token, &packet) {
+        match capture_packet(unsafe { hv_first_nb(nbl) }, nbl, &packet) {
             Ok(record) => record,
             Err(()) => {
                 with_state(|e| e.malformed());
@@ -421,7 +533,7 @@ pub extern "C" fn HvClassify(
         e.submit_with_work(
             interface_index,
             packet,
-            token,
+            nbl,
             cancel,
             unsafe { hv_now() },
             record,
@@ -431,6 +543,75 @@ pub extern "C" fn HvClassify(
         Submission::Pending(_) => -1,
         Submission::Finish(a) => finish_code(a.finish),
     }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn HvWfpInjectionError(
+    status: u32,
+    ipv6: u32,
+    route: u32,
+    completion: u32,
+    destination_interface: u32,
+    failures: u32,
+) {
+    let family = if ipv6 != 0 { "IPv6" } else { "IPv4" };
+    let route = match route {
+        1 => "network-receive",
+        2 => "network-send",
+        _ => "forward",
+    };
+    let stage = if completion != 0 {
+        "completion"
+    } else {
+        "submit"
+    };
+    with_state(|e| {
+        e.log_args(
+            4,
+            format_args!(
+                "WFP {family} {route} injection {stage} failed: status=0x{status:08X} destination_interface={destination_interface} failures={failures}"
+            ),
+        );
+    });
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn HvWfpFragmentDiagnostic(
+    kind: u32,
+    flags: u32,
+    source_interface: u32,
+    destination_interface: u32,
+    first_nb_bytes: u32,
+    chained: u32,
+    count: u32,
+) {
+    let kind = match kind {
+        0 => "fragment-permit-original",
+        1 => "fragment-group-normal-policy",
+        _ => "large-packet-normal-policy",
+    };
+    with_state(|e| {
+        e.log_args(
+            3,
+            format_args!(
+                "WFP DIAGNOSTIC IPv4 {kind}: flags=0x{flags:08X} source_interface={source_interface} destination_interface={destination_interface} first_nb_bytes={first_nb_bytes} chained={chained} count={count}"
+            ),
+        );
+    });
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn HvWfpStatus(healthy: u32) {
+    with_state(|e| {
+        if healthy != 0 {
+            e.log(
+                3,
+                "WFP IPFORWARD V4/V6 registration is ready for all forwarding interfaces",
+            );
+        } else {
+            e.log(
+                4,
+                "WFP IPFORWARD is unavailable (BFE or registration); NDIS filtering is independent",
+            );
+        }
+    });
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn HvResourceDrop() {

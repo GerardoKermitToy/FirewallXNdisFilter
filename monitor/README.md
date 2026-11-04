@@ -14,7 +14,7 @@ The pointer callbacks replace the former unified `Connection` / `Bandwidth` call
 
 ## Build and no-driver tests
 
-On Windows x64 with CMake and the Visual Studio C++ toolchain installed:
+On Windows x64 with CMake, the Visual Studio C++ toolchain and Rust 1.91+ installed (Rust is required for the offline WFP tests):
 
 ```powershell
 cmake -S C:\hyperv\monitor -B C:\hyperv\monitor\build -G "Visual Studio 18 2026" -A x64 -DBUILD_TESTING=ON
@@ -27,6 +27,8 @@ For Visual Studio 2022 use `-G "Visual Studio 17 2022"`. Alternatively configure
 With the VS generator the executable is `build\Release\hyperv_monitor.exe`. It deliberately uses an **as-invoker** manifest so `--help` and invalid-CLI tests need neither elevation nor a device. Actual device access still requires elevated Administrator/SYSTEM because of the driver's device ACL.
 
 All MSVC targets, including static libraries, standalone header-client examples, setup tools and offline tests, compile with `/Zi`; EXE/DLL links use `/DEBUG:FULL` and `/PDBALTPATH:%_PDB%`. Release optimizations are preserved. Linker PDBs go to the build root (the configuration subdirectory with the VS generator), and the main package build copies the product PDBs to `dist/` alongside their binaries.
+
+WFP tests build a small host-only library from the actual [Rust WFP](../driver/src/wfp.rs) and [checksum](../driver/src/wfp_checksum.rs) modules and link the fake WDK bridge; they never build or load a SYS. Cargo uses a separate target directory with inherited kernel flags cleared. Use `-DBUILD_TESTING=OFF` to build only the native monitor/client/setup targets without Rust.
 
 CTest registers **only no-driver tests**: exact IPv4/IPv6/event/command codecs and device-only lifecycle checks, fragmented streams and length limits, strict CLI/filter validation, startup-event races/cancellation with fake device opens and private local test events, delayed-verdict scheduling, output serialization, `--help`, and deliberately invalid CLI invocations. Additional offline tests cover LWF target/copy/ownership helpers, binding-policy decisions, mock management preflight and user-mode COM factory/lifetime. The notify DLL is loaded only as a normal DLL for that test; it is never registered. No test installs/loads/binds a driver, opens its device, or runs a monitoring session. The record-output test writes only in its CTest build working directory. Do not substitute a valid monitoring run when validating a build without explicit authorization.
 

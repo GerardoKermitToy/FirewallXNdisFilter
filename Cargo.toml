@@ -1,10 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["protocol", "policy", "driver"]
+members = ["protocol", "policy", "driver", "monitor/tests/wfp_rust"]
 default-members = ["protocol", "policy"]
 
 [workspace.dependencies]
 likely_stable = { version = "0.1.3", default-features = false }
+smoltcp = { version = "0.14.0", default-features = false, features = ["proto-ipv4"] }
+windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_NetworkManagement_WindowsFilteringPlatform"] }
 
 [profile.release]
 panic = "abort"

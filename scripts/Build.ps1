@@ -54,6 +54,7 @@ try {
     if ($LASTEXITCODE) { throw 'Driver version resource compilation failed.' }
     & link.exe /NOLOGO /DRIVER /SUBSYSTEM:NATIVE,10.00 /ENTRY:GsDriverEntry /MACHINE:X64 /MANIFEST:NO /NODEFAULTLIB /INCREMENTAL:NO /INTEGRITYCHECK /DYNAMICBASE /NXCOMPAT /OPT:REF /OPT:ICF /DEBUG:FULL '/PDBALTPATH:%_PDB%' /RELEASE "/OUT:$dist\HyperVXNdisFilter.sys" "/PDB:$dist\HyperVXNdisFilter.pdb" $objects $resource "$root\target\x86_64-pc-windows-msvc\release\hyperv_driver.lib" "$lib\ndis.lib" "$lib\netio.lib" "$lib\fwpkclnt.lib" "$lib\wdmsec.lib" "$lib\ntoskrnl.lib" "$lib\hal.lib" "$lib\BufferOverflowK.lib"
     if ($LASTEXITCODE) { throw 'Kernel image link failed.' }
+    & "$PSScriptRoot\tests\driver_import_tests.ps1" -DriverPath "$dist\HyperVXNdisFilter.sys"
     $cmake = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
     $ninja = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'
     & $cmake -S "$root\monitor" -B "$build\monitor" -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON

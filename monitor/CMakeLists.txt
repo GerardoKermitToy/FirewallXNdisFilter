@@ -115,7 +115,21 @@ if(BUILD_TESTING)
         add_test(NAME ${test_name} COMMAND ${test_name})
         set_tests_properties(${test_name} PROPERTIES TIMEOUT 15 LABELS "no-driver")
     endforeach()
+    find_program(CARGO_EXECUTABLE cargo REQUIRED)
+    set(WFP_RUST_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/wfp-rust")
+    set(WFP_RUST_LIBRARY "${WFP_RUST_TARGET_DIR}/release/hyperv_wfp_tests.lib")
+    add_custom_command(OUTPUT "${WFP_RUST_LIBRARY}"
+        COMMAND "${CMAKE_COMMAND}" -E env --unset=RUSTFLAGS --unset=CARGO_ENCODED_RUSTFLAGS
+            "${CARGO_EXECUTABLE}" build --release --locked -p hyperv-wfp-tests
+            --target-dir "${WFP_RUST_TARGET_DIR}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
+        DEPENDS tests/wfp_rust/lib.rs tests/wfp_rust/Cargo.toml
+            ../driver/src/wfp.rs ../driver/src/wfp_checksum.rs ../driver/build.rs ../Cargo.toml ../Cargo.lock
+        VERBATIM)
+    add_custom_target(wfp_rust_test_library DEPENDS "${WFP_RUST_LIBRARY}")
     add_executable(wfp_management_tests tests/wfp_management_tests.cpp)
+    add_dependencies(wfp_management_tests wfp_rust_test_library)
+    target_link_libraries(wfp_management_tests PRIVATE "${WFP_RUST_LIBRARY}")
     target_compile_features(wfp_management_tests PRIVATE cxx_std_20)
     if(MSVC)
         target_compile_options(wfp_management_tests PRIVATE /W4 /WX /permissive- /utf-8)

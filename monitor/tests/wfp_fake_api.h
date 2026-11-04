@@ -41,6 +41,7 @@ inline void RtlCopyMemory(void* target, const void* source, std::size_t size) {
 }
 using BOOLEAN = UCHAR;
 using ULONG = std::uint32_t;
+using NDIS_PORT_NUMBER = ULONG;
 using ULONG_PTR = std::uintptr_t;
 using LONG = std::int32_t;
 using UINT32 = std::uint32_t;
@@ -170,9 +171,20 @@ struct NET_BUFFER {
     ULONG CurrentMdlOffset = 0, DataLength = 0;
 };
 using PNET_BUFFER = NET_BUFFER*;
+struct alignas(16) NET_BUFFER_LIST_CONTEXT {
+    NET_BUFFER_LIST_CONTEXT* Next;
+    USHORT Size, Offset;
+};
 struct _NET_BUFFER_LIST {
     PNET_BUFFER FirstNb = nullptr;
     void* ChecksumInfo = nullptr;
+    _NET_BUFFER_LIST* Next = nullptr;
+    NET_BUFFER_LIST_CONTEXT* Context = nullptr;
+    NTSTATUS Status = STATUS_SUCCESS;
+    void* LsoInfo = nullptr;
+    void* RscInfo = nullptr;
+    void* ReceiveBytes = nullptr;
+    BOOLEAN Reassembled = FALSE;
 };
 using PNET_BUFFER_LIST = _NET_BUFFER_LIST*;
 union NDIS_TCP_IP_CHECKSUM_NET_BUFFER_LIST_INFO {
@@ -184,13 +196,29 @@ union NDIS_TCP_IP_CHECKSUM_NET_BUFFER_LIST_INFO {
     } Receive;
 };
 constexpr ULONG TcpIpChecksumNetBufferListInfo = 0;
+constexpr ULONG TcpLargeSendNetBufferListInfo = 1;
+constexpr ULONG TcpRecvSegCoalesceInfo = 2;
+constexpr ULONG TcpReceiveBytesTransferred = 3;
+constexpr NTSTATUS NDIS_STATUS_SUCCESS = STATUS_SUCCESS;
+#define NET_BUFFER_LIST_NEXT_NBL(nbl) ((nbl)->Next)
+#define NET_BUFFER_LIST_STATUS(nbl) ((nbl)->Status)
+#define NET_BUFFER_LIST_CONTEXT_DATA_START(nbl) \
+    (reinterpret_cast<UCHAR*>((nbl)->Context + 1) + (nbl)->Context->Offset)
+inline void*& FakeNblInfo(PNET_BUFFER_LIST nbl, ULONG kind) {
+    switch (kind) {
+    case TcpLargeSendNetBufferListInfo: return nbl->LsoInfo;
+    case TcpRecvSegCoalesceInfo: return nbl->RscInfo;
+    case TcpReceiveBytesTransferred: return nbl->ReceiveBytes;
+    default: return nbl->ChecksumInfo;
+    }
+}
 constexpr ULONG NormalPagePriority = 0, MdlMappingNoExecute = 0;
 #define NET_BUFFER_LIST_FIRST_NB(nbl) ((nbl)->FirstNb)
 #define NET_BUFFER_NEXT_NB(nb) ((nb)->Next)
 #define NET_BUFFER_DATA_LENGTH(nb) ((nb)->DataLength)
 #define NET_BUFFER_CURRENT_MDL(nb) ((nb)->CurrentMdl)
 #define NET_BUFFER_CURRENT_MDL_OFFSET(nb) ((nb)->CurrentMdlOffset)
-#define NET_BUFFER_LIST_INFO(nbl, info) ((nbl)->ChecksumInfo)
+#define NET_BUFFER_LIST_INFO(nbl, info) FakeNblInfo((nbl), (info))
 inline ULONG MmGetMdlByteCount(PMDL mdl) {
     ++hv_wfp_fake::packet_work.mdl_counts;
     return mdl->Length;
@@ -230,9 +258,11 @@ constexpr FWP_DATA_TYPE FWP_UINT64 = 2;
 constexpr FWP_MATCH_TYPE FWP_MATCH_EQUAL = 0;
 constexpr FWP_ACTION_TYPE FWP_ACTION_CALLOUT_TERMINATING = 1;
 constexpr FWP_ACTION_TYPE FWP_ACTION_BLOCK = 2;
+constexpr FWP_ACTION_TYPE FWP_ACTION_PERMIT = 3;
 
 struct FWP_VALUE0 {
     FWP_DATA_TYPE type = FWP_EMPTY;
+    UINT32 uint32 = 0;
 };
 struct FWP_CONDITION_VALUE0 {
     FWP_DATA_TYPE type = FWP_EMPTY;
@@ -283,6 +313,7 @@ struct FWPM_CALLOUT0 {
     GUID applicableLayer{};
 };
 
+constexpr UINT32 RPC_C_AUTHN_WINNT = 10;
 constexpr ULONG FWPM_SESSION_FLAG_DYNAMIC = 0x00000001u;
 
 enum FWPM_SERVICE_STATE : UINT32 {
@@ -292,8 +323,26 @@ enum FWPM_SERVICE_STATE : UINT32 {
     FWPM_SERVICE_RUNNING = 3,
 };
 
-struct FWPS_INCOMING_VALUES0 {};
-struct FWPS_INCOMING_METADATA_VALUES0 {};
+constexpr ULONG FWPS_LAYER_IPFORWARD_V4 = 1, FWPS_LAYER_IPFORWARD_V6 = 2;
+constexpr ULONG FWPS_FIELD_IPFORWARD_V4_SOURCE_INTERFACE_INDEX = 0;
+constexpr ULONG FWPS_FIELD_IPFORWARD_V4_DESTINATION_INTERFACE_INDEX = 1;
+constexpr ULONG FWPS_FIELD_IPFORWARD_V4_DESTINATION_SUB_INTERFACE_INDEX = 2;
+constexpr ULONG FWPS_FIELD_IPFORWARD_V4_FLAGS = 3;
+constexpr ULONG FWPS_FIELD_IPFORWARD_V6_SOURCE_INTERFACE_INDEX = 0;
+constexpr ULONG FWPS_FIELD_IPFORWARD_V6_DESTINATION_INTERFACE_INDEX = 1;
+constexpr ULONG FWPS_FIELD_IPFORWARD_V6_DESTINATION_SUB_INTERFACE_INDEX = 2;
+constexpr ULONG FWPS_FIELD_IPFORWARD_V6_FLAGS = 3;
+constexpr UINT64 FWPS_METADATA_FIELD_COMPARTMENT_ID = 1;
+constexpr COMPARTMENT_ID UNSPECIFIED_COMPARTMENT_ID = 0;
+struct FWPS_INCOMING_VALUE0 { FWP_VALUE0 value; };
+struct FWPS_INCOMING_VALUES0 {
+    ULONG layerId = 0, valueCount = 0;
+    FWPS_INCOMING_VALUE0* incomingValue = nullptr;
+};
+struct FWPS_INCOMING_METADATA_VALUES0 {
+    UINT64 currentMetadataValues = 0;
+    COMPARTMENT_ID compartmentId = UNSPECIFIED_COMPARTMENT_ID;
+};
 struct FWPS_FILTER0 { UINT64 rawContext = 0; };
 struct FWPS_CLASSIFY_OUT0 {
     UINT32 rights = 0;
@@ -326,12 +375,16 @@ constexpr UINT32 FWPS_INJECTION_TYPE_NETWORK = 4;
 constexpr UINT32 FWPS_INJECTION_TYPE_FORWARD = 8;
 constexpr ULONG FWP_CONDITION_FLAG_IS_OUTBOUND_PASS_THRU = 0x00040000;
 constexpr ULONG FWP_CONDITION_FLAG_IS_INBOUND_PASS_THRU = 0x00080000;
+constexpr ULONG FWP_CONDITION_FLAG_IS_FRAGMENT = 0x20;
+constexpr ULONG FWP_CONDITION_FLAG_IS_FRAGMENT_GROUP = 0x40;
+constexpr ULONG FWP_CONDITION_FLAG_IS_REASSEMBLED = 0x400;
 using FWPS_INJECT_COMPLETE0 = void (NTAPI *)(void*, PNET_BUFFER_LIST, BOOLEAN);
 using FWPM_BFE_STATE_CHANGE_CALLBACK0 = void (NTAPI *)(void*, FWPM_SERVICE_STATE);
 
 namespace hv_wfp_fake {
 
 enum class FailurePoint : unsigned {
+    clone, reassemble, context_allocate,
     uuid_create,
     create_device,
     allocate_work_item,
@@ -419,6 +472,10 @@ struct InjectionState {
 };
 
 struct State {
+    unsigned clones = 0, clone_frees = 0, reassemblies = 0, reassembly_frees = 0;
+    unsigned context_allocations = 0, context_frees = 0, live_packets = 0;
+    BOOLEAN complete_inline = FALSE;
+    NTSTATUS completion_status = STATUS_SUCCESS;
     FWPM_SERVICE_STATE bfe_state = FWPM_SERVICE_RUNNING;
     std::vector<Failure> failures;
     std::array<unsigned, static_cast<unsigned>(FailurePoint::count)> operation_calls{};
@@ -852,6 +909,10 @@ inline NTSTATUS FwpsInjectForwardAsync0(HANDLE handle, void*, UINT32 flags, ADDR
     if (injection->type != FWPS_INJECTION_TYPE_FORWARD || injection->family != family || flags != 0)
         return STATUS_INVALID_PARAMETER;
     if (hv_wfp_fake::TakeFailure(hv_wfp_fake::FailurePoint::injection_forward, &failure)) return failure;
+    if (hv_wfp_fake::state().complete_inline) {
+        nbl->Status = hv_wfp_fake::state().completion_status;
+        completion(context, nbl, FALSE);
+    }
     return STATUS_SUCCESS;
 }
 
@@ -866,6 +927,10 @@ inline NTSTATUS FakeNetworkInject(HANDLE handle, UINT32 flags, COMPARTMENT_ID co
     NTSTATUS failure = STATUS_SUCCESS;
     auto point = route == 1 ? hv_wfp_fake::FailurePoint::injection_receive : hv_wfp_fake::FailurePoint::injection_send;
     if (hv_wfp_fake::TakeFailure(point, &failure)) return failure;
+    if (hv_wfp_fake::state().complete_inline) {
+        nbl->Status = hv_wfp_fake::state().completion_status;
+        completion(context, nbl, FALSE);
+    }
     return STATUS_SUCCESS;
 }
 inline NTSTATUS FwpsInjectNetworkReceiveAsync0(HANDLE handle, void*, UINT32 flags,
@@ -1040,20 +1105,57 @@ inline NTSTATUS FwpmFilterDeleteById0(HANDLE engine_handle, UINT64 id) {
     return STATUS_SUCCESS;
 }
 
-extern "C" {
-NTSTATUS HvWfpInitialize(PDRIVER_OBJECT driver);
-void HvWfpStop(void);
-void HvWfpUninitialize(void);
-void HvWfpReportStatus(void);
-BOOLEAN HvWfpRetainPacket(void);
-void HvWfpReleasePacket(void);
-BOOLEAN HvWfpIsSelfInjected(PNET_BUFFER_LIST nbl, BOOLEAN ipv6);
-NTSTATUS HvWfpInject(PNET_BUFFER_LIST nbl, BOOLEAN ipv6, ULONG compartment,
-    ULONG destinationInterface, ULONG destinationSubInterface, ULONG flags, BOOLEAN segmented,
-    FWPS_INJECT_COMPLETE0 completion, void* context);
-void NTAPI HvForwardClassify(const FWPS_INCOMING_VALUES0* values,
-    const FWPS_INCOMING_METADATA_VALUES0* metadata, void* layerData,
-    const FWPS_FILTER0* filter, UINT64 flowContext, FWPS_CLASSIFY_OUT0* out);
+inline NTSTATUS NdisAllocateNetBufferListContext(PNET_BUFFER_LIST nbl, USHORT size, USHORT backfill, ULONG) {
+    NTSTATUS failure = STATUS_SUCCESS;
+    if (hv_wfp_fake::TakeFailure(hv_wfp_fake::FailurePoint::context_allocate, &failure)) return failure;
+    auto* memory = new (std::nothrow) UCHAR[sizeof(NET_BUFFER_LIST_CONTEXT) + size + backfill];
+    if (memory == nullptr) return STATUS_INSUFFICIENT_RESOURCES;
+    auto* context = reinterpret_cast<NET_BUFFER_LIST_CONTEXT*>(memory);
+    context->Next = nbl->Context;
+    context->Size = static_cast<USHORT>(size + backfill);
+    context->Offset = backfill;
+    nbl->Context = context;
+    ++hv_wfp_fake::state().context_allocations;
+    return STATUS_SUCCESS;
+}
+inline void NdisFreeNetBufferListContext(PNET_BUFFER_LIST nbl, USHORT size) {
+    auto* context = nbl->Context;
+    if (context == nullptr || context->Size - context->Offset != size) std::abort();
+    nbl->Context = context->Next;
+    delete[] reinterpret_cast<UCHAR*>(context);
+    ++hv_wfp_fake::state().context_frees;
+}
+inline NTSTATUS FakeClone(PNET_BUFFER_LIST original, BOOLEAN reassembled, PNET_BUFFER_LIST* out) {
+    NTSTATUS failure = STATUS_SUCCESS;
+    const auto point = reassembled ? hv_wfp_fake::FailurePoint::reassemble : hv_wfp_fake::FailurePoint::clone;
+    if (hv_wfp_fake::TakeFailure(point, &failure)) return failure;
+    auto* packet = new (std::nothrow) _NET_BUFFER_LIST{};
+    if (packet == nullptr) return STATUS_INSUFFICIENT_RESOURCES;
+    packet->FirstNb = original->FirstNb;
+    packet->Reassembled = reassembled;
+    *out = packet;
+    if (reassembled) ++hv_wfp_fake::state().reassemblies;
+    else ++hv_wfp_fake::state().clones;
+    ++hv_wfp_fake::state().live_packets;
+    return STATUS_SUCCESS;
+}
+inline NTSTATUS FwpsAllocateCloneNetBufferList0(PNET_BUFFER_LIST original, void*, void*, ULONG, PNET_BUFFER_LIST* out) {
+    return FakeClone(original, FALSE, out);
+}
+inline NTSTATUS FwpsReassembleForwardFragmentGroup0(ADDRESS_FAMILY, PNET_BUFFER_LIST original, void*, ULONG, ULONG, PNET_BUFFER_LIST* out) {
+    return FakeClone(original, TRUE, out);
+}
+inline void FwpsFreeCloneNetBufferList0(PNET_BUFFER_LIST packet, ULONG) {
+    if (packet->Reassembled || packet->Context != nullptr) std::abort();
+    ++hv_wfp_fake::state().clone_frees;
+    --hv_wfp_fake::state().live_packets;
+    delete packet;
+}
+inline void FwpsFreeNetBufferList0(PNET_BUFFER_LIST packet) {
+    if (!packet->Reassembled || packet->Context != nullptr) std::abort();
+    ++hv_wfp_fake::state().reassembly_frees;
+    --hv_wfp_fake::state().live_packets;
+    delete packet;
 }
 
 #endif

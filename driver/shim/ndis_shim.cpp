@@ -54,7 +54,6 @@ extern int HvClassifyIp(ULONG_PTR, ULONG, ULONG, ULONG, ULONG, ULONG);
 extern void HvResourceDrop(void);
 #ifdef HV_WFP_FRAGMENT_PERMIT_DIAGNOSTIC
 extern void HvWfpFragmentDiagnostic(ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG);
-static volatile LONG ForwardDiagnosticCounts[3];
 #endif
 extern ULONG HvRead(UCHAR*, ULONG);
 extern NTSTATUS HvWrite(const UCHAR*, ULONG);
@@ -186,10 +185,6 @@ static void OpenClassificationSession(void) {
         ExReInitializeRundownProtection(&ClassificationRundown);
         (void)HvSessionGateReopen(&ClassificationClosed);
     }
-#ifdef HV_WFP_FRAGMENT_PERMIT_DIAGNOSTIC
-    for (ULONG i = 0; i != RTL_NUMBER_OF(ForwardDiagnosticCounts); ++i)
-        InterlockedExchange(&ForwardDiagnosticCounts[i], 0);
-#endif
     HvConnect();
     HvWfpReportStatus();
 }
@@ -444,36 +439,11 @@ static PNET_BUFFER_LIST CreateNdisPacket(HV_ADAPTER* a, PNET_BUFFER_LIST origina
     context->Copied = resources;
     return nbl;
 }
-static void FreeForwardPacket(PNET_BUFFER_LIST nbl) {
-    HV_PACKET_OWNER owner = PacketContext(nbl)->Owner;
-    FreePacketContext(nbl);
-    if (owner == HvOwnerWfpReassembled) FwpsFreeNetBufferList0(nbl);
-    else FwpsFreeCloneNetBufferList0(nbl, 0);
-    HvWfpReleasePacket();
-}
-static void NTAPI ForwardInjected(void* context, PNET_BUFFER_LIST nbl, BOOLEAN dispatchLevel) {
-    UNREFERENCED_PARAMETER(dispatchLevel);
-    if (context != nbl) hv_bugcheck();
-    if (!NT_SUCCESS((NTSTATUS)NET_BUFFER_LIST_STATUS(nbl))) {
-        const HV_NBL_CONTEXT* packet = PacketContext(nbl);
-        HvWfpReportInjectionFailure((NTSTATUS)NET_BUFFER_LIST_STATUS(nbl), packet->Ipv6,
-            packet->Flags, packet->ForwardInterface, TRUE);
-    }
-    FreeForwardPacket(nbl);
-}
 void hv_finish(ULONG_PTR packet, ULONG finish) {
     auto* nbl = reinterpret_cast<PNET_BUFFER_LIST>(packet);
     HV_NBL_CONTEXT* context = PacketContext(nbl);
     if (context->Owner != HvOwnerNdis) {
-        if (finish == 0 && !Stopping) {
-            NTSTATUS status = HvWfpInject(nbl, context->Ipv6, context->Compartment,
-                context->ForwardInterface, context->ForwardSubInterface, context->Flags,
-                context->Segmented, ForwardInjected, nbl);
-            if (NT_SUCCESS(status)) return; // Inline completion may already have freed the NBL.
-            HvWfpReportInjectionFailure(status, context->Ipv6, context->Flags,
-                context->ForwardInterface, FALSE);
-        }
-        FreeForwardPacket(nbl);
+        HvWfpFinish(nbl, finish);
         return;
     }
     HV_ADAPTER* a = context->Adapter;
@@ -547,125 +517,9 @@ ULONG hv_snapshot(PNET_BUFFER nb, ULONG_PTR packet, UCHAR* out, ULONG cap,
     *offload = SnapshotOffload(packet);
     return result;
 }
-struct HV_FORWARD_VALUES { ULONG SourceIndex, DestinationIndex, DestinationSubIndex, Flags, Compartment; };
-static BOOLEAN ForwardU32(const FWPS_INCOMING_VALUES0* values, ULONG field, ULONG* out) {
-    if (field >= values->valueCount || values->incomingValue[field].value.type != FWP_UINT32) return FALSE;
-    *out = values->incomingValue[field].value.uint32;
-    return TRUE;
-}
-static BOOLEAN DecodeForward(const FWPS_INCOMING_VALUES0* values,
-    const FWPS_INCOMING_METADATA_VALUES0* metadata, BOOLEAN ipv6, HV_FORWARD_VALUES* route) {
-    if (values->incomingValue == NULL ||
-        !ForwardU32(values, ipv6 ? FWPS_FIELD_IPFORWARD_V6_SOURCE_INTERFACE_INDEX : FWPS_FIELD_IPFORWARD_V4_SOURCE_INTERFACE_INDEX, &route->SourceIndex) ||
-        !ForwardU32(values, ipv6 ? FWPS_FIELD_IPFORWARD_V6_DESTINATION_INTERFACE_INDEX : FWPS_FIELD_IPFORWARD_V4_DESTINATION_INTERFACE_INDEX, &route->DestinationIndex) ||
-        !ForwardU32(values, ipv6 ? FWPS_FIELD_IPFORWARD_V6_FLAGS : FWPS_FIELD_IPFORWARD_V4_FLAGS, &route->Flags) ||
-        route->SourceIndex == 0 || route->DestinationIndex == 0) return FALSE;
-    if ((route->Flags & FWP_CONDITION_FLAG_IS_INBOUND_PASS_THRU) != 0 &&
-        !ForwardU32(values, ipv6 ? FWPS_FIELD_IPFORWARD_V6_DESTINATION_SUB_INTERFACE_INDEX :
-            FWPS_FIELD_IPFORWARD_V4_DESTINATION_SUB_INTERFACE_INDEX, &route->DestinationSubIndex)) return FALSE;
-    route->Compartment = metadata != NULL &&
-        (metadata->currentMetadataValues & FWPS_METADATA_FIELD_COMPARTMENT_ID) != 0 ?
-        metadata->compartmentId : UNSPECIFIED_COMPARTMENT_ID;
-    return TRUE;
-}
-static PNET_BUFFER_LIST CreateForwardPacket(PNET_BUFFER_LIST original,
-    const HV_FORWARD_VALUES* route, BOOLEAN ipv6) {
-    BOOLEAN grouped = (route->Flags & FWP_CONDITION_FLAG_IS_FRAGMENT_GROUP) != 0;
-    BOOLEAN segmented = NET_BUFFER_LIST_INFO(original, TcpLargeSendNetBufferListInfo) != NULL ||
-        NET_BUFFER_LIST_INFO(original, TcpRecvSegCoalesceInfo) != NULL ||
-        NET_BUFFER_LIST_INFO(original, TcpReceiveBytesTransferred) != NULL;
-    if ((!grouped && NET_BUFFER_LIST_NEXT_NBL(original) != NULL) || !HvWfpRetainPacket()) return NULL;
-    PNET_BUFFER_LIST nbl = NULL;
-    NTSTATUS status;
-    if (grouped) status = FwpsReassembleForwardFragmentGroup0(ipv6 ? AF_INET6 : AF_INET,
-        original, NULL, 0, 0, &nbl);
-    else status = FwpsAllocateCloneNetBufferList0(original, NULL, NULL, 0, &nbl);
-    if (!NT_SUCCESS(status)) { HvWfpReleasePacket(); return NULL; }
-    HV_NBL_CONTEXT* context = AllocatePacketContext(nbl);
-    if (context == NULL) {
-        if (grouped) FwpsFreeNetBufferList0(nbl);
-        else FwpsFreeCloneNetBufferList0(nbl, 0);
-        HvWfpReleasePacket();
-        return NULL;
-    }
-    context->Owner = grouped ? HvOwnerWfpReassembled : HvOwnerWfpClone;
-    context->Ipv6 = ipv6;
-    // A logical segmentation/coalescing buffer is not a complete datagram.
-    // Preserve this fact before cloning without copying opaque OOB metadata.
-    context->Segmented = segmented;
-    context->ForwardInterface = route->DestinationIndex;
-    context->ForwardSubInterface = route->DestinationSubIndex;
-    context->Flags = route->Flags;
-    context->Compartment = route->Compartment;
-    return nbl;
-}
-void NTAPI HvForwardClassify(const FWPS_INCOMING_VALUES0* values,
-    const FWPS_INCOMING_METADATA_VALUES0* metadata, void* layerData,
-    const FWPS_FILTER0* filter, UINT64 flowContext, FWPS_CLASSIFY_OUT0* out) {
-    HV_FORWARD_VALUES route = {};
-    UNREFERENCED_PARAMETER(filter); UNREFERENCED_PARAMETER(flowContext);
-    if (!(out->rights & FWPS_RIGHT_ACTION_WRITE)) return;
-    out->actionType = FWP_ACTION_BLOCK;
-    out->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
-    if (values == NULL || layerData == NULL ||
-        (values->layerId != FWPS_LAYER_IPFORWARD_V4 && values->layerId != FWPS_LAYER_IPFORWARD_V6)) goto Reject;
-    {
-        BOOLEAN ipv6 = values->layerId == FWPS_LAYER_IPFORWARD_V6;
-        if (HvWfpIsSelfInjected(static_cast<PNET_BUFFER_LIST>(layerData), ipv6)) {
-            out->actionType = FWP_ACTION_PERMIT;
-            out->flags &= ~FWPS_CLASSIFY_OUT_FLAG_ABSORB;
-            return;
-        }
-        if (Stopping || !DecodeForward(values, metadata, ipv6, &route)) goto Reject;
-#ifdef HV_WFP_FRAGMENT_PERMIT_DIAGNOSTIC
-        // Opt-in diagnostic only: bypass policy/clone/injection for individual IPv4
-        // fragments. Leave fragment groups on the normal reassembly/verdict path.
-        if (!ipv6) {
-            auto* original = static_cast<PNET_BUFFER_LIST>(layerData);
-            PNET_BUFFER nb = NET_BUFFER_LIST_FIRST_NB(original);
-            ULONG length = nb == NULL ? 0 : NET_BUFFER_DATA_LENGTH(nb);
-            UCHAR header[20];
-            const auto* ip = nb == NULL || length < sizeof(header) ? NULL :
-                static_cast<const UCHAR*>(NdisGetDataBuffer(nb, sizeof(header), header, 1, 0));
-            BOOLEAN grouped = (route.Flags & FWP_CONDITION_FLAG_IS_FRAGMENT_GROUP) != 0;
-            BOOLEAN permit = HvForwardDiagnosticIpv4Fragment(ip, length, grouped);
-            ULONG kind = permit ? 0u : grouped ? 1u : 2u;
-            if (permit || grouped || length > 1500) {
-                ULONG count = (ULONG)InterlockedIncrement(&ForwardDiagnosticCounts[kind]);
-                if (count <= 32) HvWfpFragmentDiagnostic(kind, route.Flags, route.SourceIndex,
-                    route.DestinationIndex, length, NET_BUFFER_LIST_NEXT_NBL(original) != NULL, count);
-            }
-            if (permit) {
-                out->actionType = FWP_ACTION_PERMIT;
-                out->flags &= ~FWPS_CLASSIFY_OUT_FLAG_ABSORB;
-                return;
-            }
-        }
-#endif
-        BOOLEAN session = ExAcquireRundownProtection(&ClassificationRundown);
-        PNET_BUFFER_LIST nbl = CreateForwardPacket(static_cast<PNET_BUFFER_LIST>(layerData), &route, ipv6);
-        int result = nbl == NULL ? 1 : HvClassifyIp((ULONG_PTR)nbl, route.SourceIndex, HV_FORWARD_SOURCE_DIRECTION,
-            ipv6 ? 6u : 4u,
-            (route.Flags & (FWP_CONDITION_FLAG_IS_FRAGMENT_GROUP | FWP_CONDITION_FLAG_IS_FRAGMENT |
-                FWP_CONDITION_FLAG_IS_REASSEMBLED)) == 0 ? 1u : 0u, session ? 1u : 0u);
-        if (nbl == NULL) HvResourceDrop();
-        else HvFinishClassifyPacket(nbl, result, [out](PNET_BUFFER_LIST owned, ULONG decision) {
-            if (decision == 0 && !Stopping) {
-                out->actionType = FWP_ACTION_PERMIT;
-                out->flags &= ~FWPS_CLASSIFY_OUT_FLAG_ABSORB;
-            }
-            FreeForwardPacket(owned);
-        });
-        // Pending publication is the last NBL access. A verdict may already have
-        // injected/freed it; the original remains BLOCK|ABSORB in every such case.
-        if (out->actionType != FWP_ACTION_PERMIT) out->rights &= ~FWPS_RIGHT_ACTION_WRITE;
-        if (session) ExReleaseRundownProtection(&ClassificationRundown);
-        return;
-    }
-Reject:
-    HvResourceDrop();
-    out->rights &= ~FWPS_RIGHT_ACTION_WRITE;
-}
+BOOLEAN hv_wfp_driver_stopping(void) { return Stopping != 0; }
+BOOLEAN hv_wfp_session_acquire(void) { return ExAcquireRundownProtection(&ClassificationRundown); }
+void hv_wfp_session_release(void) { ExReleaseRundownProtection(&ClassificationRundown); }
 static void ClassifyChain(HV_ADAPTER* a, PNET_BUFFER_LIST chain, NDIS_PORT_NUMBER port,
     ULONG flags, ULONG direction, BOOLEAN resources, BOOLEAN admitted, BOOLEAN session) {
     while (chain != NULL) {

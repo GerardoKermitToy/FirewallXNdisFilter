@@ -36,15 +36,42 @@ extern "C" void HvForwardStop() {
     if (hook != nullptr) hook();
 }
 
-extern "C" void HvForwardClassify(const FWPS_INCOMING_VALUES0*,
-    const FWPS_INCOMING_METADATA_VALUES0*, void*, const FWPS_FILTER0*, UINT64,
-    FWPS_CLASSIFY_OUT0* out) {
+struct WfpTestState {
+    ULONG Healthy, Dirty, WorkQueued, ResetEngine, NotificationsReady;
+};
+extern "C" WfpTestState HvWfpTestState();
+static void (*WorkHandoffHook)() = nullptr;
+extern "C" void hv_wfp_test_handoff() {
+    auto hook = WorkHandoffHook;
+    WorkHandoffHook = nullptr;
+    if (hook != nullptr) hook();
+}
+struct PolicyCall {
+    ULONG InterfaceIndex, Direction, Family, Cacheable, Session;
+};
+static PolicyCall PolicyObservation{};
+static LONG PolicyResult = 1;
+static BOOLEAN DriverStopping = FALSE, SessionAvailable = TRUE;
+static ULONG ResourceDrops = 0, SessionReferences = 0;
+static PNET_BUFFER_LIST PendingPacket = nullptr;
+static void (*PolicyHook)(PNET_BUFFER_LIST) = nullptr;
+extern "C" BOOLEAN hv_wfp_driver_stopping() { return DriverStopping; }
+extern "C" BOOLEAN hv_wfp_session_acquire() {
+    if (SessionAvailable) ++SessionReferences;
+    return SessionAvailable;
+}
+extern "C" void hv_wfp_session_release() { --SessionReferences; }
+extern "C" void HvResourceDrop() { ++ResourceDrops; }
+extern "C" int HvClassifyIp(ULONG_PTR packet, ULONG index, ULONG direction, ULONG family, ULONG cacheable, ULONG session) {
+    PolicyObservation = {index, direction, family, cacheable, session};
     ++g_forward_calls;
-    out->actionType = FWP_ACTION_CALLOUT_TERMINATING;
+    PendingPacket = reinterpret_cast<PNET_BUFFER_LIST>(packet);
+    if (PolicyHook != nullptr) PolicyHook(PendingPacket);
+    return PolicyResult;
 }
 
 void NTAPI InjectionComplete(void*, PNET_BUFFER_LIST, BOOLEAN) {}
-void RequestAtWorkHandoff() { RequestReconcile(); }
+void RequestAtWorkHandoff() { HvWfpRequestReconcile(); }
 
 bool HasGlobalFilters() {
     const auto& filters = hv_wfp_fake::state().active_filters;
@@ -69,6 +96,10 @@ bool Start(_DRIVER_OBJECT* driver) {
 bool StopAndVerifyClean() {
     HvWfpUninitialize();
     const auto& fake = hv_wfp_fake::state();
+    CHECK(fake.live_packets == 0);
+    CHECK(fake.clones == fake.clone_frees && fake.reassemblies == fake.reassembly_frees);
+    CHECK(fake.context_allocations == fake.context_frees);
+    CHECK(SessionReferences == 0);
     CHECK(fake.live_devices == 0);
     CHECK(fake.live_work_items == 0);
     CHECK(fake.live_injections == 0);
@@ -104,17 +135,17 @@ bool TestGlobalRegistrationWithoutAnyNdisModules() {
     CHECK(fake.live_subscriptions == 1);
     CHECK(fake.live_engines == 1);
     CHECK(HasGlobalFilters());
-    CHECK(Healthy == 1);
+    CHECK(HvWfpTestState().Healthy == 1);
 
     FWPS_CLASSIFY_OUT0 out{};
     out.rights = FWPS_RIGHT_ACTION_WRITE;
     const unsigned before = g_forward_calls;
     Classify(nullptr, nullptr, nullptr, nullptr, 0, &out);
-    CHECK(g_forward_calls == before + 1);
-    CHECK(out.actionType == FWP_ACTION_CALLOUT_TERMINATING);
+    CHECK(g_forward_calls == before);
+    CHECK(out.actionType == FWP_ACTION_BLOCK);
     out.rights = 0;
     Classify(nullptr, nullptr, nullptr, nullptr, 0, &out);
-    CHECK(g_forward_calls == before + 1);
+    CHECK(g_forward_calls == before);
     CHECK(StopAndVerifyClean());
     return true;
 }
@@ -142,14 +173,14 @@ bool TestSubscribeCallbackDefersReconcileUntilReady() {
     CHECK(!fake.subscribe_in_progress);
     CHECK(fake.work_queues_during_subscribe == 0);
     CHECK(!fake.bfe_state_queried_during_subscribe);
-    CHECK(NotificationsReady == 1);
-    CHECK(Dirty == 1 && WorkQueued == 1);
+    CHECK(HvWfpTestState().NotificationsReady == 1);
+    CHECK(HvWfpTestState().Dirty == 1 && HvWfpTestState().WorkQueued == 1);
     CHECK(hv_wfp_fake::QueuedWorkCount() == 1);
     CHECK(fake.work_queue_calls == 1);
     CHECK(HasGlobalFilters());
     hv_wfp_fake::DrainWork();
-    CHECK(Dirty == 0 && WorkQueued == 0);
-    CHECK(Healthy == 1);
+    CHECK(HvWfpTestState().Dirty == 0 && HvWfpTestState().WorkQueued == 0);
+    CHECK(HvWfpTestState().Healthy == 1);
     CHECK(HasGlobalFilters());
     CHECK(StopAndVerifyClean());
     return true;
@@ -167,12 +198,12 @@ bool TestBfePausedStartAndStop() {
     hv_wfp_fake::SetBfeState(FWPM_SERVICE_RUNNING);
     hv_wfp_fake::DrainWork();
     CHECK(HasGlobalFilters());
-    CHECK(Healthy == 1);
+    CHECK(HvWfpTestState().Healthy == 1);
     hv_wfp_fake::SetBfeState(FWPM_SERVICE_STOPPED);
     hv_wfp_fake::DrainWork();
     CHECK(hv_wfp_fake::state().active_filters.empty());
     CHECK(hv_wfp_fake::state().live_engines == 0);
-    CHECK(Healthy == 0);
+    CHECK(HvWfpTestState().Healthy == 0);
     CHECK(!hv_wfp_fake::AnyTimerArmed());
     hv_wfp_fake::SetBfeState(FWPM_SERVICE_RUNNING);
     hv_wfp_fake::DrainWork();
@@ -222,7 +253,7 @@ bool TestRegistrationFailuresRetryWithoutNdisAttachments() {
         CHECK(hv_wfp_fake::state().live_work_items == 1);
         CHECK(hv_wfp_fake::state().live_subscriptions == 1);
         CHECK(hv_wfp_fake::state().active_filters.empty());
-        CHECK(Healthy == 0);
+        CHECK(HvWfpTestState().Healthy == 0);
         CHECK(hv_wfp_fake::AnyTimerArmed());
         hv_wfp_fake::FireTimers();
         hv_wfp_fake::DrainWork();
@@ -230,7 +261,7 @@ bool TestRegistrationFailuresRetryWithoutNdisAttachments() {
         CHECK(hv_wfp_fake::state().live_injections == 4);
         CHECK(hv_wfp_fake::state().live_engines == 1);
         CHECK(HasGlobalFilters());
-        CHECK(Healthy == 1);
+        CHECK(HvWfpTestState().Healthy == 1);
         CHECK(!hv_wfp_fake::AnyTimerArmed());
         CHECK(StopAndVerifyClean());
     }
@@ -267,7 +298,7 @@ bool TestCloseFailurePreservesThenRebuildsAndUnloads() {
     CHECK(hv_wfp_fake::state().active_filters.front().id == old_id);
     CHECK(hv_wfp_fake::state().live_engines == 1);
     CHECK(hv_wfp_fake::AnyTimerArmed());
-    CHECK(ResetEngine == 1);
+    CHECK(HvWfpTestState().ResetEngine == 1);
     hv_wfp_fake::FireTimers();
     hv_wfp_fake::DrainWork();
     CHECK(HasGlobalFilters());
@@ -285,13 +316,13 @@ bool TestWorkHandoffDoesNotLoseRequest() {
     _DRIVER_OBJECT driver{};
     CHECK(Start(&driver));
     const unsigned before = hv_wfp_fake::state().work_run_calls;
-    hv_wfp_fake::SetExchangeHook(&WorkQueued, 0, RequestAtWorkHandoff);
-    RequestReconcile();
+    WorkHandoffHook = RequestAtWorkHandoff;
+    HvWfpRequestReconcile();
     CHECK(hv_wfp_fake::QueuedWorkCount() == 1);
     hv_wfp_fake::DrainWork();
     CHECK(hv_wfp_fake::QueuedWorkCount() == 0);
     CHECK(hv_wfp_fake::state().work_run_calls == before + 2);
-    CHECK(WorkQueued == 0 && Dirty == 0);
+    CHECK(HvWfpTestState().WorkQueued == 0 && HvWfpTestState().Dirty == 0);
     CHECK(HasGlobalFilters());
     CHECK(StopAndVerifyClean());
     return true;
@@ -306,7 +337,7 @@ bool TestStopUnsubscribesAndDrainsBeforeDestruction() {
     hv_wfp_fake::SetBfeState(FWPM_SERVICE_RUNNING);
     hv_wfp_fake::DrainWork();
     CHECK(hv_wfp_fake::AnyTimerArmed());
-    RequestReconcile();
+    HvWfpRequestReconcile();
     CHECK(hv_wfp_fake::QueuedWorkCount() == 1);
     HvWfpStop();
     const auto& fake = hv_wfp_fake::state();
@@ -343,6 +374,7 @@ bool TestStopResolvesPendingBeforeWaitingForPacketRundown() {
 
 #include "wfp_checksum_cases.h"
 #include "wfp_cpu_cases.h"
+#include "wfp_packet_cases.h"
 
 bool TestInjectionWrapperPreservesArgumentsAndFailure() {
     hv_wfp_fake::Reset();
@@ -452,11 +484,11 @@ bool TestEveryInjectionHandleFailureCanRetryAndUnwind() {
         hv_wfp_fake::FailAfter(hv_wfp_fake::FailurePoint::injection_create, successful);
         _DRIVER_OBJECT driver{};
         CHECK(Start(&driver));
-        CHECK(!Healthy && hv_wfp_fake::state().active_filters.empty());
+        CHECK(!HvWfpTestState().Healthy && hv_wfp_fake::state().active_filters.empty());
         CHECK(hv_wfp_fake::state().live_injections == successful);
         hv_wfp_fake::FireTimers();
         hv_wfp_fake::DrainWork();
-        CHECK(Healthy && hv_wfp_fake::state().live_injections == 4 && HasGlobalFilters());
+        CHECK(HvWfpTestState().Healthy && hv_wfp_fake::state().live_injections == 4 && HasGlobalFilters());
         CHECK(StopAndVerifyClean());
     }
     return true;
@@ -511,6 +543,14 @@ int main() {
     if (!TestWeakHostInjectionUsesNetworkHandlesAndOriginalRoute()) return 1;
     if (!TestEveryInjectionHandleFailureCanRetryAndUnwind()) return 1;
     if (!TestInjectionFailureLogIsBoundedAndSessionResettable()) return 1;
+    if (!TestRustClassifyRightsValidationAndSelfInjection()) return 1;
+    if (!TestRustClassifySynchronousDecisionsAndMetadata()) return 1;
+    if (!TestRustClassifyAllocationFailuresAndChains()) return 1;
+    if (!TestRustPendingFragmentOwnershipAndOffloadSnapshot()) return 1;
+    if (!TestRustEarlyVerdictAndInlineInjectionCompletion()) return 1;
+    if (!TestRustPendingInjectionFailureAndCompletionFailure()) return 1;
+    if (!TestRustStopDrainsActualPendingPacket()) return 1;
+    if (!TestRustLargeChecksumSpans()) return 1;
     std::puts("PASS global WFP filters without NDIS attachments, BFE retries, teardown and injection");
     return 0;
 }

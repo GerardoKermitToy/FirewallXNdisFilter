@@ -9,6 +9,7 @@ compile_error!("The driver supports Windows x64 only.");
 extern crate alloc;
 
 mod packet_snapshot;
+mod wfp;
 
 use alloc::vec::Vec;
 use core::{

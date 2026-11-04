@@ -10,7 +10,14 @@ crate-type = ["staticlib"]
 test = false
 doctest = false
 
+[features]
+wfp-test = []
+
 [dependencies]
 hyperv-protocol = { path = "../protocol" }
 hyperv-policy = { path = "../policy" }
 likely_stable.workspace = true
+smoltcp.workspace = true
+
+[build-dependencies]
+windows-sys.workspace = true

@@ -188,7 +188,7 @@ fn close_engine() -> i32 {
 fn populate_engine(engine: Handle) -> i32 {
     let mut status = unsafe { hv_wfp_provider_add(engine) };
     if status >= 0 {
-        status = unsafe { hv_wfp_sublayer_add(engine, 0x7fff) };
+        status = unsafe { hv_wfp_sublayer_add(engine, 0x7100) };
     }
     for family in 0..2 {
         if status < 0 {

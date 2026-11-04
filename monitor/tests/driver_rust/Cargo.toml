@@ -1,0 +1,18 @@
+[package]
+name = "hyperv-driver-tests"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+build = "build.rs"
+
+[lib]
+path = "lib.rs"
+crate-type = ["staticlib"]
+test = false
+doctest = false
+
+[dependencies]
+hyperv-protocol = { path = "../../../protocol" }
+
+[build-dependencies]
+windows-sys.workspace = true

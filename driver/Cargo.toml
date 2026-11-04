@@ -2,6 +2,7 @@
 name = "hyperv-driver"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.91"
 license = "GPL-3.0-only"
 
 [lib]
@@ -12,6 +13,8 @@ doctest = false
 
 [features]
 wfp-test = []
+wfp-fragment-diagnostic = []
+native-wdk = ["dep:bindgen"]
 
 [dependencies]
 hyperv-protocol = { path = "../protocol" }
@@ -21,3 +24,5 @@ smoltcp.workspace = true
 
 [build-dependencies]
 windows-sys.workspace = true
+bindgen = { version = "0.73.2", optional = true }
+wdk-build = "0.6.0"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["protocol", "policy", "driver", "monitor/tests/wfp_rust"]
+members = ["protocol", "policy", "driver", "monitor/tests/driver_rust", "monitor/tests/native_rust"]
 default-members = ["protocol", "policy"]
 
 [workspace.dependencies]

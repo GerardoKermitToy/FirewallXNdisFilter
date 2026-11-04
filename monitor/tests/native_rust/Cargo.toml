@@ -1,0 +1,27 @@
+[package]
+name = "hyperv-native-tests"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "GPL-3.0-only"
+build = "../../../driver/build.rs"
+
+[lib]
+path = "lib.rs"
+doctest = false
+
+[features]
+default = ["native-wdk", "wfp-test"]
+native-wdk = []
+wfp-fragment-diagnostic = []
+wfp-test = []
+
+[dependencies]
+hyperv-protocol = { path = "../../../protocol" }
+smoltcp.workspace = true
+likely_stable.workspace = true
+
+[build-dependencies]
+windows-sys.workspace = true
+bindgen = "0.73.2"
+wdk-build = "0.6.0"

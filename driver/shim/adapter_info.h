@@ -48,55 +48,18 @@ typedef struct _HV_ADAPTER_INFO {
     uint16_t FilterModuleName[HV_ADAPTER_INFO_NAME_CAPACITY];
 } HV_ADAPTER_INFO;
 
-// A restart replaces the optional general-attributes snapshot. Clear every
-// value before applying the current restart's attributes so a missing entry
-// cannot leave old values marked as valid.
-static inline void HvClearGeneralAttributes(HV_ADAPTER_INFO* info) {
-    info->Flags &= ~HV_ADAPTER_GENERAL_VALID;
-    info->Mtu = 0;
-    info->MaxXmitLinkSpeed = 0;
-    info->MaxRcvLinkSpeed = 0;
-    info->LookaheadSize = 0;
-    info->MacOptions = 0;
-    info->SupportedPacketFilters = 0;
-    info->MaxMulticastListSize = 0;
-    info->AccessType = 0;
-    info->RestartFlags = 0;
-    info->ConnectionType = 0;
-    info->SupportedStatistics = 0;
-    info->DataBackFillSize = 0;
-    info->ContextBackFillSize = 0;
-}
-
-// Counted UTF-16 input; always terminate/zero the bounded destination and never
-// cut a surrogate pair at the truncation boundary. Returns the stored length.
-static inline uint32_t HvCopyAdapterName(uint16_t* out, const uint16_t* source,
-    uint32_t length, uint32_t* flags, uint32_t truncatedFlag) {
-    uint32_t i, copied = 0;
-    for (i = 0; i < HV_ADAPTER_INFO_NAME_CAPACITY; ++i) out[i] = 0;
-    if (source == 0) return 0;
-    while (copied < length && copied < HV_ADAPTER_INFO_NAME_CAPACITY - 1 && source[copied] != 0) {
-        out[copied] = source[copied];
-        ++copied;
-    }
-    if (copied < length && source[copied] != 0) {
-        *flags |= truncatedFlag;
-        if (copied != 0 && out[copied - 1] >= 0xd800 && out[copied - 1] <= 0xdbff) out[--copied] = 0;
-    }
-    return copied;
-}
-static inline void HvInfoWrite32(uint8_t* out, uint32_t value) {
-    unsigned int i;
-    for (i = 0; i < 4; ++i) out[i] = (uint8_t)(value >> (8 * i));
-}
-static inline void HvInfoWrite64(uint8_t* out, uint64_t value) {
-    unsigned int i;
-    for (i = 0; i < 8; ++i) out[i] = (uint8_t)(value >> (8 * i));
-}
-static inline uint32_t HvAdapterInfoSize(uint32_t count) {
-    return count <= HV_ADAPTER_INFO_MAX_ADAPTERS ?
-        HV_ADAPTER_INFO_HEADER_SIZE + count * HV_ADAPTER_INFO_ENTRY_SIZE : 0;
-}
+// Portable behavior is implemented in production Rust, also linked by offline
+// fixture tests. This structure is an internal ABI, never a wire memcpy.
+#ifdef __cplusplus
+#include <stddef.h>
+static_assert(sizeof(HV_ADAPTER_INFO) == 1760 && alignof(HV_ADAPTER_INFO) == 8);
+static_assert(offsetof(HV_ADAPTER_INFO, InterfaceGuid) == 48);
+static_assert(offsetof(HV_ADAPTER_INFO, MacAddress) == 168);
+static_assert(offsetof(HV_ADAPTER_INFO, InstanceName) == 224);
+static_assert(offsetof(HV_ADAPTER_INFO, BaseName) == 736);
+static_assert(offsetof(HV_ADAPTER_INFO, FilterModuleName) == 1248);
+extern "C" {
+#endif
 typedef enum _HV_ADAPTER_INFO_ACTION {
     HvAdapterInfoTooSmall,
     HvAdapterInfoCountOverflow,
@@ -104,69 +67,17 @@ typedef enum _HV_ADAPTER_INFO_ACTION {
     HvAdapterInfoGrowStaging,
     HvAdapterInfoEncode
 } HV_ADAPTER_INFO_ACTION;
-// Plan from one lock-protected observation. Staging growth must never masquerade
-// as insufficient user capacity; otherwise an unchanged-capacity retry can loop.
-static inline HV_ADAPTER_INFO_ACTION HvPlanAdapterInfo(uint64_t count, uint32_t capacity,
-    uint64_t stagedCount, uint32_t* required) {
-    if (capacity < HV_ADAPTER_INFO_HEADER_SIZE) return HvAdapterInfoTooSmall;
-    if (count > HV_ADAPTER_INFO_MAX_ADAPTERS) return HvAdapterInfoCountOverflow;
-    *required = HvAdapterInfoSize((uint32_t)count);
-    if (capacity < *required) return HvAdapterInfoHeaderOnly;
-    return stagedCount < count ? HvAdapterInfoGrowStaging : HvAdapterInfoEncode;
+void HvClearGeneralAttributes(HV_ADAPTER_INFO* info);
+uint32_t HvCopyAdapterName(uint16_t* out, const uint16_t* source, uint32_t length,
+    uint32_t* flags, uint32_t truncatedFlag);
+void HvInfoWrite32(uint8_t* out, uint32_t value);
+void HvInfoWrite64(uint8_t* out, uint64_t value);
+uint32_t HvAdapterInfoSize(uint32_t count);
+HV_ADAPTER_INFO_ACTION HvPlanAdapterInfo(uint64_t count, uint32_t capacity,
+    uint64_t stagedCount, uint32_t* required);
+void HvEncodeAdapterInfoHeader(uint8_t* out, uint32_t count, uint32_t running);
+void HvEncodeAdapterInfo(uint8_t* out, const HV_ADAPTER_INFO* info);
+#ifdef __cplusplus
 }
-static inline void HvEncodeAdapterInfoHeader(uint8_t* out, uint32_t count, uint32_t running) {
-    HvInfoWrite32(out, HV_ADAPTER_INFO_VERSION);
-    HvInfoWrite32(out + 4, HV_ADAPTER_INFO_ENTRY_SIZE);
-    HvInfoWrite32(out + 8, count);
-    HvInfoWrite32(out + 12, running);
-}
-static inline void HvEncodeAdapterInfo(uint8_t* out, const HV_ADAPTER_INFO* a) {
-    unsigned int i;
-    HvInfoWrite64(out, a->ModuleId);
-    HvInfoWrite32(out + 8, a->InterfaceIndex);
-    HvInfoWrite32(out + 12, a->FilterInterfaceIndex);
-    HvInfoWrite32(out + 16, a->LowerInterfaceIndex);
-    HvInfoWrite32(out + 20, a->Flags);
-    HvInfoWrite64(out + 24, a->InterfaceLuid);
-    HvInfoWrite64(out + 32, a->FilterInterfaceLuid);
-    HvInfoWrite64(out + 40, a->LowerInterfaceLuid);
-    for (i = 0; i < 16; ++i) out[48 + i] = a->InterfaceGuid[i];
-    HvInfoWrite32(out + 64, a->MediaType);
-    HvInfoWrite32(out + 68, a->PhysicalMedium);
-    HvInfoWrite32(out + 72, a->MediaConnectState);
-    HvInfoWrite32(out + 76, a->MediaDuplexState);
-    HvInfoWrite64(out + 80, a->XmitLinkSpeed);
-    HvInfoWrite64(out + 88, a->RcvLinkSpeed);
-    HvInfoWrite32(out + 96, a->Mtu);
-    HvInfoWrite32(out + 100, a->MacOptions);
-    HvInfoWrite32(out + 104, a->SupportedPacketFilters);
-    HvInfoWrite32(out + 108, a->MaxMulticastListSize);
-    HvInfoWrite64(out + 112, a->MaxXmitLinkSpeed);
-    HvInfoWrite64(out + 120, a->MaxRcvLinkSpeed);
-    HvInfoWrite32(out + 128, a->LookaheadSize);
-    HvInfoWrite32(out + 132, a->AccessType);
-    HvInfoWrite32(out + 136, a->ConnectionType);
-    HvInfoWrite32(out + 140, a->SupportedStatistics);
-    HvInfoWrite32(out + 144, a->DataBackFillSize);
-    HvInfoWrite32(out + 148, a->ContextBackFillSize);
-    HvInfoWrite32(out + 152, a->RestartFlags);
-    HvInfoWrite32(out + 156, a->AttachFlags);
-    HvInfoWrite32(out + 160, a->ConnectorPresent);
-    HvInfoWrite32(out + 164, a->MacAddressLength);
-    for (i = 0; i < HV_ADAPTER_INFO_MAC_CAPACITY; ++i) out[168 + i] = a->MacAddress[i];
-    HvInfoWrite32(out + 200, a->InstanceNameLength);
-    HvInfoWrite32(out + 204, a->BaseNameLength);
-    HvInfoWrite32(out + 208, a->FilterModuleNameLength);
-    HvInfoWrite32(out + 212, a->AutoNegotiationFlags);
-    HvInfoWrite32(out + 216, a->PauseReason);
-    HvInfoWrite32(out + 220, a->PauseFlags);
-    for (i = 0; i < HV_ADAPTER_INFO_NAME_CAPACITY; ++i) {
-        out[224 + 2 * i] = (uint8_t)a->InstanceName[i];
-        out[225 + 2 * i] = (uint8_t)(a->InstanceName[i] >> 8);
-        out[736 + 2 * i] = (uint8_t)a->BaseName[i];
-        out[737 + 2 * i] = (uint8_t)(a->BaseName[i] >> 8);
-        out[1248 + 2 * i] = (uint8_t)a->FilterModuleName[i];
-        out[1249 + 2 * i] = (uint8_t)(a->FilterModuleName[i] >> 8);
-    }
-}
+#endif
 #endif

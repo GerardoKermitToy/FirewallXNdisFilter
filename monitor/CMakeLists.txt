@@ -92,8 +92,8 @@ if(BUILD_TESTING)
     add_test(NAME header_client_tests COMMAND header_client_tests)
     set_tests_properties(header_client_tests PROPERTIES TIMEOUT 30 LABELS "no-driver")
     foreach(test_name IN ITEMS ip_address_tests protocol_codec_tests adapter_info_tests monitor_options_tests
-                               driver_startup_tests delayed_verdict_tests record_output_tests lwf_contract_tests wfp_contract_tests
-                               binding_policy_tests target_config_tests netcfg_binding_tests notify_registration_tests)
+                               driver_startup_tests delayed_verdict_tests record_output_tests
+                               binding_policy_tests target_config_tests netcfg_binding_tests notify_registration_tests driver_logic_tests)
         add_executable(${test_name} "tests/${test_name}.cpp")
         target_link_libraries(${test_name} PRIVATE pmkext)
         if(MSVC)
@@ -113,36 +113,53 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME ics_interfaces_tests COMMAND ics_interfaces_tests)
     set_tests_properties(ics_interfaces_tests PROPERTIES TIMEOUT 15 LABELS "no-driver")
-    foreach(test_name IN ITEMS nbl_context_tests packet_snapshot_tests nbl_offload_tests)
-        add_executable(${test_name} "tests/${test_name}.cpp")
-        target_compile_features(${test_name} PRIVATE cxx_std_20)
-        if(MSVC)
-            target_compile_options(${test_name} PRIVATE /O2 /W4 /WX /permissive- /utf-8)
-        endif()
-        add_test(NAME ${test_name} COMMAND ${test_name})
-        set_tests_properties(${test_name} PROPERTIES TIMEOUT 15 LABELS "no-driver")
-    endforeach()
     find_program(CARGO_EXECUTABLE cargo REQUIRED)
-    set(WFP_RUST_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/wfp-rust")
-    set(WFP_RUST_LIBRARY "${WFP_RUST_TARGET_DIR}/release/hyperv_wfp_tests.lib")
-    add_custom_command(OUTPUT "${WFP_RUST_LIBRARY}"
+    # These suites compile the production Rust native modules against generated
+    # WDK layouts. Only kernel API side effects are faked; no C++ native copy.
+    foreach(suite IN ITEMS native_packet native_ndis native_device native_wfp)
+        if(suite STREQUAL "native_wfp")
+            set(test_name wfp_management_tests)
+            set(test_filter "native_wfp::")
+        elseif(suite STREQUAL "native_ndis")
+            set(test_name native_ndis_tests)
+            set(test_filter "native::ndis::")
+        elseif(suite STREQUAL "native_device")
+            set(test_name native_device_tests)
+            set(test_filter "native::device::")
+        else()
+            set(test_name "${suite}_tests")
+            set(test_filter "${suite}::")
+        endif()
+        add_test(NAME ${test_name}
+            COMMAND "${CMAKE_COMMAND}" -E env --unset=RUSTFLAGS --unset=CARGO_ENCODED_RUSTFLAGS
+                "${CARGO_EXECUTABLE}" test --release --locked -p hyperv-native-tests --lib
+                "${test_filter}" -- --test-threads=1)
+        set_tests_properties(${test_name} PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE LABELS "no-driver"
+            PASS_REGULAR_EXPRESSION "test result: ok\\. [1-9][0-9]* passed"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/..")
+    endforeach()
+    # Portable kernel logic uses its own host archive: adapter/header fixtures
+    # must not pull the WFP fake-native ABI into otherwise independent tests.
+    set(DRIVER_RUST_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/driver-rust")
+    set(DRIVER_RUST_LIBRARY "${DRIVER_RUST_TARGET_DIR}/release/hyperv_driver_tests.lib")
+    add_custom_command(OUTPUT "${DRIVER_RUST_LIBRARY}"
         COMMAND "${CMAKE_COMMAND}" -E env --unset=RUSTFLAGS --unset=CARGO_ENCODED_RUSTFLAGS
-            "${CARGO_EXECUTABLE}" build --release --locked -p hyperv-wfp-tests
-            --target-dir "${WFP_RUST_TARGET_DIR}"
+            "${CARGO_EXECUTABLE}" build --release --locked -p hyperv-driver-tests
+            --target-dir "${DRIVER_RUST_TARGET_DIR}"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
-        DEPENDS tests/wfp_rust/lib.rs tests/wfp_rust/Cargo.toml
-            ../driver/src/wfp.rs ../driver/src/wfp_checksum.rs ../driver/build.rs ../Cargo.toml ../Cargo.lock
+        DEPENDS tests/driver_rust/lib.rs tests/driver_rust/Cargo.toml tests/driver_rust/build.rs
+            ../driver/src/adapter_info.rs ../driver/src/device_control.rs ../driver/src/target_config.rs
+            ../protocol/src/lib.rs ../driver/build_constants.rs ../Cargo.toml ../Cargo.lock
         VERBATIM)
-    add_custom_target(wfp_rust_test_library DEPENDS "${WFP_RUST_LIBRARY}")
-    add_executable(wfp_management_tests tests/wfp_management_tests.cpp)
-    add_dependencies(wfp_management_tests wfp_rust_test_library)
-    target_link_libraries(wfp_management_tests PRIVATE "${WFP_RUST_LIBRARY}")
-    target_compile_features(wfp_management_tests PRIVATE cxx_std_20)
+    add_custom_target(driver_rust_test_library DEPENDS "${DRIVER_RUST_LIBRARY}")
+    foreach(test_name IN ITEMS adapter_info_tests header_client_tests driver_logic_tests)
+        add_dependencies(${test_name} driver_rust_test_library)
+        target_sources(${test_name} PRIVATE tests/driver_rust_stubs.cpp)
+        target_link_libraries(${test_name} PRIVATE "${DRIVER_RUST_LIBRARY}")
+    endforeach()
     if(MSVC)
-        target_compile_options(wfp_management_tests PRIVATE /W4 /WX /permissive- /utf-8)
+        target_compile_options(driver_logic_tests PRIVATE /WX)
     endif()
-    add_test(NAME wfp_management_tests COMMAND wfp_management_tests)
-    set_tests_properties(wfp_management_tests PROPERTIES TIMEOUT 15 LABELS "no-driver")
     target_link_libraries(netcfg_binding_tests PRIVATE ole32 uuid)
     target_link_libraries(notify_registration_tests PRIVATE ole32 uuid)
     if(MSVC)

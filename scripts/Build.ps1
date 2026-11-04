@@ -35,24 +35,19 @@ $dist = Join-Path $root 'dist'
 New-Item -ItemType Directory -Force $build, $dist | Out-Null
 $oldFlags = $env:RUSTFLAGS
 $oldEncodedFlags = $env:CARGO_ENCODED_RUSTFLAGS
+$oldSdkVersion = $env:HYPERVXNDISFILTER_SDK_VERSION
 $oldDir = Get-Location
 try {
     Set-Location $root
     $env:RUSTFLAGS = '-C panic=abort -C no-redzone=yes -C debuginfo=2 -C link-arg=/DEBUG:FULL -C link-arg=/PDBALTPATH:%_PDB%'
     $env:CARGO_ENCODED_RUSTFLAGS = $null
-    & cargo build --release --target x86_64-pc-windows-msvc -p hyperv-driver --locked
+    $env:HYPERVXNDISFILTER_SDK_VERSION = $SdkVersion
+    & cargo build --release --target x86_64-pc-windows-msvc -p hyperv-driver --features native-wdk --locked
     if ($LASTEXITCODE) { throw 'Rust driver build failed.' }
-    $objects = @()
-    foreach ($source in @('ndis_shim', 'wfp_forward')) {
-        $object = Join-Path $build "$source.obj"
-        & cl.exe /nologo /c /TP /std:c++20 /GR- /EHs-c- /O2 /W4 /WX /wd4324 /GS /kernel /Zl /Zi /D_AMD64_ /DAMD64 /DNDIS689=1 /D_WIN64 /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /DNTDDI_VERSION=NTDDI_WIN10_NI "/I$include\km" "/I$include\shared" "/I$include\ucrt" "/Fo$object" "/Fd$build\shim.pdb" "$root\driver\shim\$source.cpp"
-        if ($LASTEXITCODE) { throw "WDK ABI shim compilation failed: $source" }
-        $objects += $object
-    }
     $resource = Join-Path $build 'driver_version.res'
     & "$bin\rc.exe" /nologo "/I$include\um" "/I$include\shared" "/fo$resource" "$root\driver\version.rc"
     if ($LASTEXITCODE) { throw 'Driver version resource compilation failed.' }
-    & link.exe /NOLOGO /DRIVER /SUBSYSTEM:NATIVE,10.00 /ENTRY:GsDriverEntry /MACHINE:X64 /MANIFEST:NO /NODEFAULTLIB /INCREMENTAL:NO /INTEGRITYCHECK /DYNAMICBASE /NXCOMPAT /OPT:REF /OPT:ICF /DEBUG:FULL '/PDBALTPATH:%_PDB%' /RELEASE "/OUT:$dist\HyperVXNdisFilter.sys" "/PDB:$dist\HyperVXNdisFilter.pdb" $objects $resource "$root\target\x86_64-pc-windows-msvc\release\hyperv_driver.lib" "$lib\ndis.lib" "$lib\netio.lib" "$lib\fwpkclnt.lib" "$lib\wdmsec.lib" "$lib\ntoskrnl.lib" "$lib\hal.lib" "$lib\BufferOverflowK.lib"
+    & link.exe /NOLOGO /DRIVER /SUBSYSTEM:NATIVE,10.00 /ENTRY:GsDriverEntry /MACHINE:X64 /MANIFEST:NO /NODEFAULTLIB /INCREMENTAL:NO /INTEGRITYCHECK /DYNAMICBASE /NXCOMPAT /OPT:REF /OPT:ICF /DEBUG:FULL '/PDBALTPATH:%_PDB%' /RELEASE "/OUT:$dist\HyperVXNdisFilter.sys" "/PDB:$dist\HyperVXNdisFilter.pdb" $resource "$root\target\x86_64-pc-windows-msvc\release\hyperv_driver.lib" "$lib\ndis.lib" "$lib\netio.lib" "$lib\fwpkclnt.lib" "$lib\wdmsec.lib" "$lib\ntoskrnl.lib" "$lib\hal.lib" "$lib\BufferOverflowK.lib"
     if ($LASTEXITCODE) { throw 'Kernel image link failed.' }
     & "$PSScriptRoot\tests\driver_import_tests.ps1" -DriverPath "$dist\HyperVXNdisFilter.sys"
     $cmake = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
@@ -133,5 +128,6 @@ try {
 } finally {
     $env:RUSTFLAGS = $oldFlags
     $env:CARGO_ENCODED_RUSTFLAGS = $oldEncodedFlags
+    $env:HYPERVXNDISFILTER_SDK_VERSION = $oldSdkVersion
     Set-Location $oldDir
 }

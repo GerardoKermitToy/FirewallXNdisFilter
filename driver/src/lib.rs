@@ -8,7 +8,18 @@ compile_error!("The driver supports Windows x64 only.");
 
 extern crate alloc;
 
+mod adapter_info;
+mod device_control;
+#[cfg(feature = "native-wdk")]
+mod native;
+#[cfg(feature = "native-wdk")]
+mod native_packet;
+#[cfg(feature = "native-wdk")]
+mod native_wfp;
 mod packet_snapshot;
+mod target_config;
+#[cfg(feature = "native-wdk")]
+mod wdk;
 mod wfp;
 
 use alloc::vec::Vec;
@@ -89,7 +100,7 @@ unsafe impl GlobalAlloc for NonPagedAllocator {
 static ALLOCATOR: NonPagedAllocator = NonPagedAllocator;
 
 struct State(UnsafeCell<Engine>);
-// The C shim initializes the spin lock before ANY callback or control device is
+// The native Rust layer initializes the spin lock before ANY callback or control device is
 // published. Every engine access is under it; no references escape with_state.
 unsafe impl Sync for State {}
 unsafe fn cache_allocate(size: usize) -> *mut u8 {
@@ -160,8 +171,8 @@ fn finish_code(finish: Finish) -> i32 {
     finish_value(finish) as i32
 }
 fn finish(a: Action) {
-    // SAFETY: claiming a pending entry transfers its one owned NBL. The C
-    // shim retains its NDIS module or independent WFP packet rundown until finish.
+    // SAFETY: claiming a pending entry transfers its one owned NBL. The native Rust
+    // layer retains its NDIS module or independent WFP packet rundown until finish.
     unsafe { hv_finish(a.nbl, finish_value(a.finish)) }
 }
 // Old per-interface cache banks move out one at a time, keeping the kernel
@@ -357,7 +368,7 @@ impl PacketInput {
 }
 
 // Return -1 when policy owns the nbl; otherwise the caller finishes it after
-// releasing the per-module classification lock. Ownership stays in the C shim.
+// releasing the per-module classification lock. Ownership stays in the native Rust layer.
 #[unsafe(no_mangle)]
 pub extern "C" fn HvClassify(
     nbl: usize,
@@ -491,7 +502,7 @@ fn classify(nbl: usize, interface_index: u32, input: PacketInput, session: u32) 
     };
     packet.orient_direction(input.direction());
     if session == 0 {
-        // The C shim can close the policy rundown while the LWF remains bound.
+        // The native Rust layer can close the policy rundown while the LWF remains bound.
         // Do not publish a pending event into a session that is being torn down;
         // use the configured immediate fallback instead.
         return with_state(|e| finish_code(e.fallback()));
@@ -619,8 +630,8 @@ pub extern "C" fn HvResourceDrop() {
     with_state(|e| e.resource_drop());
 }
 
-// Nonblocking stream copy for the C shim's cancel-safe read worker. Empty
-// streams stay pending in the shim; Rust never waits or owns a read IRP.
+// Nonblocking stream copy for the native Rust layer's cancel-safe read worker. Empty
+// streams stay pending in the shim; This policy stream never waits; the native Rust module owns read IRPs.
 /// # Safety
 /// `out` is an exclusively writable nonpaged system buffer of at least `len`
 /// bytes, valid for the entire call, supplied by the buffered IRP shim.
@@ -645,7 +656,7 @@ pub unsafe extern "C" fn HvRead(out: *mut u8, len: u32) -> u32 {
 }
 /// # Safety
 /// `data` is a readable nonpaged system buffer of at least `len` bytes, immutable
-/// for the call and serialized with client cleanup by the C shim's I/O mutex.
+/// for the call and serialized with client cleanup by the native Rust layer's I/O mutex.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn HvWrite(data: *const u8, len: u32) -> i32 {
     if unlikely(data.is_null() || len == 0) {

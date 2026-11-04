@@ -2,6 +2,7 @@
 #include "../notify/BindingPolicy.h"
 #include "../notify/AdapterInventory.h"
 #include "../notify/TargetConfig.h"
+#include "../notify/NotifyRegistration.h"
 
 #include <netcfgx.h>
 #include <netcfgn.h>
@@ -396,6 +397,9 @@ public:
     Change EnableTargets(const Targets& targets) override { return SetTargetBindings(targets, true); }
 
     void DeleteConfiguration() override {
+        // Called only after the component and service are gone. NetCfg need not
+        // invoke DllUnregisterServer for a Driver Store notify DLL on removal.
+        Check(UnregisterNotifyServer(), L"Remove only HyperVXNdisFilter notify registration");
         const LSTATUS result = RegDeleteTreeW(HKEY_LOCAL_MACHINE, kConfigKey);
         if (result != ERROR_FILE_NOT_FOUND && result != ERROR_PATH_NOT_FOUND) CheckWin32(result, L"Remove only HyperVXNdisFilter target configuration");
     }

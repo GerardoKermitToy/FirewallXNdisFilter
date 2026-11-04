@@ -3,6 +3,7 @@
 #include "BindingPolicy.h"
 #include "NetCfgTrace.h"
 #include "AdapterInventory.h"
+#include "NotifyRegistration.h"
 #include <new>
 #include <string>
 
@@ -85,11 +86,6 @@ public:
     }
 };
 
-std::wstring ClassKey() {
-    wchar_t guid[39]{};
-    if (!StringFromGUID2(hyperv_xndis_filter::kNotifyClsid, guid, 39)) return {};
-    return std::wstring(L"SOFTWARE\\Classes\\CLSID\\") + guid;
-}
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
@@ -110,33 +106,10 @@ extern "C" HRESULT __stdcall DllCanUnloadNow() {
         InterlockedCompareExchange(&locks, 0, 0) == 0 ? S_OK : S_FALSE;
 }
 extern "C" HRESULT __stdcall DllRegisterServer() {
-    try {
-        wchar_t path[MAX_PATH]{};
-        const DWORD length = GetModuleFileNameW(moduleHandle, path, MAX_PATH);
-        if (length == 0 || length >= MAX_PATH) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
-        const auto key = ClassKey();
-        if (key.empty()) return E_UNEXPECTED;
-        const wchar_t description[] = L"HyperVXNdisFilter target-adapter binding policy";
-        LSTATUS status = RegSetKeyValueW(HKEY_LOCAL_MACHINE, key.c_str(), nullptr, REG_SZ,
-                                         description, sizeof(description));
-        if (status != ERROR_SUCCESS) return HRESULT_FROM_WIN32(status);
-        const auto server = key + L"\\InprocServer32";
-        status = RegSetKeyValueW(HKEY_LOCAL_MACHINE, server.c_str(), nullptr, REG_SZ,
-                                path, (length + 1) * sizeof(wchar_t));
-        if (status == ERROR_SUCCESS) {
-            const wchar_t threading[] = L"Both";
-            status = RegSetKeyValueW(HKEY_LOCAL_MACHINE, server.c_str(), L"ThreadingModel", REG_SZ,
-                                    threading, sizeof(threading));
-        }
-        if (status != ERROR_SUCCESS) RegDeleteTreeW(HKEY_LOCAL_MACHINE, key.c_str());
-        return HRESULT_FROM_WIN32(status);
-    } catch (...) { return E_OUTOFMEMORY; }
+    try { return hyperv_xndis_filter::RegisterNotifyServer(moduleHandle); }
+    catch (...) { return E_OUTOFMEMORY; }
 }
 extern "C" HRESULT __stdcall DllUnregisterServer() {
-    try {
-        const auto key = ClassKey();
-        if (key.empty()) return E_UNEXPECTED;
-        const LSTATUS status = RegDeleteTreeW(HKEY_LOCAL_MACHINE, key.c_str());
-        return status == ERROR_FILE_NOT_FOUND ? S_OK : HRESULT_FROM_WIN32(status);
-    } catch (...) { return E_OUTOFMEMORY; }
+    try { return hyperv_xndis_filter::UnregisterNotifyServer(); }
+    catch (...) { return E_OUTOFMEMORY; }
 }

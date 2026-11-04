@@ -80,7 +80,7 @@ bool HasGlobalFilters() {
     for (const auto& filter : filters) {
         if (filter.condition_count != 0 || filter.has_condition_pointer || filter.raw_context != 0 ||
             filter.action_type != FWP_ACTION_CALLOUT_TERMINATING ||
-            !(filter.sublayer == SublayerKey) || filter.sublayer_weight != 0x7FFF) return false;
+            !(filter.sublayer == SublayerKey) || filter.sublayer_weight != 0x7100) return false;
         if (filter.layer == FWPM_LAYER_IPFORWARD_V4 && filter.callout == CalloutKeys[0]) ++v4;
         else if (filter.layer == FWPM_LAYER_IPFORWARD_V6 && filter.callout == CalloutKeys[1]) ++v6;
         else return false;

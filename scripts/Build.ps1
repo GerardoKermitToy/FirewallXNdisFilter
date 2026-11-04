@@ -45,7 +45,7 @@ try {
     $objects = @()
     foreach ($source in @('ndis_shim', 'wfp_forward')) {
         $object = Join-Path $build "$source.obj"
-        & cl.exe /nologo /c /TP /std:c++20 /GR- /EHs-c- /O2 /W4 /WX /wd4324 /GS /kernel /Zl /Zi /D_AMD64_ /DAMD64 /DNDIS640 /DNDIS_SUPPORT_NDIS640=1 /D_WIN64 /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /DNTDDI_VERSION=0x0A00000C "/I$include\km" "/I$include\shared" "/I$include\ucrt" "/Fo$object" "/Fd$build\shim.pdb" "$root\driver\shim\$source.cpp"
+        & cl.exe /nologo /c /TP /std:c++20 /GR- /EHs-c- /O2 /W4 /WX /wd4324 /GS /kernel /Zl /Zi /D_AMD64_ /DAMD64 /DNDIS689=1 /D_WIN64 /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /DNTDDI_VERSION=NTDDI_WIN10_NI "/I$include\km" "/I$include\shared" "/I$include\ucrt" "/Fo$object" "/Fd$build\shim.pdb" "$root\driver\shim\$source.cpp"
         if ($LASTEXITCODE) { throw "WDK ABI shim compilation failed: $source" }
         $objects += $object
     }

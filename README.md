@@ -1,6 +1,6 @@
 # HyperVXNdisFilter
 
-Experimental Rust-based **NDIS Lightweight Filter (LWF)** with additional **WFP IPFORWARD IPv4/IPv6 callouts** and a C++ monitor with a `kext_monitor`-style API. The NDIS path targets **all Hyper-V management-OS Ethernet host adapters associated with HNS networks of type `ICS`**, regardless of network, switch or adapter names. WFP independently filters **all traffic presented at `FWPM_LAYER_IPFORWARD_V4/V6`**, including forwarding through physical and VPN interfaces. This includes Default Switch and WSL (Hyper-V firewall) when their HNS networks are ICS. It is not a Hyper-V switch extension; WFP does not replace the LWF.
+Experimental Rust-based **NDIS 6.89 Lightweight Filter (LWF)** with additional **WFP IPFORWARD IPv4/IPv6 callouts** and a C++ monitor with a `kext_monitor`-style API. The NDIS path targets **all Hyper-V management-OS Ethernet host adapters associated with HNS networks of type `ICS`**, regardless of network, switch or adapter names. WFP independently filters **all traffic presented at `FWPM_LAYER_IPFORWARD_V4/V6`**, including forwarding through physical and VPN interfaces. This includes Default Switch and WSL (Hyper-V firewall) when their HNS networks are ICS. It is not a Hyper-V switch extension; WFP does not replace the LWF.
 
 Driver package and device API: **0.3.3.0**. Connection records add the host adapter `interface_index:u32` immediately after `id:u64`, and bandwidth group headers now carry the same index. This breaks compatibility with 0.3.2.0 and earlier event layouts; nonzero reads still wait for event data and support cancellation. Use a matching SYS and monitor; the monitor rejects older device versions.
 
@@ -9,6 +9,24 @@ Coverage consists of the restricted host-vNIC NDIS path and unrestricted routed 
 ## Build
 
 Requires Windows x64 **build 25341+**, Hyper-V with at least one HNS ICS network, Visual Studio C++ x64 tools with CMake/Ninja, Rust 1.91+ with the `x86_64-pc-windows-msvc` target, and WDK/SDK **10.0.28000.0**. Kernel builds are **release-only**.
+
+The LWF builds against `NDIS689=1` and selects the highest supported runtime version with `NdisGetVersion`: **6.40, 6.50, 6.51, 6.60, 6.70, and 6.80 through 6.89**. Registration uses revision 2 below 6.80 and revision 3 from 6.80; direct and synchronous OIDs bypass it. Resource-copy metadata scans use the corresponding runtime OOB bounds, not a newer structure size on older runtimes. The existing package OS minimum is unchanged; runtime compatibility is not a claim that the current notify-object package installs on older Windows releases. **UDP Receive Segment Coalescing Offload (URO)** is supported on the NDIS receive path: original NBLs retain their packet/OOB state, and private `RESOURCES` copies preserve the inline `SegCount`/`SegSize` metadata and receive-checksum information. The complete logical UDP packet is exposed in one event without rewriting checksum fields, and coalesced/segmented packets never use, seed or refresh permanent verdict caches. UDP segmentation offload (USO) is recognized on sends. Unknown pointer-bearing OOB metadata is still rejected for private receive copies. See Microsoft's [NDIS 6.89 requirements](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/introduction-to-ndis-6-89) and [URO specification](https://github.com/microsoft/net-offloads/blob/main/udp-rsc-offload.md).
+
+WFP is unchanged and does not opt into `FWP_CALLOUT_FLAG_ALLOW_URO`; this NDIS support does not claim WFP URO clone/reinjection support. Windows may suppress URO for incompatible components at URO-sensitive layers. The device/wire API remains **0.3.3.0**.
+
+The intermediate-version contracts are handled as follows ([version overview](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/overview-of-ndis-versions)):
+
+| NDIS versions | LWF behavior |
+| --- | --- |
+| 6.40, 6.50, 6.51, 6.60 | Revision 2 registration; version-appropriate OOB bounds. Optional dynamic MAC/MTU capabilities are not advertised. |
+| 6.70 | Ordinary LWF callbacks remain valid with NetAdapterCx miniports; no dependency on deprecated TCP Chimney/IPsec offload. |
+| 6.80, 6.81, 6.82 | Revision 3 registration; synchronous OID/RSSv2 requests bypass the LWF rather than being pended or cloned as regular OIDs. |
+| 6.83, 6.84 | USO and UDP receive-coalescing scalar metadata are recognized without treating logical packets as cacheable datagrams. |
+| 6.85 | Miniport Poll Mode needs no new LWF callback; original USO NBLs retain encapsulation/offload OOB without copying borrowed pointers. |
+| 6.86, 6.87, 6.88 | Existing callback, ownership and bounded packet rules continue to apply; unknown receive-copy OOB remains fail-closed. |
+| 6.89 | NDIS URO is accepted with checksum/segment metadata retained; no URO opt-out flag is set. |
+
+These are compatibility rules for this Ethernet LWF, not an implementation of every optional miniport, RDMA, wireless or switch-extension feature. Registration selection and structure/OOB boundaries are covered offline; successful installation and live validation on each Windows runtime are separate requirements.
 
 Cargo resolves the `no_std`-compatible `likely_stable`, `smoltcp` and `windows-sys` dependencies from crates.io (or its local cache). Only stateless wire/checksum helpers are used from `smoltcp`; it does not manage interfaces, sockets or packet queues. A build-time generator uses `windows-sys` to extract named SDK constants; it is not linked into the kernel image. The [WDK ABI shim](driver/shim/ndis_shim.cpp) uses C++20 branch attributes, with C linkage and exceptions/RTTI disabled. Hints favor IPv4 TCP/UDP and successful allocation; all validation and allocation-failure fallbacks remain in place.
 
@@ -125,6 +143,8 @@ Stop the monitor, then run from an elevated console:
 ```
 
 Uninstall first disarms and removes the `hyperv_xndis_filter` NetCfg component, then removes **all identified HyperVXNdisFilter driver-package versions** from Driver Store, including old `HyperVXNdisFilter.sys` copies under `FileRepository`. Windows driver-installation APIs perform the deletion; the program never takes ownership of Driver Store folders or deletes them manually. Package ownership is checked from the original INF name, NetService class, every component model, filter instance GUID, and service/SYS identity, without requiring the current package version. Unrelated driver packages are not selected.
+
+After the component and service are gone and package removal completes, setup also unregisters only this package's notify COM class before deleting the target configuration. Missing registration is harmless; cleanup errors remain failures, leaving configuration disarmed for a retry.
 
 `--what-if` lists matching published OEM INFs without changing system state. Cleanup also works when the component is already absent and only old staged packages remain. Exit **0** requires a fresh inventory with no matching packages; partial failure is reported, not ignored. If component/package removal returns **3010**, reboot and run `Uninstall.exe` again before reinstalling. Busy packages are never forcibly deleted; no manual SCM service creation/deletion is needed.
 

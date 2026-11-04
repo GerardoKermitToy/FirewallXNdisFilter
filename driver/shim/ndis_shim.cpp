@@ -8,6 +8,8 @@
 #include "adapter_info.h"
 #include "target_config.h"
 #include "nbl_context.h"
+#include "nbl_offload.h"
+#include "ndis_version.h"
 #include "packet_snapshot.h"
 #include "wfp_forward.h"
 
@@ -23,6 +25,7 @@ extern "C" {
 #define ADAPTER_INFO_IOCTL CTL_CODE(40000, 0x803, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
 
 C_ASSERT(NDIS_MAX_PHYS_ADDRESS_LENGTH == HV_ADAPTER_INFO_MAC_CAPACITY);
+C_ASSERT(NDIS_FILTER_MAJOR_VERSION == 6 && NDIS_FILTER_MINOR_VERSION == 89);
 
 typedef struct _HV_ADAPTER HV_ADAPTER;
 struct _HV_ADAPTER {
@@ -59,6 +62,7 @@ extern ULONG HvRead(UCHAR*, ULONG);
 extern NTSTATUS HvWrite(const UCHAR*, ULONG);
 
 static NDIS_HANDLE DriverHandle, DeviceHandle;
+static UINT FilterNdisVersion;
 static PDEVICE_OBJECT ControlDevice;
 static BOOLEAN StandaloneWfp, StandaloneLinkCreated;
 static UNICODE_STRING ControlDeviceName = RTL_CONSTANT_STRING(L"\\Device\\HyperVXNdisFilter");
@@ -357,30 +361,10 @@ static void FreeReceiveCopy(PNET_BUFFER_LIST nbl) {
     }
     NdisFreeNetBufferList(nbl);
 }
-static BOOLEAN CopyMetadataSupported(PNET_BUFFER_LIST nbl) {
-    ULONG i;
-    // Only inline receive OOB with a known lifetime is supported for resources
-    // copies. Do not retain media/IPsec/WFP/RSC/virtualization metadata pointers.
-    for (i = 0; i < MaxNetBufferListInfo; ++i) {
-        if (NET_BUFFER_LIST_INFO(nbl, i) == NULL) continue;
-        switch (i) {
-        case TcpIpChecksumNetBufferListInfo:
-        case TcpReceiveNoPush:
-        case Ieee8021QNetBufferListInfo:
-        case NetBufferListFrameType:
-        case NetBufferListHashValue:
-        case NetBufferListHashInfo:
-            break;
-        default:
-            return FALSE;
-        }
-    }
-    return TRUE;
-}
 static PNET_BUFFER_LIST CopyReceive(HV_ADAPTER* a, PNET_BUFFER_LIST source) {
     PNET_BUFFER nb, tail = NULL;
     PNET_BUFFER_LIST copy;
-    if (!CopyMetadataSupported(source) || NET_BUFFER_LIST_FIRST_NB(source) == NULL) return NULL;
+    if (!HvCopyReceiveMetadataSupported(source, HvNblInfoCount(FilterNdisVersion)) || NET_BUFFER_LIST_FIRST_NB(source) == NULL) return NULL;
     copy = NdisAllocateNetBufferList(a->NblPool, 0, 0);
     if (copy == NULL) [[unlikely]] return NULL;
     NET_BUFFER_LIST_FIRST_NB(copy) = NULL;
@@ -408,6 +392,7 @@ static PNET_BUFFER_LIST CopyReceive(HV_ADAPTER* a, PNET_BUFFER_LIST source) {
         tail = created;
     }
     NdisCopyReceiveNetBufferListInfo(copy, source);
+    HvCopyReceiveUroInfo(copy, source);
     NET_BUFFER_LIST_NBL_FLAGS(copy) = NET_BUFFER_LIST_NBL_FLAGS(source) &
         (NDIS_NBL_FLAGS_IS_IPV4 | NDIS_NBL_FLAGS_IS_IPV6 |
          NDIS_NBL_FLAGS_IS_TCP | NDIS_NBL_FLAGS_IS_UDP | NDIS_NBL_FLAGS_IS_LOOPBACK_PACKET);
@@ -491,17 +476,12 @@ void* hv_next_nb(PNET_BUFFER nb) { return NET_BUFFER_NEXT_NB(nb); }
 static ULONG SnapshotOffload(ULONG_PTR packet) {
     auto* nbl = reinterpret_cast<PNET_BUFFER_LIST>(packet);
     const HV_NBL_CONTEXT* context = PacketContext(nbl);
-    ULONG offload = NET_BUFFER_LIST_INFO(nbl, TcpRecvSegCoalesceInfo) != NULL;
     if (context->Owner == HvOwnerNdis) {
-        offload = offload != 0 || (context->Direction == HV_DIRECTION_SEND ?
-            NET_BUFFER_LIST_INFO(nbl, TcpLargeSendNetBufferListInfo) != NULL :
-            NET_BUFFER_LIST_INFO(nbl, TcpReceiveBytesTransferred) != NULL);
-    } else {
-        offload = offload != 0 || context->Segmented ||
-            NET_BUFFER_LIST_INFO(nbl, TcpLargeSendNetBufferListInfo) != NULL ||
-            NET_BUFFER_LIST_INFO(nbl, TcpReceiveBytesTransferred) != NULL;
+        return context->Direction == HV_DIRECTION_SEND ? HvNblSendSegmented(nbl) : HvNblReceiveCoalesced(nbl);
     }
-    return offload;
+    return NET_BUFFER_LIST_INFO(nbl, TcpRecvSegCoalesceInfo) != NULL || context->Segmented ||
+        NET_BUFFER_LIST_INFO(nbl, TcpLargeSendNetBufferListInfo) != NULL ||
+        NET_BUFFER_LIST_INFO(nbl, TcpReceiveBytesTransferred) != NULL;
 }
 const UCHAR* hv_snapshot_view(PNET_BUFFER nb, ULONG_PTR packet, UCHAR* storage, ULONG cap,
     ULONG* copied, ULONG* trusted, ULONG* frameLength, ULONG* offload) {
@@ -1181,10 +1161,13 @@ NTSTATUS hv_initialize(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
         if (!NT_SUCCESS(status)) goto Failed;
         ControlDevice = control;
     } else {
-        c.Header.Type = NDIS_OBJECT_TYPE_FILTER_DRIVER_CHARACTERISTICS;
-        c.Header.Revision = NDIS_FILTER_CHARACTERISTICS_REVISION_2;
-        c.Header.Size = NDIS_SIZEOF_FILTER_DRIVER_CHARACTERISTICS_REVISION_2;
-        c.MajorNdisVersion = 6; c.MinorNdisVersion = 40;
+        FilterNdisVersion = HvNdisVersion(NdisGetVersion());
+        if (!HvSetNdisVersion(&c, FilterNdisVersion)) {
+            status = NDIS_STATUS_BAD_VERSION;
+            goto Failed;
+        }
+        // URO's scalar metadata is retained on original and private receive NBLs.
+        c.Flags = 0;
         c.MajorDriverVersion = 0; c.MinorDriverVersion = 3;
         c.FriendlyName = Friendly; c.UniqueName = Unique; c.ServiceName = ServiceName;
         c.AttachHandler = HvFilterAttach; c.DetachHandler = HvFilterDetach;
@@ -1194,7 +1177,9 @@ NTSTATUS hv_initialize(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
         c.ReceiveNetBufferListsHandler = HvReceive; c.ReturnNetBufferListsHandler = HvReturn;
         c.OidRequestHandler = HvOid; c.OidRequestCompleteHandler = HvOidComplete;
         c.CancelOidRequestHandler = HvCancelOid; c.NetPnPEventHandler = HvPnp; c.StatusHandler = HvStatus;
-        // Direct OID callbacks remain NULL: NDIS bypasses this non-intercepting LWF.
+        // Direct and synchronous OIDs bypass this non-intercepting LWF.
+        c.SynchronousOidRequestHandler = NULL;
+        c.SynchronousOidRequestCompleteHandler = NULL;
         status = NdisFRegisterFilterDriver(driver, driver, &c, &filter);
         if (status != NDIS_STATUS_SUCCESS) goto Failed;
         DriverHandle = filter;

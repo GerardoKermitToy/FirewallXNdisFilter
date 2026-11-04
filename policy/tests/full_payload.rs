@@ -1,8 +1,8 @@
 use hyperv_policy::{
-    engine::{Engine, Submission, allocate_record},
+    engine::{Engine, Finish, Submission, allocate_record},
     packet::{self, NdisPath, Packet, SNAPSHOT},
 };
-use hyperv_protocol::{MAX_PAYLOAD, MAX_RECORD, connection_header_len};
+use hyperv_protocol::{MAX_PAYLOAD, MAX_RECORD, Verdict, connection_header_len};
 
 fn frame(ipv6: bool, vlans: usize, ip_len: usize, offload: bool) -> Vec<u8> {
     let l2 = 14 + vlans * 4;
@@ -176,4 +176,88 @@ fn aggregate_nbl_accounting_does_not_concatenate_or_shorten_the_first_packet() {
         &event[connection_header_len(&packet.connection)..],
         &bytes[14..]
     );
+}
+
+fn coalesced_udp_frame(ipv6: bool, ip_len: usize) -> Vec<u8> {
+    let mut bytes = frame(ipv6, 0, ip_len, true);
+    let ip = &mut bytes[14..];
+    let header = if ipv6 { 40 } else { 20 };
+    ip[if ipv6 { 6 } else { 9 }] = 17;
+    let length = if ipv6 { ip_len - 40 } else { ip_len };
+    let offset = if ipv6 { 4 } else { 2 };
+    ip[offset..offset + 2].copy_from_slice(&u16::try_from(length).unwrap_or(0).to_be_bytes());
+    ip[header..header + 8].fill(0);
+    ip[header..header + 2].copy_from_slice(&12345u16.to_be_bytes());
+    ip[header + 2..header + 4].copy_from_slice(&443u16.to_be_bytes());
+    ip[header + 4..header + 6]
+        .copy_from_slice(&u16::try_from(ip_len - header).unwrap_or(0).to_be_bytes());
+    // URO retains zero checksum fields; segmentation metadata is native OOB.
+    bytes
+}
+
+#[test]
+fn coalesced_udp_payload_is_complete_and_unchanged_in_both_directions() {
+    for ipv6 in [false, true] {
+        for length in [4096, 65535, MAX_PAYLOAD] {
+            for path in [NdisPath::Receive, NdisPath::Send] {
+                let bytes = coalesced_udp_frame(ipv6, length);
+                let packet = parse(&bytes, path, true);
+                assert!(!packet.cacheable);
+                assert_eq!(packet.connection.protocol, 17);
+                assert_eq!(packet.payload_len as usize, length);
+                let event = round_trip(packet, &bytes, path, 65536);
+                assert_eq!(
+                    &event[connection_header_len(&packet.connection)..],
+                    &bytes[14..]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn coalesced_udp_verdicts_do_not_cache_and_bandwidth_counts_logical_ip_bytes() {
+    for ipv6 in [false, true] {
+        for path in [NdisPath::Receive, NdisPath::Send] {
+            let bytes = coalesced_udp_frame(ipv6, 4096);
+            let packet = parse(&bytes, path, true);
+            let mut engine = Engine::new();
+            assert!(engine.attach(101));
+            assert!(engine.restart(101));
+            engine.connect();
+            engine.read(&mut [0; 512]);
+            let Submission::Pending(id) =
+                engine.submit(101, packet, 123, None, 100, Some(capture(&packet, &bytes)))
+            else {
+                panic!("coalesced UDP must await a verdict");
+            };
+            let mut events = [0; 8192];
+            assert!(engine.read(&mut events) > 0);
+            assert!(
+                engine
+                    .cache_plan(id, Verdict::PermanentAccept, 101)
+                    .is_none()
+            );
+            let action = engine.verdict(id, Verdict::PermanentAccept, 101).unwrap();
+            assert_eq!(action.nbl, 123);
+            assert_eq!(action.finish, Finish::Allow);
+            assert!(engine.preflight(101, &packet, 124, 102).unwrap());
+            engine.bandwidth();
+            let count = engine.read(&mut events);
+            assert!(count > 0);
+            assert_eq!(events[0], if ipv6 { 6 } else { 5 });
+            assert_eq!(events[5], 17);
+            let counters = if ipv6 { 50 } else { 26 };
+            let tx = u64::from_le_bytes(events[counters..counters + 8].try_into().unwrap());
+            let rx = u64::from_le_bytes(events[counters + 8..counters + 16].try_into().unwrap());
+            assert_eq!(
+                (tx, rx),
+                if path == NdisPath::Receive {
+                    (4096, 0)
+                } else {
+                    (0, 4096)
+                }
+            );
+        }
+    }
 }

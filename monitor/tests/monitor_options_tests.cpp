@@ -144,6 +144,39 @@ bool TestFilterAndVerdictSeparation() {
     return true;
 }
 
+bool TestIcsPresentedRemoteMatches() {
+    for (bool ipv6 : {false, true}) {
+        pmkext::Connection c;
+        c.ipv6 = ipv6;
+        c.local_ip[0] = ipv6 ? 0x20 : 203;
+        c.remote_ip[0] = ipv6 ? 0x20 : 192;
+        c.local_ip[1] = c.remote_ip[1] = ipv6 ? 1 : 0;
+        c.local_ip[ipv6 ? 15 : 3] = 80;
+        c.remote_ip[ipv6 ? 15 : 3] = 26;
+        c.local_port = 80;
+        c.remote_port = 28436;
+        pmkext::monitor::Options opt;
+        opt.has_alt = true;
+        opt.alt_verdict = pmkext::Verdict::Block;
+        opt.match = {true, true, c.LocalIpString(), c.local_port};
+        CHECK(!pmkext::monitor::AlternateMatches(opt, c));
+        CHECK(pmkext::monitor::AlternateMatches(opt, c, true));
+        opt.match.port = c.remote_port;
+        CHECK(!pmkext::monitor::AlternateMatches(opt, c, true));
+        opt.match = {true, true, c.RemoteIpString(), c.remote_port};
+        CHECK(pmkext::monitor::AlternateMatches(opt, c));
+        CHECK(!pmkext::monitor::AlternateMatches(opt, c, true));
+        opt.filter = opt.match;
+        CHECK(pmkext::monitor::ShowConnection(opt, c)); // Display matches either endpoint.
+        opt.match = {};
+        CHECK(pmkext::monitor::AlternateMatches(opt, c, true));
+        opt.has_alt = false;
+        CHECK(!pmkext::monitor::AlternateMatches(opt, c, true));
+        CHECK(c.local_port == 80 && c.remote_port == 28436 && c.direction == 0);
+    }
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -152,6 +185,7 @@ int main() {
         {"strict numeric/endpoint validation", TestInvalidNumbersAndEndpoints},
         {"redirects/suspension/PID filters/updates rejected", TestRejectedCapabilities},
         {"source/destination filters do not alter verdicts", TestFilterAndVerdictSeparation},
+        {"ICS --match selects the presented remote endpoint without packet mutation", TestIcsPresentedRemoteMatches},
     };
     for (const auto& test : tests) {
         if (!test.run()) return 1;

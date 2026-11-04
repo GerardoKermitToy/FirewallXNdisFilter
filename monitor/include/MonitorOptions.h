@@ -43,6 +43,6 @@ bool ParseOptions(int argc, const wchar_t* const* argv, Options& options, std::s
 void PrintUsage(FILE* output = stdout);
 bool MatchesEndpoint(const Endpoint& endpoint, const std::string& ip, uint16_t port);
 bool ShowConnection(const Options& options, const Connection& connection);
-bool AlternateMatches(const Options& options, const Connection& connection);
+bool AlternateMatches(const Options& options, const Connection& connection, bool reverse = false);
 
 } // namespace pmkext::monitor

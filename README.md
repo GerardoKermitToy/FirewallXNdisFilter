@@ -108,6 +108,10 @@ At startup it also prints `Attached network adapters: N` and one `[ADAPTER]` blo
 
 Each `[CONN v4]` / `[CONN v6]` header prints `interface_index=N` immediately after `id`, in both console output and `--out` files. This is the host adapter index from that event, not a guest interface index; traffic from different adapters retains its own value.
 
+The console discovers enabled **public/upstream ICS interfaces** through read-only native sharing APIs and resolves their connection GUIDs to host indices through NETIO. For those indices only, it reverses CONN direction (`0`/`1`), swaps local/remote IP addresses and ports, and swaps bandwidth endpoints and TX/RX counters. Private/downstream and nonshared interfaces are unchanged. The list is refreshed at startup and each `--poll`; status changes honor `--out`/`--timestamps`. Discovery failures warn once per failure streak, clear stale roles, and use raw driver orientation until recovery. No ICS configuration is changed.
+
+This is **console-only presentation**, applied before `--match` selects the presented remote peer. Packet bytes, IDs, interface indices, driver policy/caches and both reusable client APIs remain unchanged. NDIS and WFP records have no source tag, so the index-based rule applies to either path; it does not correlate NAT tuples or merge records from different interfaces.
+
 `--match` selects the remote endpoint in both directions; unmatched events receive PermanentAccept. `--filter-ip` only filters output, not verdicts. A blocking verdict without `--match` applies to every event and can disconnect host-vNIC or routed traffic.
 
 On exit, the monitor closes its device session before stopping a driver it started and deleting a service it created. A previously running driver is left running; a preexisting stopped service started by the monitor is stopped but not deleted. Cleanup also runs after startup/version errors; stop/delete failures are reported. Forced process termination cannot guarantee cleanup. A driver installed through NetCfg remains installed/bound; use `Uninstall.exe` to remove it. `--help` performs no device or SCM access.

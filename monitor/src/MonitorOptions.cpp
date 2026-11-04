@@ -202,8 +202,9 @@ bool ShowConnection(const Options& opt, const Connection& c) {
            MatchesEndpoint(opt.filter, c.RemoteIpString(), c.remote_port);
 }
 
-bool AlternateMatches(const Options& opt, const Connection& c) {
-    return opt.has_alt && MatchesEndpoint(opt.match, c.RemoteIpString(), c.remote_port);
+bool AlternateMatches(const Options& opt, const Connection& c, bool reverse) {
+    return opt.has_alt && MatchesEndpoint(opt.match,
+        reverse ? c.LocalIpString() : c.RemoteIpString(), reverse ? c.local_port : c.remote_port);
 }
 
 void PrintUsage(FILE* out) {
@@ -220,7 +221,7 @@ void PrintUsage(FILE* out) {
         "  --duration N     optional positive seconds; otherwise run until Ctrl+C.\n"
         "                   Startup/load failures exit without an indefinite wait.\n"
         "  --out FILE       write records to FILE, flushed per record.\n"
-        "  --poll N         query device count/logs/bandwidth every N ms (default 1000).\n"
+        "  --poll N         refresh ICS roles and query device count/logs/bandwidth every N ms (default 1000).\n"
         "  --timestamps     prefix records with local HH:MM:SS.mmm.\n"
         "  --payload        dump the complete IP packet as one hex string.\n"
         "  --memory-stats   request compatible memory-stat LogLine records each poll.\n\n"
@@ -251,7 +252,12 @@ void PrintUsage(FILE* out) {
         "  CONN is one event/verdict per NBL, not a process-owned socket.\n"
         "  NDIS direction=0 outbound, 1 inbound relative to the guest side;\n"
         "  local=guest endpoint, remote=peer. Host receive=outbound, send=inbound.\n"
-        "  IPFORWARD covers all forwarding: interface_index=source, direction=0, local=IP source.\n"
+        "  Raw IPFORWARD covers all forwarding: interface_index=source, direction=0, local=IP source.\n"
+        "  This console reverses CONN direction/endpoints and bandwidth endpoints/TX/RX\n"
+        "  for enabled ICS public/upstream interfaces, discovered read-only by GUID and NETIO.\n"
+        "  Roles refresh at startup and --poll; --match uses the presented remote peer.\n"
+        "  The rule selects interface_index for any record: NDIS/WFP have no event source tag.\n"
+        "  Packet bytes and the raw device/client APIs are unchanged; ICS is never reconfigured.\n"
         "  WFP requires BFE; registration availability is reported through driver logs.\n"
         "  Connection events carry no process/thread identity.\n"
         "  payload_layer=3 is the complete logical IP packet (up to 1 MiB, no truncation).\n"

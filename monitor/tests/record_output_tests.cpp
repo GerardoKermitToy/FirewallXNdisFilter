@@ -1,8 +1,12 @@
 // HyperVXNdisFilter adaptation, 2026-10-25: keep test files in the build directory.
 // Original source provenance/license: ../README.md and ../LICENSE.
 #include "RecordOutput.h"
+#include "DriverProtocol.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstring>
+#include <limits>
 #include <cstdio>
 #include <future>
 #include <memory>
@@ -85,6 +89,86 @@ bool CheckConnectionInterfaceIndices() {
         }
     }
     return ReadOutput(file.get()) == expected;
+}
+
+bool CheckReversedConnectionsPreserveRawPackets() {
+    pmkext::Connection c;
+    c.id = 101;
+    c.interface_index = 42;
+    c.protocol = 6;
+    c.local_port = 80;
+    c.remote_port = 28436;
+    c.payload.resize(pmkext::wire::kMaxPayloadSize, 0xA5);
+    c.payload_size = static_cast<uint32_t>(c.payload.size());
+    const auto* payload = c.payload.data();
+    std::mutex mutex;
+    for (bool ipv6 : {false, true}) {
+        c.ipv6 = ipv6;
+        std::memset(c.local_ip, 0, sizeof(c.local_ip));
+        std::memset(c.remote_ip, 0, sizeof(c.remote_ip));
+        c.local_ip[0] = ipv6 ? 0x20 : 203;
+        c.remote_ip[0] = ipv6 ? 0x20 : 192;
+        c.local_ip[1] = c.remote_ip[1] = ipv6 ? 1 : 0;
+        c.local_ip[ipv6 ? 15 : 3] = 80;
+        c.remote_ip[ipv6 ? 15 : 3] = 26;
+        const std::string raw_local = c.LocalIpString(), raw_remote = c.RemoteIpString();
+        for (uint8_t direction : {uint8_t{0}, uint8_t{1}, uint8_t{7}}) {
+            c.direction = direction;
+            File file(std::fopen("record_output_ics.tmp", "w+b"), std::fclose);
+            if (!file) return false;
+            {
+                pmkext::RecordOutput output(file.get(), mutex);
+                output.WriteConnection(c, "[time] ", true);
+            }
+            const char* reversed = direction == 0 ? "inbound" : direction == 1 ? "outbound" : "unknown";
+            const auto expected = std::string("[time] [CONN ") + (ipv6 ? "v6" : "v4") +
+                "] id=101 interface_index=42 " + reversed + " proto=6(TCP) layer=3(network)\n" +
+                "          local(guest)=" + raw_remote + ":28436  remote(peer)=" + raw_local +
+                ":80  payload=" + std::to_string(c.payload_size) + " bytes\n";
+            if (ReadOutput(file.get()) != expected) return false;
+            if (c.direction != direction || c.LocalIpString() != raw_local || c.RemoteIpString() != raw_remote ||
+                c.local_port != 80 || c.remote_port != 28436 || c.id != 101 || c.interface_index != 42 ||
+                c.payload.data() != payload || c.payload.size() != pmkext::wire::kMaxPayloadSize ||
+                !std::all_of(c.payload.begin(), c.payload.end(), [](uint8_t byte) { return byte == 0xA5; })) return false;
+        }
+    }
+    return true;
+}
+
+bool CheckBandwidthEndpointAndCounterReversal() {
+    std::mutex mutex;
+    for (bool ipv6 : {false, true}) {
+        pmkext::BandwidthEntry entry;
+        entry.ipv6 = ipv6;
+        entry.local_ip[0] = ipv6 ? 0x20 : 203;
+        entry.remote_ip[0] = ipv6 ? 0x20 : 192;
+        entry.local_ip[1] = entry.remote_ip[1] = ipv6 ? 1 : 0;
+        entry.local_ip[ipv6 ? 15 : 3] = 80;
+        entry.remote_ip[ipv6 ? 15 : 3] = 26;
+        entry.local_port = 80;
+        entry.remote_port = 28436;
+        const std::string local = entry.LocalIpString(), remote = entry.RemoteIpString();
+        for (uint64_t tx : {uint64_t{381}, std::numeric_limits<uint64_t>::max()}) {
+            entry.transmitted_bytes = tx;
+            entry.received_bytes = tx == 381 ? 0 : tx - 1;
+            const auto rx = entry.received_bytes;
+            File file(std::fopen("record_output_ics.tmp", "w+b"), std::fclose);
+            if (!file) return false;
+            {
+                pmkext::RecordOutput output(file.get(), mutex);
+                output.WriteBandwidthEntry(entry);
+                output.WriteBandwidthEntry(entry, true);
+            }
+            const auto expected = "            " + local + ":80 <-> " + remote + ":28436  tx=" +
+                std::to_string(tx) + " rx=" + std::to_string(rx) + "\n" +
+                "            " + remote + ":28436 <-> " + local + ":80  tx=" +
+                std::to_string(rx) + " rx=" + std::to_string(tx) + "\n";
+            if (ReadOutput(file.get()) != expected || entry.LocalIpString() != local || entry.RemoteIpString() != remote ||
+                entry.local_port != 80 || entry.remote_port != 28436 ||
+                entry.transmitted_bytes != tx || entry.received_bytes != rx) return false;
+        }
+    }
+    return true;
 }
 
 bool CheckWholeRecordLock() {
@@ -199,6 +283,8 @@ int main() {
     } tests[] = {
         {"formatting and null output", CheckFormattingAndNullOutput},
         {"IPv4/IPv6 connection output includes each unsigned interface index after id", CheckConnectionInterfaceIndices},
+        {"ICS direction/endpoints without changing raw metadata or 1 MiB payload", CheckReversedConnectionsPreserveRawPackets},
+        {"IPv4/IPv6 bandwidth endpoints and full u64 counters reverse without mutation", CheckBandwidthEndpointAndCounterReversal},
         {"whole-record lock against a concurrent verdict", CheckWholeRecordLock},
         {"exception releases lock", CheckExceptionReleasesLock},
         {"1000 concurrent CONN/BANDWIDTH/VERDICT records", CheckConcurrentRecords},

@@ -830,6 +830,64 @@ fn send_inline_completion_preserves_flags_and_drops_context_before_upper_ownersh
 }
 
 #[test]
+fn locally_dropped_lso_uses_completion_metadata() {
+    let f = Fixture::new();
+    let mut a = f.adapter();
+    state(|s| s.classify_result = 1);
+    unsafe { start(&mut *a) };
+    for version in [
+        NDIS_TCP_LARGE_SEND_OFFLOAD_V1_TYPE,
+        NDIS_TCP_LARGE_SEND_OFFLOAD_V2_TYPE,
+    ] {
+        let mut source = Source::new();
+        let offset = 34;
+        source.data[offset + 12] = 5 << 4;
+        let mut info: NDIS_TCP_LARGE_SEND_OFFLOAD_NET_BUFFER_LIST_INFO = unsafe { zeroed() };
+        unsafe {
+            info.__bindgen_anon_1.LsoV1Transmit.set_MSS(64);
+            info.__bindgen_anon_1
+                .LsoV1Transmit
+                .set_TcpHeaderOffset(offset as u32);
+            info.__bindgen_anon_1.LsoV1Transmit.set_Type(version);
+            source.nbl.NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize] =
+                info.__bindgen_anon_1.Value;
+            send((&mut *a as *mut Adapter).cast(), &mut *source.nbl, 0, 0);
+            info.__bindgen_anon_1.Value =
+                source.nbl.NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize];
+            if version == NDIS_TCP_LARGE_SEND_OFFLOAD_V1_TYPE {
+                assert_eq!(info.__bindgen_anon_1.LsoV1TransmitComplete.TcpPayload(), 74);
+                assert_eq!(info.__bindgen_anon_1.LsoV1TransmitComplete.Type(), version);
+            } else {
+                assert_eq!(info.__bindgen_anon_1.LsoV2TransmitComplete.Type(), version);
+                assert_eq!(info.__bindgen_anon_1.LsoV2TransmitComplete.Reserved(), 0);
+                assert_eq!(info.__bindgen_anon_1.LsoV2TransmitComplete.Reserved2(), 0);
+            }
+            assert_eq!(
+                source.nbl.__bindgen_anon_2.Status,
+                HV_WDK_NDIS_SUCCESS as NDIS_STATUS
+            );
+        }
+    }
+    // An unreadable/malformed LSOv1 TCP header fails safely without passing
+    // the transmit-form bitfields back as a successful completion.
+    let mut malformed = Source::new();
+    let mut info: NDIS_TCP_LARGE_SEND_OFFLOAD_NET_BUFFER_LIST_INFO = unsafe { zeroed() };
+    unsafe {
+        info.__bindgen_anon_1.LsoV1Transmit.set_MSS(64);
+        info.__bindgen_anon_1.LsoV1Transmit.set_TcpHeaderOffset(120);
+        malformed.nbl.NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize] =
+            info.__bindgen_anon_1.Value;
+        send((&mut *a as *mut Adapter).cast(), &mut *malformed.nbl, 0, 0);
+        assert_eq!(
+            malformed.nbl.__bindgen_anon_2.Status,
+            HV_WDK_NDIS_RESOURCES as NDIS_STATUS
+        );
+        assert!(malformed.nbl.NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize].is_null());
+        stop(&mut *a);
+    }
+}
+
+#[test]
 fn early_verdict_can_complete_and_free_original_before_classify_returns() {
     let f = Fixture::new();
     let mut a = f.adapter();

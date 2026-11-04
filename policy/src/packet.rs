@@ -153,7 +153,20 @@ pub fn parse(
     let mut tags = 0;
     while matches!(ether_type, 0x8100 | 0x88a8 | 0x9100) {
         if unlikely(tags == 2) {
-            return Err(ParseError::TooManyVlans);
+            // The flow key stores at most two tags, but extra tags do not
+            // make an otherwise identifiable non-IP control frame IP traffic.
+            while matches!(ether_type, 0x8100 | 0x88a8 | 0x9100) {
+                if unlikely(trusted.len() < offset + 4 || frame_len < offset + 4) {
+                    return Err(ParseError::Truncated);
+                }
+                ether_type = be16(trusted, offset + 2);
+                offset += 4;
+            }
+            return if matches!(ether_type, 0x0800 | 0x86dd) {
+                Err(ParseError::TooManyVlans)
+            } else {
+                Ok(None)
+            };
         }
         if unlikely(trusted.len() < offset + 4 || frame_len < offset + 4) {
             return Err(ParseError::Truncated);
@@ -247,6 +260,11 @@ pub fn parse_ip(
         let mut steps = 0;
         while matches!(proto, 0 | 43 | 60 | 44 | 51) {
             steps += 1;
+            // An unavailable snapshot is not necessarily malformed, but the
+            // advertised extension must fit in the logical IPv6 packet.
+            if transport + 2 > ip_len {
+                return Err(ParseError::Malformed);
+            }
             if steps > 8 || transport + 2 > ip.len() {
                 fully_parsed = false;
                 break;
@@ -577,6 +595,27 @@ mod tests {
         assert!(parse(&v, 68, 68, false).unwrap().is_none());
     }
     #[test]
+    fn deeply_tagged_non_ip_bypasses_without_letting_ip_escape() {
+        for tags in [3usize, 4, 16] {
+            for ether_type in [0x0806u16, 0x88cc, 0x888e, 0x8863, 0x0800, 0x86dd] {
+                let mut frame = [0u8; 14 + 16 * 4];
+                frame[12..14].copy_from_slice(&0x8100u16.to_be_bytes());
+                for tag in 0..tags {
+                    let next = if tag + 1 == tags { ether_type } else { 0x8100 };
+                    frame[16 + tag * 4..18 + tag * 4].copy_from_slice(&next.to_be_bytes());
+                }
+                let len = 14 + tags * 4;
+                let parsed = parse(&frame[..len], len, len, false);
+                if matches!(ether_type, 0x0800 | 0x86dd) {
+                    assert_eq!(parsed.unwrap_err(), ParseError::TooManyVlans);
+                } else {
+                    assert!(parsed.unwrap().is_none());
+                }
+                assert!(parse(&frame[..len - 1], len - 1, len - 1, false).is_err());
+            }
+        }
+    }
+    #[test]
     fn ipv6_extensions_and_fragment() {
         let mut b = [0; 90];
         b[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
@@ -592,6 +631,40 @@ mod tests {
         assert_eq!(p.flow.protocol, 17);
         b[20] = 44;
         assert!(!parse(&b, 90, 90, false).unwrap().unwrap().cacheable);
+    }
+    #[test]
+    fn nine_ipv6_extensions_are_admitted_without_caching() {
+        let mut ip = [0u8; 40 + 9 * 8 + 8];
+        ip[0] = 0x60;
+        ip[4..6].copy_from_slice(&80u16.to_be_bytes());
+        ip[6] = 60;
+        for index in 0..9 {
+            ip[40 + index * 8] = if index == 8 { 17 } else { 60 };
+        }
+        ip[40 + 9 * 8 + 4..40 + 9 * 8 + 6].copy_from_slice(&8u16.to_be_bytes());
+        let p = parse_ip(&ip, ip.len(), ip.len(), true, false).unwrap();
+        assert!(!p.cacheable);
+        assert_eq!(p.payload_len as usize, ip.len());
+    }
+    #[test]
+    fn advertised_ipv6_extension_must_fit_declared_packet() {
+        for payload in 0..=1 {
+            let mut ip = [0u8; 48];
+            ip[0] = 0x60;
+            ip[4..6].copy_from_slice(&(payload as u16).to_be_bytes());
+            ip[6] = 0; // Hop-by-Hop Options
+            assert_eq!(
+                parse_ip(&ip, 40 + payload, 40 + payload, true, false).unwrap_err(),
+                ParseError::Malformed
+            );
+        }
+        // A short capture is distinct from a logically truncated packet.
+        let mut ip = [0u8; 48];
+        ip[0] = 0x60;
+        ip[4..6].copy_from_slice(&8u16.to_be_bytes());
+        ip[6] = 0;
+        let p = parse_ip(&ip, 40, ip.len(), true, false).unwrap();
+        assert!(!p.cacheable);
     }
     #[test]
     fn no_cache_from_untrusted_transport() {

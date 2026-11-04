@@ -194,22 +194,17 @@ pub(crate) unsafe fn map_mdl(mdl: *mut MDL) -> *mut u8 {
 #[inline]
 pub(crate) unsafe fn receive_coalesced(nbl: *mut NET_BUFFER_LIST) -> bool {
     unsafe {
-        !(*nbl).NetBufferListInfo[TcpRecvSegCoalesceInfo as usize].is_null()
-            // NET_BUFFER_LIST_IS_URO_SET tests the scalar low DWORD only.
-            || (*nbl).NetBufferListInfo[UdpRecvSegCoalesceOffloadInfo as usize] as usize
-                & u32::MAX as usize
-                != 0
+        // The WDK predicates interpret these scalar OOB values as a DWORD.
+        (*nbl).NetBufferListInfo[TcpRecvSegCoalesceInfo as usize] as usize as u32 != 0
+            || (*nbl).NetBufferListInfo[UdpRecvSegCoalesceOffloadInfo as usize] as usize as u32 != 0
     }
 }
 
 #[inline]
 pub(crate) unsafe fn send_segmented(nbl: *mut NET_BUFFER_LIST) -> bool {
     unsafe {
-        !(*nbl).NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize].is_null()
-            // NET_BUFFER_LIST_IS_USO_SET tests the scalar low DWORD only.
-            || (*nbl).NetBufferListInfo[UdpSegmentationOffloadInfo as usize] as usize
-                & u32::MAX as usize
-                != 0
+        (*nbl).NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize] as usize as u32 != 0
+            || (*nbl).NetBufferListInfo[UdpSegmentationOffloadInfo as usize] as usize as u32 != 0
     }
 }
 
@@ -362,9 +357,10 @@ pub(crate) unsafe fn snapshot_offload(nbl: *mut NET_BUFFER_LIST) -> u32 {
             });
         }
         u32::from(
-            !(*nbl).NetBufferListInfo[TcpRecvSegCoalesceInfo as usize].is_null()
+            (*nbl).NetBufferListInfo[TcpRecvSegCoalesceInfo as usize] as usize as u32 != 0
                 || (*context).segmented != 0
-                || !(*nbl).NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize].is_null()
+                || (*nbl).NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize] as usize as u32
+                    != 0
                 || !(*nbl).NetBufferListInfo[TcpReceiveBytesTransferred as usize].is_null(),
         )
     }

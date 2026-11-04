@@ -235,6 +235,70 @@ unsafe fn create_ndis_packet(
     }
 }
 
+/// Convert the TCP LSO transmit OOB to its completion form when this filter
+/// completes a send locally. Normal forwarded sends retain lower-driver OOB.
+unsafe fn complete_local_lso(nbl: PNET_BUFFER_LIST) -> bool {
+    unsafe {
+        let value = (*nbl).NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize];
+        if value as usize as u32 == 0 {
+            return true;
+        }
+        let mut info: NDIS_TCP_LARGE_SEND_OFFLOAD_NET_BUFFER_LIST_INFO = zeroed();
+        info.__bindgen_anon_1.Value = value;
+        let version = info.__bindgen_anon_1.Transmit.Type();
+        let mut completion: NDIS_TCP_LARGE_SEND_OFFLOAD_NET_BUFFER_LIST_INFO = zeroed();
+        if version == NDIS_TCP_LARGE_SEND_OFFLOAD_V2_TYPE {
+            completion
+                .__bindgen_anon_1
+                .LsoV2TransmitComplete
+                .set_Type(version);
+        } else if version == NDIS_TCP_LARGE_SEND_OFFLOAD_V1_TYPE {
+            // Even an unsuccessful completion must not return transmit-form
+            // metadata as the TCP-payload completion field.
+            (*nbl).NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize] = null_mut();
+            let nb = packet::first_nb(nbl);
+            if nb.is_null() || !packet::next_nb(nb).is_null() {
+                return false;
+            }
+            let offset = info.__bindgen_anon_1.LsoV1Transmit.TcpHeaderOffset();
+            let length = packet::data_length(nb);
+            let mut data_offset = 0u8;
+            if offset > length
+                || length - offset < 20
+                || crate::native_wfp::ForwardRead(nb, offset + 12, &mut data_offset, 1) == 0
+            {
+                return false;
+            }
+            let header = u32::from(data_offset >> 4) * 4;
+            if header < 20 || header > length - offset {
+                return false;
+            }
+            let payload = length - offset - header;
+            completion
+                .__bindgen_anon_1
+                .LsoV1TransmitComplete
+                .set_TcpPayload(payload);
+            if completion
+                .__bindgen_anon_1
+                .LsoV1TransmitComplete
+                .TcpPayload()
+                != payload
+            {
+                return false;
+            }
+            completion
+                .__bindgen_anon_1
+                .LsoV1TransmitComplete
+                .set_Type(version);
+        } else {
+            return false;
+        }
+        (*nbl).NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize] =
+            completion.__bindgen_anon_1.Value;
+        true
+    }
+}
+
 /// Finish one claimed NBL. Publishing a pending NBL transfers its ownership to
 /// policy; the classifier must not inspect it after that publication.
 #[unsafe(no_mangle)]
@@ -281,8 +345,11 @@ pub(super) unsafe extern "C" fn hv_finish(nbl_address: usize, finish: u32) {
         // before transferring ownership, and keep the adapter reference till last.
         packet::free_packet_context(nbl);
         if send {
+            let lso_complete = complete_local_lso(nbl);
             (*nbl).__bindgen_anon_2.Status = if finish == 2 {
                 HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+            } else if !lso_complete {
+                HV_WDK_NDIS_RESOURCES as NDIS_STATUS
             } else {
                 HV_WDK_NDIS_SUCCESS as NDIS_STATUS
             };

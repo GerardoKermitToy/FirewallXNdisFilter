@@ -453,6 +453,7 @@ pub(super) unsafe fn ExWaitForRundownProtectionRelease(_rundown: PEX_RUNDOWN_REF
         state(|s| {
             let r = s.rundowns.get_mut(&(_rundown as usize)).unwrap();
             assert_eq!(r.0, 0, "rundown waited with live references");
+            assert!(!r.1, "rundown waited more than once");
             r.1 = true;
         });
     }
@@ -1393,6 +1394,23 @@ fn clone_reassembly_owner_route_and_scalar_offload_profile_survive_oob_loss() {
 }
 
 #[test]
+fn clone_ignores_high_dword_only_tcp_offload_values() {
+    let _guard = begin();
+    let mut original = NET_BUFFER_LIST::default();
+    for slot in [TcpLargeSendNetBufferListInfo, TcpRecvSegCoalesceInfo] {
+        original.NetBufferListInfo[slot as usize] = (1usize << 32) as PVOID;
+        unsafe {
+            let clone = hv_wfp_clone(&mut original, &route(0), 0);
+            assert!(!clone.is_null());
+            assert_eq!((*packet_context(clone)).segmented, 0);
+            hv_wfp_free_packet(clone);
+        }
+        original.NetBufferListInfo[slot as usize] = ptr::null_mut();
+    }
+    assert!(state(|s| s.live.is_empty()));
+}
+
+#[test]
 fn clone_native_failures_do_not_allocate_or_free_unowned_packets() {
     let _guard = begin();
     state(|s| s.clone_status = HV_WDK_STATUS_INSUFFICIENT_RESOURCES);
@@ -1882,6 +1900,39 @@ fn manager_classification_synchronous_fragment_pending_and_early_inline_verdicts
     assert_eq!(state(|s| s.injection), Some((1, 0, 31, 23, 29)));
     assert!(state(|s| s.live.is_empty()));
     assert_eq!(state(|s| s.session_references), 0);
+    stop_and_check();
+}
+
+#[test]
+fn accepted_ipv6_with_nine_extensions_reaches_forward_injection() {
+    let _guard = integration_begin();
+    start_manager();
+    state(|s| {
+        s.policy_result = -1;
+        s.inline = true;
+    });
+    let base = udp_packet(true, 3);
+    let extensions = 9usize;
+    let mut bytes = self::std::vec![0u8; base.len() + extensions * 8];
+    bytes[..40].copy_from_slice(&base[..40]);
+    let payload = (bytes.len() - 40) as u16;
+    bytes[4..6].copy_from_slice(&payload.to_be_bytes());
+    bytes[6] = 60;
+    for index in 0..extensions {
+        bytes[40 + index * 8] = if index + 1 == extensions { 17 } else { 60 };
+    }
+    bytes[40 + extensions * 8..].copy_from_slice(&base[40..]);
+    let mut packet = PacketFixture::new(bytes, &[1, 2, 4, 8, 16]);
+    assert!(blocked(&packet.classify(true, 0)));
+    let nbl = state(|s| {
+        let nbl = s.pending;
+        s.pending = 0;
+        nbl as *mut NET_BUFFER_LIST
+    });
+    assert!(!nbl.is_null());
+    unsafe { actual_finish(nbl.cast(), 0) };
+    assert_eq!(state(|s| s.injection), Some((0, 23, 31, 23, 0)));
+    assert!(state(|s| s.live.is_empty()));
     stop_and_check();
 }
 

@@ -5,7 +5,7 @@ use crate::wdk::*;
 use core::{
     mem::{offset_of, size_of, zeroed},
     ptr::{self, addr_of, addr_of_mut, null_mut},
-    sync::atomic::{AtomicI32, AtomicI64, Ordering},
+    sync::atomic::{AtomicI32, AtomicI64, AtomicPtr, Ordering},
 };
 
 #[path = "native_device.rs"]
@@ -74,7 +74,7 @@ static mut CLASSIFICATION_RUNDOWN: EX_RUNDOWN_REF = unsafe { zeroed() };
 static mut READ_RUNDOWN: EX_RUNDOWN_REF = unsafe { zeroed() };
 static mut CACHE_RUNDOWN: EX_RUNDOWN_REF = unsafe { zeroed() };
 static mut CLASSIFICATION_CLOSED: bool = false;
-static mut READ_WORK_ITEM: PIO_WORKITEM = null_mut();
+static READ_WORK_ITEM: AtomicPtr<_IO_WORKITEM> = AtomicPtr::new(null_mut());
 static mut CACHE_WORK_ITEM: PIO_WORKITEM = null_mut();
 static READ_PENDING: AtomicI32 = AtomicI32::new(0);
 static READ_READY: AtomicI32 = AtomicI32::new(0);

@@ -1,4 +1,4 @@
-use super::Handle;
+use super::{ForwardReadCursor, Handle};
 use core::slice;
 use smoltcp::wire::{IpProtocol, checksum};
 
@@ -17,7 +17,6 @@ const ICMP_CHECKSUM_OFFSET: u32 = 2;
 const IPV4_FRAGMENT_MASK: u32 = 0x3fff;
 const IPV6_FRAGMENT_MASK: u32 = 0xfff9;
 const IPV6_EXTENSION_SIZE: usize = 8;
-const MAX_IPV6_EXTENSIONS: u32 = 8;
 const IPV4_OPTION_END: u8 = 0;
 const IPV4_OPTION_NOP: u8 = 1;
 const IPV4_OPTION_LOOSE_SOURCE_ROUTE: u8 = 131;
@@ -31,6 +30,13 @@ const MAX_CHECKSUM_CHUNK: usize = 65534;
 
 unsafe extern "C" {
     fn ForwardRead(nb: Handle, offset: u32, bytes: *mut u8, length: u32) -> u8;
+    fn ForwardReadCached(
+        nb: Handle,
+        offset: u32,
+        bytes: *mut u8,
+        length: u32,
+        cursor: *mut ForwardReadCursor,
+    ) -> u8;
     fn WriteForwardChecksum(nb: Handle, offset: u32, checksum: u16) -> u8;
     fn hv_wfp_sum(nb: Handle, start: u32, length: u32, field: u32, sum: *mut u64) -> u8;
     fn hv_wfp_first_nb(nbl: Handle) -> Handle;
@@ -40,6 +46,9 @@ unsafe extern "C" {
 }
 fn read(nb: Handle, offset: u32, bytes: &mut [u8]) -> bool {
     unsafe { ForwardRead(nb, offset, bytes.as_mut_ptr(), bytes.len() as u32) != 0 }
+}
+fn read_cached(nb: Handle, offset: u32, bytes: &mut [u8], cursor: &mut ForwardReadCursor) -> bool {
+    unsafe { ForwardReadCached(nb, offset, bytes.as_mut_ptr(), bytes.len() as u32, cursor) != 0 }
 }
 fn write(nb: Handle, offset: u32, checksum: u16) -> bool {
     unsafe { WriteForwardChecksum(nb, offset, checksum) != 0 }
@@ -176,7 +185,11 @@ fn packet(nb: Handle, ipv6: bool, segmented: bool, complete: &mut bool) -> bool 
         protocol = IpProtocol::from(ip[6]);
         let mut addresses = [0u8; 32];
         addresses.copy_from_slice(&ip[8..40]);
-        let mut steps = 0;
+        let mut cursor = ForwardReadCursor {
+            mdl: core::ptr::null_mut(),
+            start: 0,
+            skip: 0,
+        };
         while matches!(
             protocol,
             IpProtocol::HopByHop
@@ -186,10 +199,11 @@ fn packet(nb: Handle, ipv6: bool, segmented: bool, complete: &mut bool) -> bool 
                 | IpProtocol::IpSecAh
         ) {
             let mut extension = [0u8; IPV6_EXTENSION_SIZE];
-            steps += 1;
-            if steps > MAX_IPV6_EXTENSIONS
-                || total - transport < IPV6_EXTENSION_SIZE as u32
-                || !read(nb, transport, &mut extension)
+            // Each valid extension consumes at least eight bytes, so the
+            // declared IPv6 payload bounds traversal without an arbitrary
+            // header-count limit that could discard an accepted datagram.
+            if total - transport < IPV6_EXTENSION_SIZE as u32
+                || !read_cached(nb, transport, &mut extension, &mut cursor)
             {
                 return false;
             }
@@ -221,7 +235,7 @@ fn packet(nb: Handle, ipv6: bool, segmented: bool, complete: &mut bool) -> bool 
                 } else {
                     return false;
                 };
-                if !read(nb, destination, &mut addresses[16..]) {
+                if !read_cached(nb, destination, &mut addresses[16..], &mut cursor) {
                     return false;
                 }
             }
@@ -229,22 +243,38 @@ fn packet(nb: Handle, ipv6: bool, segmented: bool, complete: &mut bool) -> bool 
                 let mut option = 2;
                 while option < length {
                     let mut item = [0u8; 2];
-                    if !read(nb, transport + option, &mut item[..1]) {
+                    if !read_cached(nb, transport + option, &mut item[..1], &mut cursor) {
                         return false;
                     }
                     if item[0] == IPV6_OPTION_PAD1 {
-                        option += 1;
+                        // Long Pad1 runs are legal. Inspect them in bounded
+                        // chunks instead of mapping an MDL once per byte.
+                        let mut padding = [0u8; 64];
+                        let count = (length - option).min(padding.len() as u32) as usize;
+                        if !read_cached(nb, transport + option, &mut padding[..count], &mut cursor)
+                        {
+                            return false;
+                        }
+                        option += padding[..count]
+                            .iter()
+                            .take_while(|&&value| value == IPV6_OPTION_PAD1)
+                            .count() as u32;
                         continue;
                     }
                     if length - option < 2
-                        || !read(nb, transport + option, &mut item)
+                        || !read_cached(nb, transport + option, &mut item, &mut cursor)
                         || u32::from(item[1]) > length - option - 2
                     {
                         return false;
                     }
                     if item[0] == IPV6_OPTION_HOME_ADDRESS
                         && (item[1] != 16
-                            || !read(nb, transport + option + 2, &mut addresses[..16]))
+                            || !read_cached(
+                                nb,
+                                transport + option + 2,
+                                &mut addresses[..16],
+                                &mut cursor,
+                            ))
                     {
                         return false;
                     }

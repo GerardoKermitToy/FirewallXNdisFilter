@@ -8,6 +8,15 @@ use core::{
 mod checksum;
 
 type Handle = *mut c_void;
+
+// Private cursor for amortized forward traversal of a split MDL chain.
+#[repr(C)]
+pub(crate) struct ForwardReadCursor {
+    pub(crate) mdl: Handle,
+    pub(crate) start: u32,
+    pub(crate) skip: u32,
+}
+
 type Completion = Option<unsafe extern "system" fn(Handle, Handle, u8)>;
 mod constants {
     include!(concat!(env!("OUT_DIR"), "/wfp_constants.rs"));
@@ -406,7 +415,8 @@ extern "C" fn HvWfpUninitialize() {
             unsafe { hv_bugcheck() };
         }
     }
-    unsafe { hv_wfp_wait(CLASSIFY) };
+    // HvWfpStop already closed and drained CLASSIFY before stopping forwards.
+    // A second wait on the same rundown is not valid after a blocking wait.
     for handles in [&INJECTION, &NETWORK] {
         for handle in handles {
             let value = handle.swap(ptr::null_mut(), SeqCst);

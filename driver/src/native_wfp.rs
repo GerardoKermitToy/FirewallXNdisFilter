@@ -12,6 +12,7 @@ use crate::{
         packet_context,
     },
     wdk::*,
+    wfp::ForwardReadCursor,
 };
 #[cfg(feature = "wfp-fragment-diagnostic")]
 use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
@@ -401,6 +402,81 @@ pub(crate) unsafe extern "C" fn ForwardRead(
         u8::from(copied == length)
     }
 }
+/// Read from a NET_BUFFER while retaining the MDL containing the request start.
+/// IPv6 extension/option parsing is monotonic except for small in-header reads;
+/// this prevents repeated traversal from the head on heavily split MDL chains.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn ForwardReadCached(
+    nb: *mut NET_BUFFER,
+    offset: u32,
+    bytes: *mut u8,
+    length: u32,
+    cursor: *mut ForwardReadCursor,
+) -> u8 {
+    unsafe {
+        let nb_length = data_length(nb);
+        if offset > nb_length || length > nb_length - offset {
+            return 0;
+        }
+        if length == 0 {
+            return 1;
+        }
+        let mut mdl = (*cursor).mdl.cast::<MDL>();
+        let mut start = (*cursor).start;
+        let mut skip = (*cursor).skip;
+        if mdl.is_null() || offset < start {
+            mdl = current_mdl(nb);
+            start = 0;
+            skip = current_mdl_offset(nb);
+        }
+        let mut seek = offset - start;
+        while !mdl.is_null() {
+            let size = (*mdl).ByteCount;
+            if skip > size {
+                return 0;
+            }
+            let available = size - skip;
+            if seek < available {
+                break;
+            }
+            seek -= available;
+            start += available;
+            mdl = (*mdl).Next;
+            skip = 0;
+        }
+        if mdl.is_null() {
+            return 0;
+        }
+        (*cursor).mdl = mdl.cast();
+        (*cursor).start = start;
+        (*cursor).skip = skip;
+        skip += seek;
+        let mut copied = 0;
+        while !mdl.is_null() && copied < length {
+            let size = (*mdl).ByteCount;
+            if skip > size {
+                return 0;
+            }
+            let take = (size - skip).min(length - copied);
+            if take != 0 {
+                let data = map_mdl(mdl);
+                if data.is_null() {
+                    return 0;
+                }
+                ptr::copy_nonoverlapping(
+                    data.add(skip as usize),
+                    bytes.add(copied as usize),
+                    take as usize,
+                );
+                copied += take;
+            }
+            skip = 0;
+            mdl = (*mdl).Next;
+        }
+        u8::from(copied == length)
+    }
+}
+
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn hv_wfp_sum(
     nb: *mut NET_BUFFER,
@@ -914,9 +990,10 @@ pub(crate) unsafe extern "C" fn hv_wfp_clone(
     unsafe {
         let grouped = (*route).flags & FWP_CONDITION_FLAG_IS_FRAGMENT_GROUP != 0;
         // Preserve scalar segmentation/coalescing before clone/reassembly drops OOB.
-        let segmented = !(*original).NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize]
-            .is_null()
-            || !(*original).NetBufferListInfo[TcpRecvSegCoalesceInfo as usize].is_null()
+        let segmented = (*original).NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize]
+            as usize as u32
+            != 0
+            || (*original).NetBufferListInfo[TcpRecvSegCoalesceInfo as usize] as usize as u32 != 0
             || !(*original).NetBufferListInfo[TcpReceiveBytesTransferred as usize].is_null();
         if !grouped && !next_nbl(original).is_null() {
             return ptr::null_mut();

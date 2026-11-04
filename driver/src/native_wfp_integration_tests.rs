@@ -522,8 +522,26 @@ fn routing_options_home_address_atomic_fragment_and_ah_use_correct_pseudo_header
             }
         }
     }
-    for failure in 0..4 {
-        let mut bytes = datagram(true, 17, 20, if failure == 0 { 9 } else { 1 }, 17);
+    // Nine destination-option headers must not be rejected just because the
+    // policy parser stops extracting cache keys after eight extensions.
+    let expected = datagram(true, 17, 20, 9, 17);
+    let mut bytes = expected.clone();
+    bytes[6] = 60;
+    for index in 0..8 {
+        bytes[40 + index * 8] = 60;
+    }
+    let mut expected = bytes.clone();
+    let transport = 40 + 9 * 8;
+    put_word(&mut bytes, transport + 6, 0);
+    // The header changes do not affect the UDP pseudo-header/checksum.
+    expected[6] = 60;
+    for split in 0..=bytes.len() {
+        let mut packet = PacketFixture::new(bytes.clone(), &[split]);
+        assert_eq!(packet.restore(true, false), 1);
+        assert_eq!(packet.bytes, expected);
+    }
+    for failure in 1..4 {
+        let mut bytes = datagram(true, 17, 20, 1, 17);
         if failure == 1 {
             bytes[41] = 255;
         }
@@ -540,6 +558,41 @@ fn routing_options_home_address_atomic_fragment_and_ah_use_correct_pseudo_header
         let mut packet = PacketFixture::new(bytes, &[1, 3, 5]);
         assert_eq!(packet.restore(true, false), 0);
     }
+}
+
+#[test]
+fn cached_forward_read_handles_split_mdls_and_backwards_offsets() {
+    let _guard = begin();
+    let mut packet = PacketFixture::new((0u8..80).collect(), &[1, 2, 3, 5, 8, 13, 21]);
+    let mut cursor = ForwardReadCursor {
+        mdl: ptr::null_mut(),
+        start: 0,
+        skip: 0,
+    };
+    for (offset, len) in [(0, 8), (9, 4), (17, 11), (18, 2), (65, 10), (3, 9), (80, 0)] {
+        let mut bytes = [0u8; 16];
+        assert_eq!(
+            unsafe {
+                ForwardReadCached(
+                    packet.nb.as_mut(),
+                    offset,
+                    bytes.as_mut_ptr(),
+                    len,
+                    &mut cursor,
+                )
+            },
+            1
+        );
+        assert_eq!(
+            &bytes[..len as usize],
+            &packet.bytes[offset as usize..(offset + len) as usize]
+        );
+    }
+    let mut byte = 0;
+    assert_eq!(
+        unsafe { ForwardReadCached(packet.nb.as_mut(), 80, &mut byte, 1, &mut cursor) },
+        0
+    );
 }
 
 #[test]
@@ -571,6 +624,22 @@ fn mapping_work_stays_range_based_not_per_byte() {
     assert_eq!(packet.restore(false, false), 1);
     assert_eq!(packet.bytes, expected);
     assert_eq!(crate::native_packet::map_mdl_call_count(), 7);
+
+    // Destination Options with 2046 Pad1 bytes should require bounded chunk
+    // reads, not one mapping per padding byte.
+    let base = datagram(true, 17, 20, 0, 17);
+    let mut ipv6 = std::vec![0u8; base.len() + 2048];
+    ipv6[..40].copy_from_slice(&base[..40]);
+    let payload = (ipv6.len() - 40) as u16;
+    ipv6[4..6].copy_from_slice(&payload.to_be_bytes());
+    ipv6[6] = 60;
+    ipv6[40] = 17;
+    ipv6[41] = 255;
+    ipv6[40 + 2048..].copy_from_slice(&base[40..]);
+    let mut packet = PacketFixture::new(ipv6, &[65535]);
+    crate::native_packet::reset_map_mdl_call_count();
+    assert_eq!(packet.restore(true, false), 1);
+    assert!(crate::native_packet::map_mdl_call_count() < 100);
 }
 
 unsafe extern "system" fn no_completion(_context: Handle, _nbl: Handle, _dispatch: u8) {}

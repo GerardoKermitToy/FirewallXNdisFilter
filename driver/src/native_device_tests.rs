@@ -11,6 +11,7 @@ struct Fake {
     references: i32,
     mutex: bool,
     reject_rundown: bool,
+    stop_on_rundown_acquire: bool,
     cancel_insert: bool,
     worker: IO_WORKITEM_ROUTINE,
     connects: u32,
@@ -29,7 +30,7 @@ unsafe fn reset() {
         CLIENT = null_mut();
         READ_CLIENT = null_mut();
         CLASSIFICATION_CLOSED = false;
-        READ_WORK_ITEM = 1usize as PIO_WORKITEM;
+        READ_WORK_ITEM.store(1usize as PIO_WORKITEM, Ordering::Release);
         STOPPING.store(0, Ordering::SeqCst);
         READ_PENDING.store(0, Ordering::SeqCst);
         READ_READY.store(0, Ordering::SeqCst);
@@ -104,6 +105,9 @@ pub(crate) mod calls {
                 0
             } else {
                 s.references += 1;
+                if s.stop_on_rundown_acquire {
+                    STOPPING.store(1, Ordering::SeqCst);
+                }
                 1
             }
         })
@@ -157,12 +161,14 @@ pub(crate) mod calls {
         }
     }
     pub unsafe fn IoQueueWorkItem(
-        _: PIO_WORKITEM,
+        item: PIO_WORKITEM,
         callback: IO_WORKITEM_ROUTINE,
         _: WORK_QUEUE_TYPE,
         _: PVOID,
     ) {
         state(|s| {
+            assert!(!item.is_null());
+            assert!(s.references > 0, "work item queued without rundown");
             assert!(s.worker.is_none());
             s.worker = callback;
         });
@@ -308,6 +314,45 @@ fn already_cancelled_insert_completes_inline_exactly_once() {
         assert_eq!(s.completions[0].1, HV_WDK_STATUS_CANCELLED);
     });
 }
+#[test]
+fn rejected_insert_after_pending_mark_completes_and_returns_pending() {
+    let _lock = SERIAL.lock().unwrap();
+    unsafe { reset() };
+    open(1);
+    // An open handle may submit a read after the session has shut down.
+    READ_ONLINE.store(0, Ordering::SeqCst);
+    let mut read = Request::new(IRP_MJ_READ, 1, 16);
+    assert_eq!(read.run(), HV_WDK_STATUS_PENDING);
+    assert_ne!(read._stack.Control & SL_PENDING_RETURNED as u8, 0);
+    state(|s| {
+        assert_eq!(s.references, 0);
+        assert_eq!(s.completions.len(), 1);
+        assert_eq!(s.completions[0].1, HV_WDK_STATUS_DEVICE_NOT_CONNECTED);
+        assert_eq!(s.completions[0].2, 0);
+        assert!(s.worker.is_none());
+    });
+}
+
+#[test]
+fn work_item_scheduling_respects_publication_and_rundown() {
+    let _lock = SERIAL.lock().unwrap();
+    unsafe { reset() };
+    READ_PENDING.store(1, Ordering::SeqCst);
+    READ_WORK_ITEM.store(null_mut(), Ordering::Release);
+    unsafe { schedule_read() };
+    state(|s| {
+        assert_eq!(s.references, 0);
+        assert!(s.worker.is_none());
+    });
+    READ_WORK_ITEM.store(1usize as PIO_WORKITEM, Ordering::Release);
+    state(|s| s.stop_on_rundown_acquire = true);
+    unsafe { schedule_read() };
+    state(|s| {
+        assert_eq!(s.references, 0);
+        assert!(s.worker.is_none());
+    });
+}
+
 #[test]
 fn cleanup_cancels_all_reads_and_closed_session_rejects_new_irps() {
     let _lock = SERIAL.lock().unwrap();

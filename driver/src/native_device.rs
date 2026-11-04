@@ -115,7 +115,6 @@ pub(super) unsafe fn cancel_reads(file: PFILE_OBJECT) {
 pub(super) unsafe fn schedule_read() {
     unsafe {
         if is_stopping()
-            || READ_WORK_ITEM.is_null()
             || READ_PENDING.load(Ordering::SeqCst) == 0
             || (READ_READY.load(Ordering::SeqCst) == 0 && READ_ONLINE.load(Ordering::SeqCst) != 0)
         {
@@ -124,16 +123,16 @@ pub(super) unsafe fn schedule_read() {
         if api::ExAcquireRundownProtection(addr_of_mut!(READ_RUNDOWN)) == 0 {
             return;
         }
-        if READ_SCHEDULED
-            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+        // The device can be published before initialization stores the item.
+        // The atomic publishes it safely; rundown keeps it alive through queueing.
+        let work_item = READ_WORK_ITEM.load(Ordering::Acquire);
+        if !is_stopping()
+            && !work_item.is_null()
+            && READ_SCHEDULED
+                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
         {
-            api::IoQueueWorkItem(
-                READ_WORK_ITEM,
-                Some(read_worker),
-                DelayedWorkQueue,
-                null_mut(),
-            );
+            api::IoQueueWorkItem(work_item, Some(read_worker), DelayedWorkQueue, null_mut());
         } else {
             api::ExReleaseRundownProtection(addr_of_mut!(READ_RUNDOWN));
         }
@@ -281,7 +280,7 @@ unsafe extern "C" fn dispatch(_: PDEVICE_OBJECT, irp: PIRP) -> i32 {
             status = api::IoCsqInsertIrpEx(addr_of_mut!(READ_CSQ), irp, null_mut(), null_mut());
             if !nt_success(status) {
                 complete_read(irp, status, 0);
-                return status;
+                return HV_WDK_STATUS_PENDING;
             }
             schedule_read();
             return HV_WDK_STATUS_PENDING;
@@ -417,9 +416,10 @@ unsafe extern "C" fn hv_initialize(driver: PDRIVER_OBJECT, registry: PUNICODE_ST
             unload(driver);
             return status;
         }
-        READ_WORK_ITEM = IoAllocateWorkItem(CONTROL_DEVICE);
+        let read_work_item = IoAllocateWorkItem(CONTROL_DEVICE);
+        READ_WORK_ITEM.store(read_work_item, Ordering::Release);
         CACHE_WORK_ITEM = IoAllocateWorkItem(CONTROL_DEVICE);
-        if READ_WORK_ITEM.is_null() || CACHE_WORK_ITEM.is_null() {
+        if read_work_item.is_null() || CACHE_WORK_ITEM.is_null() {
             status = HV_WDK_STATUS_INSUFFICIENT_RESOURCES;
         } else {
             (*CONTROL_DEVICE).Flags |= DO_BUFFERED_IO;
@@ -458,9 +458,9 @@ unsafe extern "C" fn unload(_: PDRIVER_OBJECT) {
         KeFlushQueuedDpcs();
         ExWaitForRundownProtectionRelease(addr_of_mut!(READ_RUNDOWN));
         ExWaitForRundownProtectionRelease(addr_of_mut!(CACHE_RUNDOWN));
-        if !READ_WORK_ITEM.is_null() {
-            IoFreeWorkItem(READ_WORK_ITEM);
-            READ_WORK_ITEM = null_mut();
+        let read_work_item = READ_WORK_ITEM.swap(null_mut(), Ordering::AcqRel);
+        if !read_work_item.is_null() {
+            IoFreeWorkItem(read_work_item);
         }
         if !CACHE_WORK_ITEM.is_null() {
             IoFreeWorkItem(CACHE_WORK_ITEM);

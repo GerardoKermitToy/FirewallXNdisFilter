@@ -789,10 +789,10 @@ fn offload_detection_preserves_ndis_path_and_uso_uro_low_dword_semantics() {
         let context = allocate_packet_context(&mut nbl);
         nbl.NetBufferListInfo[UdpSegmentationOffloadInfo as usize] = (1usize << 32) as PVOID;
         assert!(!send_segmented(&mut nbl));
-        assert!(receive_coalesced(&mut nbl)); // Same slot is TCP RSC on receive.
+        assert!(!receive_coalesced(&mut nbl)); // Same slot is TCP RSC on receive.
         assert_eq!(snapshot_offload(&mut nbl), 0);
         (*context).direction = 1;
-        assert_eq!(snapshot_offload(&mut nbl), 1);
+        assert_eq!(snapshot_offload(&mut nbl), 0);
         nbl.NetBufferListInfo[UdpSegmentationOffloadInfo as usize] = null_mut();
         nbl.NetBufferListInfo[UdpRecvSegCoalesceOffloadInfo as usize] = (1usize << 32) as PVOID;
         assert!(!receive_coalesced(&mut nbl));
@@ -800,6 +800,8 @@ fn offload_detection_preserves_ndis_path_and_uso_uro_low_dword_semantics() {
         nbl.NetBufferListInfo[UdpRecvSegCoalesceOffloadInfo as usize] = 3 as PVOID;
         assert_eq!(snapshot_offload(&mut nbl), 1);
         nbl.NetBufferListInfo[UdpRecvSegCoalesceOffloadInfo as usize] = null_mut();
+        nbl.NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize] = (1usize << 32) as PVOID;
+        assert!(!send_segmented(&mut nbl));
         nbl.NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize] = 1 as PVOID;
         assert_eq!(snapshot_offload(&mut nbl), 0); // ReceiveNoPush is not coalescing.
         (*context).direction = 0;
@@ -824,6 +826,13 @@ fn wfp_offload_snapshot_retains_preclone_scalar_profile_and_transfer_marker() {
             (*context).segmented = 1;
             assert_eq!(snapshot_offload(&mut nbl), 1);
             (*context).segmented = 0;
+            for slot in [TcpLargeSendNetBufferListInfo, TcpRecvSegCoalesceInfo] {
+                nbl.NetBufferListInfo[slot as usize] = (1usize << 32) as PVOID;
+                assert_eq!(snapshot_offload(&mut nbl), 0);
+                nbl.NetBufferListInfo[slot as usize] = 1usize as PVOID;
+                assert_eq!(snapshot_offload(&mut nbl), 1);
+                nbl.NetBufferListInfo[slot as usize] = null_mut();
+            }
             nbl.NetBufferListInfo[TcpReceiveBytesTransferred as usize] = (1usize << 32) as PVOID;
             assert_eq!(snapshot_offload(&mut nbl), 1);
             nbl.NetBufferListInfo[TcpReceiveBytesTransferred as usize] = null_mut();

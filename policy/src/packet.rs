@@ -55,6 +55,8 @@ pub struct Packet {
     pub flow: Flow,
     pub connection: Connection,
     pub cacheable: bool,
+    // True only when the bounded snapshot established the complete flow key.
+    mergeable: bool,
     pub ip_len: u64,      // Total bytes for bandwidth; can aggregate same-flow NBs.
     pub payload_len: u32, // Complete IP packet in the first NB, without Ethernet padding.
 }
@@ -69,6 +71,7 @@ impl Packet {
         flow: Flow::EMPTY,
         connection: Connection::EMPTY,
         cacheable: false,
+        mergeable: false,
         ip_len: 0,
         payload_len: 0,
     };
@@ -88,9 +91,10 @@ impl Packet {
         })
     }
     // One verdict covers a homogeneous NBL; only the first NB supplies payload.
+    // Unknown ports or protocol cannot prove two packets have the same flow.
     // The chain has no count quota and can account for more than u32::MAX bytes.
     pub fn merge(&mut self, other: &Self) -> Result<(), ParseError> {
-        if unlikely(self.flow != other.flow) {
+        if unlikely(!self.mergeable || !other.mergeable || self.flow != other.flow) {
             return Err(ParseError::Malformed);
         }
         self.ip_len = self.ip_len.saturating_add(other.ip_len);
@@ -312,8 +316,13 @@ pub fn parse_ip(
             p.flow.source_port = be16(ip, transport);
             p.flow.destination_port = be16(ip, transport + 2);
             p.cacheable = !offload;
+        } else {
+            // The logical packet can be complete while the bounded snapshot
+            // does not contain its transport header.
+            fully_parsed = false;
         }
     }
+    p.mergeable = fully_parsed && !fragment;
     p.flow.protocol = proto;
     p.ip_len = ip_len as u64;
     p.connection.ipv6 = p.flow.ipv6;
@@ -478,6 +487,123 @@ mod tests {
         assert_eq!(batch.merge(&other), Err(ParseError::Malformed));
         assert_eq!(batch.ip_len, original.ip_len);
         assert_eq!(batch.payload_len, original.payload_len);
+    }
+    fn merged(mut first: Packet, second: &Packet) -> Result<(), ParseError> {
+        first.merge(second)
+    }
+    #[test]
+    fn incomplete_flow_keys_never_merge_even_when_their_fields_match() {
+        let mut frame = udp();
+        // Zero is a valid parsed port value, so the port values alone cannot
+        // distinguish a complete key from an unavailable transport header.
+        frame[34..38].fill(0);
+        let complete = parse(&frame, frame.len(), frame.len(), false)
+            .unwrap()
+            .unwrap();
+        let incomplete = parse(&frame, 34, frame.len(), false).unwrap().unwrap();
+        assert_eq!(complete.flow, incomplete.flow);
+        assert!(complete.mergeable);
+        assert!(!incomplete.mergeable);
+        assert_eq!(merged(complete, &incomplete), Err(ParseError::Malformed));
+        assert_eq!(merged(incomplete, &complete), Err(ParseError::Malformed));
+        assert_eq!(merged(incomplete, &incomplete), Err(ParseError::Malformed));
+        assert_eq!(merged(complete, &complete), Ok(()));
+    }
+    #[test]
+    fn incomplete_ipv6_extension_keys_reject_mixed_nbls_for_both_paths() {
+        const EXTENSION: usize = 320;
+        let mut first = [0u8; 40 + EXTENSION + 8];
+        first[0] = 0x60;
+        first[4..6].copy_from_slice(&((EXTENSION + 8) as u16).to_be_bytes());
+        first[6] = 60; // Destination Options
+        first[8..24].copy_from_slice(&[0x20; 16]);
+        first[24..40].copy_from_slice(&[0x30; 16]);
+        first[40] = 17; // UDP after the complete extension
+        first[41] = (EXTENSION / 8 - 1) as u8;
+        first[40 + EXTENSION..42 + EXTENSION].copy_from_slice(&1234u16.to_be_bytes());
+        first[42 + EXTENSION..44 + EXTENSION].copy_from_slice(&53u16.to_be_bytes());
+        first[44 + EXTENSION..46 + EXTENSION].copy_from_slice(&8u16.to_be_bytes());
+        let mut second = first;
+        second[42 + EXTENSION..44 + EXTENSION].copy_from_slice(&443u16.to_be_bytes());
+
+        // WFP IPFORWARD starts at the IP header.
+        let first_ip = parse_ip(&first[..SNAPSHOT], SNAPSHOT, first.len(), true, false).unwrap();
+        let second_ip = parse_ip(&second[..SNAPSHOT], SNAPSHOT, second.len(), true, false).unwrap();
+        assert_eq!(first_ip.flow, second_ip.flow);
+        assert_eq!(first_ip.flow.protocol, 60);
+        assert_eq!(first_ip.flow.destination_port, 0);
+        assert_eq!(first_ip.payload_len as usize, first.len());
+        assert!(!first_ip.mergeable);
+        assert_eq!(merged(first_ip, &second_ip), Err(ParseError::Malformed));
+
+        // NDIS sees the same IP packet after its Ethernet header.
+        let mut first_frame = [0u8; 14 + 40 + EXTENSION + 8];
+        first_frame[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+        first_frame[14..].copy_from_slice(&first);
+        let mut second_frame = first_frame;
+        second_frame[14..].copy_from_slice(&second);
+        let first_ndis = parse(&first_frame[..SNAPSHOT], SNAPSHOT, first_frame.len(), false)
+            .unwrap()
+            .unwrap();
+        let second_ndis = parse(
+            &second_frame[..SNAPSHOT],
+            SNAPSHOT,
+            second_frame.len(),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first_ndis.flow, second_ndis.flow);
+        assert!(!first_ndis.mergeable);
+        assert_eq!(merged(first_ndis, &second_ndis), Err(ParseError::Malformed));
+    }
+    #[test]
+    fn ipv6_transport_beyond_snapshot_cannot_form_a_batch() {
+        const EXTENSION: usize = 280;
+        for protocol in [6u8, 17] {
+            let mut ip = [0u8; 40 + EXTENSION + 20];
+            ip[0] = 0x60;
+            ip[4..6].copy_from_slice(&((EXTENSION + 20) as u16).to_be_bytes());
+            ip[6] = 60;
+            ip[40] = protocol;
+            ip[41] = (EXTENSION / 8 - 1) as u8;
+            let transport = 40 + EXTENSION;
+            ip[transport..transport + 2].copy_from_slice(&1234u16.to_be_bytes());
+            ip[transport + 2..transport + 4].copy_from_slice(&53u16.to_be_bytes());
+            if protocol == 6 {
+                ip[transport + 12] = 0x50;
+            } else {
+                ip[transport + 4..transport + 6].copy_from_slice(&20u16.to_be_bytes());
+            }
+            let complete = parse_ip(&ip, ip.len(), ip.len(), true, false).unwrap();
+            assert!(complete.mergeable);
+            assert_eq!(complete.flow.destination_port, 53);
+            let incomplete = parse_ip(&ip[..SNAPSHOT], SNAPSHOT, ip.len(), true, false).unwrap();
+            assert!(!incomplete.mergeable);
+            assert_eq!(incomplete.flow.protocol, protocol);
+            assert_eq!(incomplete.flow.destination_port, 0);
+            assert_eq!(merged(incomplete, &incomplete), Err(ParseError::Malformed));
+        }
+    }
+    #[test]
+    fn fragment_flow_keys_cannot_be_merged() {
+        let mut ipv4 = udp();
+        ipv4[20] = 0x20; // More Fragments
+        let fragment = parse(&ipv4, ipv4.len(), ipv4.len(), false)
+            .unwrap()
+            .unwrap();
+        assert!(!fragment.mergeable);
+        assert_eq!(merged(fragment, &fragment), Err(ParseError::Malformed));
+
+        let mut ipv6 = [0u8; 40 + 8 + 8];
+        ipv6[0] = 0x60;
+        ipv6[4..6].copy_from_slice(&16u16.to_be_bytes());
+        ipv6[6] = 44; // Fragment
+        ipv6[40] = 17;
+        ipv6[42..44].copy_from_slice(&1u16.to_be_bytes()); // More Fragments
+        let fragment = parse_ip(&ipv6, ipv6.len(), ipv6.len(), true, false).unwrap();
+        assert!(!fragment.mergeable);
+        assert_eq!(merged(fragment, &fragment), Err(ParseError::Malformed));
     }
     #[test]
     fn large_batch_bandwidth_is_64_bit_and_saturates_without_wrapping() {
@@ -644,6 +770,8 @@ mod tests {
         ip[40 + 9 * 8 + 4..40 + 9 * 8 + 6].copy_from_slice(&8u16.to_be_bytes());
         let p = parse_ip(&ip, ip.len(), ip.len(), true, false).unwrap();
         assert!(!p.cacheable);
+        assert!(!p.mergeable);
+        assert_eq!(merged(p, &p), Err(ParseError::Malformed));
         assert_eq!(p.payload_len as usize, ip.len());
     }
     #[test]

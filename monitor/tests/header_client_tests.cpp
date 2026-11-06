@@ -63,6 +63,7 @@ void operator delete(void* p, const std::nothrow_t&) noexcept { ::operator delet
 void operator delete[](void* p, const std::nothrow_t&) noexcept { ::operator delete(p); }
 
 namespace testio {
+void AcquireExclusive(PSRWLOCK);
 HANDLE CreateEventW(LPSECURITY_ATTRIBUTES, BOOL, BOOL, LPCWSTR);
 HANDLE CreateFileW(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 BOOL CloseHandle(HANDLE);
@@ -72,6 +73,7 @@ BOOL WriteFile(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
 BOOL GetOverlappedResult(HANDLE, LPOVERLAPPED, LPDWORD, BOOL);
 BOOL CancelIoEx(HANDLE, LPOVERLAPPED);
 }
+#define AcquireSRWLockExclusive testio::AcquireExclusive
 #define CreateEventW testio::CreateEventW
 #define CreateFileW testio::CreateFileW
 #define CloseHandle testio::CloseHandle
@@ -81,6 +83,7 @@ BOOL CancelIoEx(HANDLE, LPOVERLAPPED);
 #define GetOverlappedResult testio::GetOverlappedResult
 #define CancelIoEx testio::CancelIoEx
 #include "HyperVXNdisFilter.hpp"
+#undef AcquireSRWLockExclusive
 #undef CreateEventW
 #undef CreateFileW
 #undef CloseHandle
@@ -113,6 +116,9 @@ struct State {
     HANDLE submitted = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE startup_seen = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE driver_ready = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE admission_paused = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE admission_resume = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::atomic<bool> pause_admission{false};
     Bytes queued, written, adapter_info;
     std::vector<AdapterReply> adapter_replies;
     std::vector<DWORD> adapter_capacities;
@@ -125,8 +131,19 @@ struct State {
     bool empty_read = false, short_control = false, wrong_version = false, fail_open = false, secure_ready = false;
     const uint8_t* first_buffer = nullptr;
     Client* stop_on_read = nullptr;
-    ~State() { ::CloseHandle(submitted); ::CloseHandle(startup_seen); ::CloseHandle(driver_ready); }
+    Client* stop_on_version = nullptr;
+    ~State() {
+        ::CloseHandle(submitted); ::CloseHandle(startup_seen); ::CloseHandle(driver_ready);
+        ::CloseHandle(admission_paused); ::CloseHandle(admission_resume);
+    }
 } state;
+void AcquireExclusive(PSRWLOCK lock) {
+    if (state.pause_admission.exchange(false)) {
+        ::SetEvent(state.admission_paused);
+        ::WaitForSingleObject(state.admission_resume, INFINITE);
+    }
+    ::AcquireSRWLockExclusive(lock);
+}
 HANDLE Device() { return reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x1234)); }
 void Reset() {
     std::lock_guard lock(state.mutex);
@@ -140,8 +157,10 @@ void Reset() {
     state.adapter_reply_index = 0; state.legacy_adapter_info = false;
     state.reads = state.cancels = state.opens = state.closes = state.adapter_queries = 0;
     state.empty_read = state.short_control = state.wrong_version = state.fail_open = state.secure_ready = false;
-    state.first_buffer = nullptr; state.stop_on_read = nullptr;
+    state.first_buffer = nullptr; state.stop_on_read = nullptr; state.stop_on_version = nullptr;
+    state.pause_admission.store(false);
     ::ResetEvent(state.submitted); ::ResetEvent(state.startup_seen); ::ResetEvent(state.driver_ready);
+    ::ResetEvent(state.admission_paused); ::ResetEvent(state.admission_resume);
 }
 void Complete(OVERLAPPED* ov, DWORD bytes, DWORD error = ERROR_SUCCESS) {
     auto& op = state.operations.at(ov);
@@ -236,6 +255,7 @@ BOOL DeviceIoControl(HANDLE, DWORD code, LPVOID input, DWORD input_size, LPVOID 
     uint8_t bytes[4]{};
     DWORD size = 4;
     if (code == 0x9c40e000u) {
+        if (state.stop_on_version) state.stop_on_version->Stop();
         const auto version = Client::RequiredVersion;
         std::memcpy(bytes, version.data(), 4);
         if (state.wrong_version) bytes[2] = 1;
@@ -1012,6 +1032,68 @@ bool TestIdleAndStop() {
     CHECK(client.Close() == ERROR_SUCCESS);
     return true;
 }
+bool TestStopDuringStartupAdmission() {
+    testio::Reset();
+    testio::state.fail_open = true;
+    testio::state.pause_admission.store(true);
+    Client client;
+    {
+        auto open = std::async(std::launch::async, [&] { return client.Open(); });
+        struct Guard {
+            Client& client; std::future<DWORD>& open;
+            ~Guard() {
+                if (!open.valid()) return;
+                ::SetEvent(testio::state.admission_resume);
+                {
+                    std::lock_guard lock(testio::state.mutex);
+                    testio::state.fail_open = false;
+                }
+                ::SetEvent(testio::state.driver_ready);
+                client.Stop();
+                open.wait();
+            }
+        } guard{client, open};
+        CHECK(::WaitForSingleObject(testio::state.admission_paused, 2000) == WAIT_OBJECT_0);
+        client.Stop();
+        client.Stop(); // Repeated stop requests must not make cancellation disappear.
+        ::SetEvent(testio::state.admission_resume);
+        const bool completed = open.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        if (!completed) client.Stop(); // Reap the old, broken implementation too.
+        CHECK(open.get() == ERROR_OPERATION_ABORTED);
+        CHECK(completed);
+        std::lock_guard lock(testio::state.mutex);
+        CHECK(testio::state.opens == 0); // Cancellation wins before device admission.
+    }
+    testio::state.fail_open = false;
+    CHECK(client.Open() == ERROR_SUCCESS); // A prior Stop must not poison a later Open.
+    CHECK(client.Close() == ERROR_SUCCESS);
+    return true;
+}
+bool TestStopBeforeOpen() {
+    testio::Reset();
+    Client client;
+    client.Stop();
+    CHECK(client.Open() == ERROR_OPERATION_ABORTED);
+    CHECK(testio::state.opens == 0);
+    CHECK(client.Open() == ERROR_SUCCESS); // The cancellation was consumed once.
+    CHECK(client.Close() == ERROR_SUCCESS);
+    client.Stop();
+    CHECK(client.Close() == ERROR_SUCCESS); // Explicit Close clears an idle stop.
+    CHECK(client.Open() == ERROR_SUCCESS);
+    CHECK(client.Close() == ERROR_SUCCESS);
+    return true;
+}
+bool TestStopDuringVersionCheck() {
+    testio::Reset();
+    Client client;
+    testio::state.stop_on_version = &client;
+    CHECK(client.Open() == ERROR_OPERATION_ABORTED);
+    CHECK(testio::state.closes == 1 && testio::state.operations.empty());
+    testio::state.stop_on_version = nullptr;
+    CHECK(client.Open() == ERROR_SUCCESS);
+    CHECK(client.Close() == ERROR_SUCCESS);
+    return true;
+}
 bool TestStartupWait() {
     for (bool cancel : {false, true}) {
         testio::Reset();
@@ -1158,6 +1240,9 @@ int main() {
         {"unaligned zero-copy views, restored packing and deferred stream compaction", TestUnalignedViewsAndDeferredCompaction},
         {"borrowed logs and batched bandwidth arrays, exact layouts and malformed records", TestLogAndBandwidth},
         {"idle read without polling, concurrent IOCTL, Stop/Shutdown cancellation and reaping", TestIdleAndStop},
+        {"Stop during startup admission is preserved and a later Open succeeds", TestStopDuringStartupAdmission},
+        {"Stop before Open cancels once and Close clears an idle stop", TestStopBeforeOpen},
+        {"Stop during the version query cancels Open and permits reopening", TestStopDuringVersionCheck},
         {"unlimited DriverReady startup wait, protected ACL, stale signal and Stop without device polling", TestStartupWait},
         {"exclusive-device sharing errors never wait for DriverReady and allow a later reopen", TestBusyStartup},
         {"deadline reaping, no legacy-read spin, and Stop during read admission", TestTimeoutAndLegacy},

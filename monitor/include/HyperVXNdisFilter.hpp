@@ -160,7 +160,12 @@ public:
     DWORD Open() {
         if (device_ != INVALID_HANDLE_VALUE || stop_event_) return ERROR_ALREADY_EXISTS;
         AcquireSRWLockExclusive(&stop_lock_);
-        stopping_.store(false);
+        // A Stop can arrive before this thread starts or acquires the lock.
+        // Consume it once instead of discarding it while initializing Open.
+        if (stopping_.exchange(false)) {
+            ReleaseSRWLockExclusive(&stop_lock_);
+            return ERROR_OPERATION_ABORTED;
+        }
         stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         const DWORD stop_error = stop_event_ ? ERROR_SUCCESS : GetLastError();
         ReleaseSRWLockExclusive(&stop_lock_);
@@ -171,6 +176,7 @@ public:
         if (!error && stopping_.load()) error = ERROR_OPERATION_ABORTED;
         std::array<uint8_t, 4> version{};
         if (!error) error = GetVersion(version);
+        if (!error && stopping_.load()) error = ERROR_OPERATION_ABORTED;
         if (!error && version != RequiredVersion) error = ERROR_REVISION_MISMATCH;
         if (error) Close();
         return error;
@@ -190,6 +196,7 @@ public:
         AcquireSRWLockExclusive(&stop_lock_);
         if (stop_event_) CloseHandle(stop_event_);
         stop_event_ = nullptr;
+        stopping_.store(false);
         ReleaseSRWLockExclusive(&stop_lock_);
         device_ = INVALID_HANDLE_VALUE;
         control_event_ = nullptr;

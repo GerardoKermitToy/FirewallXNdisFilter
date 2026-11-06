@@ -55,7 +55,7 @@ pub struct Packet {
     pub flow: Flow,
     pub connection: Connection,
     pub cacheable: bool,
-    // True only when the bounded snapshot established the complete flow key.
+    // False for fragments or an incomplete bounded header parse.
     mergeable: bool,
     pub ip_len: u64,      // Total bytes for bandwidth; can aggregate same-flow NBs.
     pub payload_len: u32, // Complete IP packet in the first NB, without Ethernet padding.
@@ -91,10 +91,15 @@ impl Packet {
         })
     }
     // One verdict covers a homogeneous NBL; only the first NB supplies payload.
-    // Unknown ports or protocol cannot prove two packets have the same flow.
+    // Only TCP/UDP flow keys identify the transport in this parser.
     // The chain has no count quota and can account for more than u32::MAX bytes.
     pub fn merge(&mut self, other: &Self) -> Result<(), ParseError> {
-        if unlikely(!self.mergeable || !other.mergeable || self.flow != other.flow) {
+        if unlikely(
+            !self.mergeable
+                || !other.mergeable
+                || self.flow != other.flow
+                || !matches!(self.flow.protocol, 6 | 17),
+        ) {
             return Err(ParseError::Malformed);
         }
         self.ip_len = self.ip_len.saturating_add(other.ip_len);
@@ -490,6 +495,126 @@ mod tests {
     }
     fn merged(mut first: Packet, second: &Packet) -> Result<(), ParseError> {
         first.merge(second)
+    }
+    #[test]
+    fn unidentified_transport_flows_cannot_be_merged() {
+        for ipv6 in [false, true] {
+            // ICMP, ESP and SCTP have no transport identity in this parser.
+            for protocol in [if ipv6 { 58 } else { 1 }, 50, 132] {
+                for offload in [false, true] {
+                    let ip_header = if ipv6 { 40 } else { 20 };
+                    let ip_len = ip_header + 16;
+                    let mut frame = [0u8; 14 + 40 + 16];
+                    frame[12..14]
+                        .copy_from_slice(&(if ipv6 { 0x86ddu16 } else { 0x0800u16 }).to_be_bytes());
+                    let ip = &mut frame[14..14 + ip_len];
+                    if ipv6 {
+                        ip[0] = 0x60;
+                        ip[4..6].copy_from_slice(&16u16.to_be_bytes());
+                        ip[6] = protocol;
+                        ip[23] = 1;
+                        ip[39] = 2;
+                    } else {
+                        ip[0] = 0x45;
+                        ip[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
+                        ip[9] = protocol;
+                        ip[15] = 1;
+                        ip[19] = 2;
+                    }
+                    // These are distinct SCTP destination ports when protocol=132.
+                    ip[ip_header..ip_header + 2].copy_from_slice(&5000u16.to_be_bytes());
+                    ip[ip_header + 2..ip_header + 4].copy_from_slice(&5001u16.to_be_bytes());
+                    let mut second = frame;
+                    second[14 + ip_header + 2..14 + ip_header + 4]
+                        .copy_from_slice(&5002u16.to_be_bytes());
+                    let length = 14 + ip_len;
+                    for raw_ip in [false, true] {
+                        let parse_frame = |bytes: &[u8]| {
+                            if raw_ip {
+                                parse_ip(&bytes[14..length], ip_len, ip_len, ipv6, offload).unwrap()
+                            } else {
+                                parse(bytes, length, length, offload).unwrap().unwrap()
+                            }
+                        };
+                        let first = parse_frame(&frame);
+                        let other = parse_frame(&second);
+                        assert_eq!(first.flow, other.flow);
+                        assert_eq!(first.flow.protocol, protocol);
+                        assert_eq!(
+                            (first.flow.source_port, first.flow.destination_port),
+                            (0, 0)
+                        );
+                        assert_eq!(first.payload_len as usize, ip_len);
+                        assert!(!first.cacheable);
+                        assert_eq!(merged(first, &other), Err(ParseError::Malformed));
+                        assert_eq!(merged(other, &first), Err(ParseError::Malformed));
+                        assert_eq!(merged(first, &first), Err(ParseError::Malformed));
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn complete_tcp_udp_flows_still_merge() {
+        for ipv6 in [false, true] {
+            for protocol in [6u8, 17] {
+                for offload in [false, true] {
+                    let ip_header = if ipv6 { 40 } else { 20 };
+                    let transport_len = if protocol == 6 { 20 } else { 8 };
+                    let ip_len = ip_header + transport_len;
+                    let mut frame = [0u8; 14 + 40 + 20];
+                    frame[12..14]
+                        .copy_from_slice(&(if ipv6 { 0x86ddu16 } else { 0x0800u16 }).to_be_bytes());
+                    let ip = &mut frame[14..14 + ip_len];
+                    if ipv6 {
+                        ip[0] = 0x60;
+                        ip[4..6].copy_from_slice(&(transport_len as u16).to_be_bytes());
+                        ip[6] = protocol;
+                        ip[23] = 1;
+                        ip[39] = 2;
+                    } else {
+                        ip[0] = 0x45;
+                        ip[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
+                        ip[9] = protocol;
+                        ip[15] = 1;
+                        ip[19] = 2;
+                    }
+                    ip[ip_header..ip_header + 2].copy_from_slice(&1234u16.to_be_bytes());
+                    ip[ip_header + 2..ip_header + 4].copy_from_slice(&53u16.to_be_bytes());
+                    if protocol == 6 {
+                        ip[ip_header + 12] = 0x50;
+                    } else {
+                        ip[ip_header + 4..ip_header + 6].copy_from_slice(&8u16.to_be_bytes());
+                    }
+                    let mut second = frame;
+                    second[14 + ip_header + 2..14 + ip_header + 4]
+                        .copy_from_slice(&443u16.to_be_bytes());
+                    let length = 14 + ip_len;
+                    for raw_ip in [false, true] {
+                        let parse_frame = |bytes: &[u8]| {
+                            if raw_ip {
+                                parse_ip(&bytes[14..length], ip_len, ip_len, ipv6, offload).unwrap()
+                            } else {
+                                parse(bytes, length, length, offload).unwrap().unwrap()
+                            }
+                        };
+                        let first = parse_frame(&frame);
+                        let other = parse_frame(&second);
+                        assert_eq!(first.cacheable, !offload);
+                        assert_eq!(
+                            (first.flow.source_port, first.flow.destination_port),
+                            (1234, 53)
+                        );
+                        let mut batch = first;
+                        assert_eq!(batch.merge(&first), Ok(()));
+                        assert_eq!(batch.ip_len, 2 * first.ip_len);
+                        assert_eq!(batch.payload_len, first.payload_len);
+                        assert!(!batch.cacheable);
+                        assert_eq!(batch.merge(&other), Err(ParseError::Malformed));
+                    }
+                }
+            }
+        }
     }
     #[test]
     fn incomplete_flow_keys_never_merge_even_when_their_fields_match() {

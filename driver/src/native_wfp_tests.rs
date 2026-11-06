@@ -22,7 +22,6 @@ struct State {
     clone_status: i32,
     injection_status: i32,
     fail_device: bool,
-    fail_work: bool,
     admission: u8,
     permit: u8,
     classify_calls: usize,
@@ -496,12 +495,8 @@ pub(super) unsafe fn IoDeleteDevice(device: PDEVICE_OBJECT) {
 pub(super) unsafe fn IoAllocateWorkItem(device: PDEVICE_OBJECT) -> PIO_WORKITEM {
     assert_eq!(unsafe { (*device).Flags } & DO_DEVICE_INITIALIZING, 0);
     call("allocate_work");
-    if state(|s| s.fail_work) || fail("allocate_work") {
-        ptr::null_mut()
-    } else {
-        state(|s| s.work_live = true);
-        0x123usize as PIO_WORKITEM
-    }
+    state(|s| s.work_live = true);
+    0x123usize as PIO_WORKITEM
 }
 pub(super) unsafe fn IoFreeWorkItem(work: PIO_WORKITEM) {
     assert_eq!(work as usize, 0x123);
@@ -1195,14 +1190,7 @@ fn native_device_work_retry_and_passive_management_lifetime() {
         assert!(hv_wfp_native_initialize(ptr::null_mut()) < 0);
         hv_wfp_free_work();
         hv_wfp_delete_device();
-        state(|s| {
-            s.fail_device = false;
-            s.fail_work = true;
-        });
-        assert!(hv_wfp_native_initialize(ptr::null_mut()) < 0);
-        hv_wfp_free_work();
-        hv_wfp_delete_device();
-        state(|s| s.fail_work = false);
+        state(|s| s.fail_device = false);
         assert_eq!(hv_wfp_native_initialize(ptr::null_mut()), 0);
         hv_wfp_lock();
         hv_wfp_unlock();
@@ -1431,29 +1419,6 @@ fn clone_native_failures_do_not_allocate_or_free_unowned_packets() {
 }
 
 #[test]
-fn clone_context_allocation_failure_frees_the_correct_native_owner_once() {
-    let _guard = begin();
-    let mut original = NET_BUFFER_LIST::default();
-    for flags in [0, FWP_CONDITION_FLAG_IS_FRAGMENT_GROUP] {
-        crate::native_packet::fail_next_context_allocation();
-        assert!(unsafe { hv_wfp_clone(&mut original, &route(flags), 0) }.is_null());
-    }
-    assert!(state(|s| s.live.is_empty()));
-    assert_eq!(
-        state(|s| s.calls.iter().filter(|&&name| name == "free_clone").count()),
-        1
-    );
-    assert_eq!(
-        state(|s| s
-            .calls
-            .iter()
-            .filter(|&&name| name == "free_reassembly")
-            .count()),
-        1
-    );
-}
-
-#[test]
 fn injection_routes_preserve_destination_subinterface_and_inline_completion_is_safe() {
     let _guard = begin();
     let mut original = NET_BUFFER_LIST::default();
@@ -1626,7 +1591,7 @@ fn manager_global_registration_bfe_restart_burst_and_callback_during_subscribe()
 #[test]
 fn manager_paused_start_private_failures_and_partial_initialization_unwind() {
     let _guard = integration_begin();
-    for failure in ["create_device", "allocate_work", "subscribe"] {
+    for failure in ["create_device", "subscribe"] {
         state(|s| s.failure = Some((failure, 0)));
         assert!(unsafe { actual_initialize(ptr::null_mut()) } < 0);
         stop_and_check();

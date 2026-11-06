@@ -7,20 +7,14 @@ mod grouped;
 
 std::thread_local! {
     static LOCKED: Cell<bool> = const { Cell::new(false) };
-    static FAIL: Cell<bool> = const { Cell::new(false) };
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
     static BYTES: Cell<usize> = const { Cell::new(0) };
 }
 unsafe fn allocate(size: usize) -> *mut u8 {
     LOCKED.with(|v| assert!(!v.get(), "allocation under the policy lock"));
     ALLOCATIONS.with(|v| v.set(v.get() + 1));
-    if FAIL.with(Cell::get) {
-        return ptr::null_mut();
-    }
     let data = unsafe { global_allocate(size) };
-    if !data.is_null() {
-        BYTES.with(|v| v.set(v.get() + size));
-    }
+    BYTES.with(|v| v.set(v.get() + size));
     data
 }
 unsafe fn free(data: *mut u8, size: usize) {
@@ -30,7 +24,6 @@ unsafe fn free(data: *mut u8, size: usize) {
 }
 fn caches() -> Caches {
     BYTES.with(|v| assert_eq!(v.get(), 0));
-    FAIL.with(|v| v.set(false));
     ALLOCATIONS.with(|v| v.set(0));
     Caches::new(unsafe { CacheAllocator::new(allocate, free) })
 }
@@ -186,58 +179,64 @@ fn tcp_udp_have_independent_decisions_and_expiry_for_the_same_ip_port_tuple() {
 }
 
 #[test]
-fn failed_initial_allocation_and_growth_preserve_live_verdicts() {
-    let mut caches = caches();
-    FAIL.with(|v| v.set(true));
-    assert!(!insert(&mut caches, &connection(false, 0), true, 60000));
-    assert_eq!(caches.bytes(), 0);
-    FAIL.with(|v| v.set(false));
-    for n in 0..96 {
-        assert!(insert(&mut caches, &connection(false, n), true, 60000));
-    }
-    let bytes = caches.bytes();
-    FAIL.with(|v| v.set(true));
-    assert!(!insert(&mut caches, &connection(false, 96), true, 60000));
-    assert_eq!(caches.counts(), (96, 0));
-    assert_eq!(caches.bytes(), bytes);
-    for n in 0..96 {
-        assert_eq!(caches.get(&connection(false, n), 1), Some(true));
-    }
-    // An existing entry can still change verdict without any allocation.
-    let calls = ALLOCATIONS.with(Cell::get);
-    assert!(insert(&mut caches, &connection(false, 0), false, 61000));
-    assert_eq!(ALLOCATIONS.with(Cell::get), calls);
-    assert_eq!(caches.get(&connection(false, 0), 1), Some(false));
-    FAIL.with(|v| v.set(false));
-    assert!(insert(&mut caches, &connection(false, 96), true, 60000));
-}
-
-#[test]
-fn failed_compaction_does_not_fill_probe_chains_with_tombstones() {
-    let mut caches = caches();
-    for n in 0..96 {
-        assert!(insert(
-            &mut caches,
-            &connection(false, n),
-            true,
-            if n < 80 { 10 } else { 10000 }
-        ));
-    }
-    for _ in 0..4 {
+fn sparse_tables_shrink_only_on_new_insertions_and_keep_live_verdicts() {
+    for ipv6 in [false, true] {
+        let mut caches = caches();
+        for n in 0..2048 {
+            assert!(insert(
+                &mut caches,
+                &connection(ipv6, n),
+                n == 0,
+                if n == 0 { 60000 } else { 10 }
+            ));
+        }
+        let old_capacity = if ipv6 {
+            caches.ipv6[1].current.capacity
+        } else {
+            caches.ipv4[1].current.capacity
+        };
+        assert!(old_capacity >= 4096);
         maintain(&mut caches, 10);
+        let bytes = caches.bytes();
+        let calls = ALLOCATIONS.with(Cell::get);
+        for _ in 0..20 {
+            assert_eq!(
+                locked(|| caches.apply(&connection(ipv6, 0), 11, 1000)),
+                Some(true)
+            );
+            maintain(&mut caches, 11);
+        }
+        assert_eq!(caches.bytes(), bytes);
+        assert_eq!(ALLOCATIONS.with(Cell::get), calls);
+
+        assert!(insert(&mut caches, &connection(ipv6, 4000), false, 60000));
+        assert!(insert(&mut caches, &connection(ipv6, 4001), false, 60000));
+        let (new_capacity, previous_capacity) = if ipv6 {
+            (
+                caches.ipv6[1].current.capacity,
+                caches.ipv6[1].previous.capacity,
+            )
+        } else {
+            (
+                caches.ipv4[1].current.capacity,
+                caches.ipv4[1].previous.capacity,
+            )
+        };
+        assert_eq!(new_capacity, old_capacity / 4);
+        assert!(previous_capacity == old_capacity || previous_capacity == 0);
+        for n in 4002..(4003 + old_capacity as u32 / WORK_PER_PASS as u32) {
+            if caches.bytes() < bytes / 2 {
+                break;
+            }
+            assert!(insert(&mut caches, &connection(ipv6, n), false, 60000));
+        }
+        assert!(caches.bytes() < bytes / 2);
+        assert_eq!(caches.get(&connection(ipv6, 0), 12), Some(true));
+        assert_eq!(caches.get(&connection(ipv6, 4000), 12), Some(false));
+        assert_eq!(caches.get(&connection(ipv6, 4001), 12), Some(false));
+        drop(caches);
+        BYTES.with(|bytes| assert_eq!(bytes.get(), 0));
     }
-    assert_eq!(caches.counts(), (16, 0));
-    let used = caches.ipv4[1].current.used;
-    FAIL.with(|v| v.set(true));
-    for n in 100..200 {
-        assert!(!insert(&mut caches, &connection(false, n), false, 10000));
-    }
-    assert_eq!(caches.ipv4[1].current.used, used);
-    for n in 80..96 {
-        assert_eq!(caches.get(&connection(false, n), 10), Some(true));
-    }
-    FAIL.with(|v| v.set(false));
-    assert!(insert(&mut caches, &connection(false, 200), false, 10000));
 }
 
 #[test]
@@ -584,26 +583,4 @@ fn growth_and_migration_are_local_to_the_selected_protocol() {
     assert_eq!(caches.ipv4[0].previous.capacity, 0);
     assert_eq!(caches.ipv6[0].previous.capacity, 0);
     assert_eq!(caches.counts(), (107, 107));
-}
-
-#[test]
-fn allocation_failure_in_one_protocol_preserves_the_other_protocol_cache() {
-    let mut caches = caches();
-    for ipv6 in [false, true] {
-        let udp = connection(ipv6, 1);
-        assert!(insert(&mut caches, &udp, true, 60000));
-        let bytes = caches.bytes();
-        let mut tcp = udp;
-        tcp.protocol = 6;
-        FAIL.with(|v| v.set(true));
-        assert!(!insert(&mut caches, &tcp, false, 60000));
-        assert_eq!(caches.get(&tcp, 1), None);
-        assert_eq!(caches.get(&udp, 1), Some(true));
-        assert_eq!(caches.bytes(), bytes);
-        FAIL.with(|v| v.set(false));
-        assert!(insert(&mut caches, &tcp, false, 60000));
-        assert_eq!(caches.get(&tcp, 1), Some(false));
-        assert_eq!(caches.get(&udp, 1), Some(true));
-    }
-    assert_eq!(caches.counts(), (2, 2));
 }

@@ -7,14 +7,14 @@ use crate::{
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use hyperv_protocol::{
-    BANDWIDTH_HEADER, MAX_LOG_RECORD, MAX_PAYLOAD, MAX_RECORD, Verdict, bandwidth_entry_len,
-    bandwidth_record_len, connection_header_len, encode_bandwidth_entry, encode_bandwidth_header,
-    encode_connection_header, encode_log,
+    BANDWIDTH_HEADER, BandwidthEntry, MAX_LOG_RECORD, MAX_PAYLOAD, MAX_RECORD, Verdict,
+    bandwidth_entry_len, bandwidth_record_len, connection_header_len, encode_bandwidth_entry,
+    encode_bandwidth_header, encode_connection_header, encode_log,
 };
 
 use likely_stable::{likely, unlikely};
 
-pub use crate::bandwidth::{BandwidthPlan, BandwidthWork};
+pub use crate::bandwidth::{BandwidthPlan, BandwidthWork, DeferredBandwidth};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Finish {
@@ -44,7 +44,18 @@ struct Interface {
     forwarding: bool,
     dirty: bool,
     candidate: bool,
+    pending: usize,
     caches: Caches,
+}
+impl Interface {
+    fn idle_forward(&self) -> bool {
+        self.forwarding
+            && !self.ndis_attached
+            && !self.dirty
+            && !self.candidate
+            && self.pending == 0
+            && self.caches.bytes() == 0
+    }
 }
 #[derive(Clone, Copy)]
 struct Pending {
@@ -63,8 +74,8 @@ struct Event {
     data: Vec<u8>,
 }
 
-// Only fallible allocation is used. Records and metadata have no aggregate
-// byte quota; the per-record payload limit remains part of the wire contract.
+// Records and metadata have no aggregate byte quota; the per-record payload
+// limit remains part of the wire contract.
 pub fn allocate_record(len: usize) -> Option<Vec<u8>> {
     if unlikely(len > MAX_RECORD) {
         return None;
@@ -72,13 +83,16 @@ pub fn allocate_record(len: usize) -> Option<Vec<u8>> {
     allocate_event(len)
 }
 fn allocate_event(len: usize) -> Option<Vec<u8>> {
-    let mut data = Vec::new();
-    if unlikely(data.try_reserve_exact(len).is_err()) {
-        return None;
-    }
-    data.resize(len, 0);
-    Some(data)
+    core::alloc::Layout::array::<u8>(len).ok()?;
+    Some(alloc::vec![0; len])
 }
+#[derive(Default)]
+struct BandwidthReportGroup {
+    count: usize,
+    data: Option<Vec<u8>>,
+    offset: usize,
+}
+
 pub struct BandwidthTable {
     store: BandwidthStore,
     epoch: u64,
@@ -98,12 +112,7 @@ impl BandwidthTable {
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
-    fn next_group(&self, after: Option<BandwidthGroup>) -> Option<BandwidthGroup> {
-        self.store.next_group(after)
-    }
-    fn encode_group(&self, group: BandwidthGroup) -> Option<Vec<u8>> {
-        let mut count = 0;
-        self.store.visit_group(group, &mut |_| count += 1);
+    fn group_record(group: BandwidthGroup, count: usize) -> Option<Vec<u8>> {
         let len = bandwidth_record_len(group.ipv6, count)?;
         let mut data = allocate_event(len)?;
         encode_bandwidth_header(
@@ -114,17 +123,123 @@ impl BandwidthTable {
             count,
         )
         .expect("valid bandwidth event layout");
-        let entry_size = bandwidth_entry_len(group.ipv6);
-        let mut offset = BANDWIDTH_HEADER;
-        self.store.visit_group(group, &mut |entry| {
-            encode_bandwidth_entry(&mut data[offset..offset + entry_size], group.ipv6, &entry)
-                .expect("valid bandwidth entry layout");
-            offset += entry_size;
-        });
         Some(data)
     }
-    fn remove_group(&mut self, group: BandwidthGroup) {
-        self.store.remove_group(group);
+    fn encode_counter(
+        data: &mut [u8],
+        offset: &mut usize,
+        ipv6: bool,
+        connection: &hyperv_protocol::Connection,
+        tx: u64,
+        rx: u64,
+    ) -> bool {
+        let Some(end) = offset.checked_add(bandwidth_entry_len(ipv6)) else {
+            return false;
+        };
+        let Some(output) = data.get_mut(*offset..end) else {
+            return false;
+        };
+        let entry = BandwidthEntry {
+            local_ip: connection.local_ip,
+            local_port: connection.local_port,
+            remote_ip: connection.remote_ip,
+            remote_port: connection.remote_port,
+            transmitted_bytes: tx,
+            received_bytes: rx,
+        };
+        encode_bandwidth_entry(output, ipv6, &entry).expect("valid bandwidth entry layout");
+        *offset = end;
+        true
+    }
+    // One or two groups need no per-entry index or sorting. Count before
+    // encoding so a mixed snapshot never allocates a speculative full record.
+    fn report_small_groups(&mut self, submit: &mut impl FnMut(Vec<u8>) -> bool) -> bool {
+        let Some(mut first) = self.store.first_group() else {
+            return false;
+        };
+        let mut second = None;
+        let (mut first_count, mut second_count) = (0usize, 0usize);
+        if !self.store.visit_report_while(&mut |group, _, _, _| {
+            let count = if group == first {
+                &mut first_count
+            } else if second.is_none() || second == Some(group) {
+                second = Some(group);
+                &mut second_count
+            } else {
+                return false;
+            };
+            let Some(next) = count.checked_add(1) else {
+                return false;
+            };
+            *count = next;
+            true
+        }) {
+            return false;
+        }
+        if let Some(mut other) = second
+            && other < first
+        {
+            core::mem::swap(&mut first, &mut other);
+            core::mem::swap(&mut first_count, &mut second_count);
+            second = Some(other);
+        }
+        let Some(mut first_data) = Self::group_record(first, first_count) else {
+            return false;
+        };
+        let mut second_data = if let Some(group) = second {
+            let Some(data) = Self::group_record(group, second_count) else {
+                return false;
+            };
+            Some(data)
+        } else {
+            None
+        };
+        let (mut first_offset, mut second_offset) = (BANDWIDTH_HEADER, BANDWIDTH_HEADER);
+        if !self
+            .store
+            .visit_report_while(&mut |group, connection, tx, rx| {
+                if group == first {
+                    Self::encode_counter(
+                        &mut first_data,
+                        &mut first_offset,
+                        first.ipv6,
+                        connection,
+                        tx,
+                        rx,
+                    )
+                } else if let (Some(other), Some(data)) = (second, second_data.as_mut()) {
+                    group == other
+                        && Self::encode_counter(
+                            data,
+                            &mut second_offset,
+                            other.ipv6,
+                            connection,
+                            tx,
+                            rx,
+                        )
+                } else {
+                    false
+                }
+            })
+            || first_offset != first_data.len()
+            || second_data
+                .as_ref()
+                .is_some_and(|data| second_offset != data.len())
+        {
+            return false;
+        }
+        if submit(first_data) {
+            let second_queued = match second_data {
+                Some(data) => submit(data),
+                None => true,
+            };
+            if second_queued {
+                self.store = BandwidthStore::new();
+            } else {
+                self.store.retain_after(first);
+            }
+        }
+        true
     }
     // Reporting and any detached-bank consolidation run outside PolicyLock in
     // the driver path. A failed consolidation leaves all deltas retryable.
@@ -132,16 +247,75 @@ impl BandwidthTable {
         if !self.store.consolidate() {
             return;
         }
-        let mut after = None;
-        while let Some(group) = self.next_group(after) {
-            after = Some(group);
-            let Some(data) = self.encode_group(group) else {
+        if self.report_small_groups(&mut submit) {
+            return;
+        }
+
+        let mut groups = Vec::<(BandwidthGroup, BandwidthReportGroup)>::new();
+        if !self.store.visit_report_while(&mut |group, _, _, _| {
+            let index = match groups.binary_search_by_key(&group, |entry| entry.0) {
+                Ok(index) => index,
+                Err(index) => {
+                    groups.insert(index, (group, BandwidthReportGroup::default()));
+                    index
+                }
+            };
+            let report = &mut groups[index].1;
+            let Some(count) = report.count.checked_add(1) else {
+                return false;
+            };
+            report.count = count;
+            true
+        }) {
+            return;
+        }
+        let mut valid = true;
+        for (group, report) in &mut groups {
+            if valid {
+                report.data = Self::group_record(*group, report.count);
+                report.offset = BANDWIDTH_HEADER;
+                valid = report.data.is_some();
+            }
+        }
+        if !self
+            .store
+            .visit_report_while(&mut |group, connection, tx, rx| {
+                let Ok(index) = groups.binary_search_by_key(&group, |entry| entry.0) else {
+                    return false;
+                };
+                let report = &mut groups[index].1;
+                let Some(data) = report.data.as_mut() else {
+                    return true;
+                };
+                Self::encode_counter(data, &mut report.offset, group.ipv6, connection, tx, rx)
+            })
+            || groups.iter().any(|(_, report)| {
+                report
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| report.offset != data.len())
+            })
+        {
+            return;
+        }
+
+        let mut last = None;
+        let mut complete = true;
+        for (group, report) in groups {
+            let Some(data) = report.data else {
+                complete = false;
                 break;
             };
             if !submit(data) {
+                complete = false;
                 break;
             }
-            self.remove_group(group);
+            last = Some(group);
+        }
+        if complete {
+            self.store = BandwidthStore::new();
+        } else if let Some(group) = last {
+            self.store.retain_after(group);
         }
     }
 }
@@ -151,7 +325,7 @@ pub struct RetiredStorage {
     _events: List<Event>,
     _bandwidth: BandwidthStore,
 }
-#[derive(Default, Clone, Copy, Debug)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stats {
     pub received: u64,
     pub allowed: u64,
@@ -190,6 +364,7 @@ pub struct Engine {
     pending: List<Pending>,
     pending_count: usize,
     interfaces: List<Interface>,
+    idle_forward: u32,
     cache_candidate_count: usize,
     cache_allocator: CacheAllocator,
     events: List<Event>,
@@ -221,6 +396,7 @@ impl Engine {
             pending: List::new(),
             pending_count: 0,
             interfaces: List::new(),
+            idle_forward: 0,
             cache_candidate_count: 0,
             cache_allocator: allocator,
             events: List::new(),
@@ -356,9 +532,14 @@ impl Engine {
     pub fn disconnect(&mut self) {
         self.bandwidth_epoch = self.bandwidth_epoch.wrapping_add(1);
         self.online = false;
+        self.stats = Stats::EMPTY;
         self.clear_events();
         self.clear_cache();
         self.clear_bandwidth();
+        let idle = core::mem::take(&mut self.idle_forward);
+        if idle != 0 {
+            self.reap_idle_forward(idle);
+        }
     }
     pub fn attach(&mut self, interface_index: u32) -> bool {
         if interface_index == 0 {
@@ -384,6 +565,7 @@ impl Engine {
                 forwarding: false,
                 dirty: false,
                 candidate: false,
+                pending: 0,
                 caches: Caches::new(self.cache_allocator),
             })
             .is_ok()
@@ -402,6 +584,16 @@ impl Engine {
             interface.forwarding = true;
             return true;
         }
+        if self.idle_forward != 0
+            && let Some(interface) = self
+                .interfaces
+                .iter_mut()
+                .find(|s| s.interface_index == self.idle_forward && s.idle_forward())
+        {
+            interface.interface_index = interface_index;
+            self.idle_forward = interface_index;
+            return true;
+        }
         self.interfaces
             .try_push_back(Interface {
                 interface_index,
@@ -410,13 +602,55 @@ impl Engine {
                 forwarding: true,
                 dirty: false,
                 candidate: false,
+                pending: 0,
                 caches: Caches::new(self.cache_allocator),
             })
             .is_ok()
     }
+    // Keep at most one idle forward-only row for the next packet. It holds no
+    // cache or pending decision and is released on disconnect or replacement.
+    pub fn reap_idle_forward(&mut self, interface_index: u32) -> bool {
+        let Some(handle) = self
+            .interfaces
+            .find(|interface| interface.interface_index == interface_index)
+        else {
+            return false;
+        };
+        self.reap_idle_forward_handle(handle)
+    }
+    fn reap_idle_forward_handle(&mut self, handle: Handle<Interface>) -> bool {
+        // SAFETY: callers obtained this live handle under exclusive access.
+        let interface = unsafe { self.interfaces.get(handle) };
+        if !interface.idle_forward() {
+            return false;
+        }
+        let index = interface.interface_index;
+        if self.online {
+            if self.idle_forward == index {
+                return true;
+            }
+            let previous = core::mem::replace(&mut self.idle_forward, index);
+            if previous != 0
+                && let Some(old) = self.interfaces.find(|interface| {
+                    interface.interface_index == previous && interface.idle_forward()
+                })
+            {
+                // SAFETY: this old row was just found and owns no cache storage.
+                unsafe { self.interfaces.remove(old) };
+            }
+        } else {
+            if self.idle_forward == index {
+                self.idle_forward = 0;
+            }
+            // SAFETY: this row owns no cache storage or valid pending decision.
+            unsafe { self.interfaces.remove(handle) };
+        }
+        true
+    }
     // Driver shutdown only, never an interface-change notification. Release
     // forward-only rows using the same unlocked cache reclamation as NDIS.
     pub fn stop_forward(&mut self) {
+        self.idle_forward = 0;
         while let Some(handle) = self.interfaces.find(|s| s.forwarding) {
             let index = unsafe { self.interfaces.get(handle) }.interface_index;
             self.invalidate(index, false);
@@ -447,6 +681,7 @@ impl Engine {
             .find(|s| s.interface_index == interface_index && interface_index != 0)
         {
             interface.dirty = interface.caches.bytes() != 0;
+            interface.pending = 0;
             if interface.candidate {
                 interface.candidate = false;
                 self.cache_candidate_count -= 1;
@@ -478,6 +713,7 @@ impl Engine {
                 }
             }
         }
+        self.reap_idle_forward(interface_index);
     }
     fn running(&self, interface_index: u32) -> bool {
         self.interfaces
@@ -499,10 +735,12 @@ impl Engine {
         // after moving out the cache allocations, which the caller frees unlocked.
         let interface = unsafe { self.interfaces.get_mut(handle) };
         interface.dirty = false;
-        let detached = interface.interface_index == 0;
+        let index = interface.interface_index;
         let retired = interface.caches.clear();
-        if detached {
+        if index == 0 {
             unsafe { self.interfaces.remove(handle) };
+        } else {
+            self.reap_idle_forward(index);
         }
         Some(retired)
     }
@@ -548,7 +786,11 @@ impl Engine {
             .caches
             .maintain_range(start, now, work);
         self.update_cache_candidates(handle);
-        unsafe { self.interfaces.get(handle) }.candidate
+        let active = unsafe { self.interfaces.get(handle) }.candidate;
+        if !active {
+            self.reap_idle_forward(interface_index);
+        }
+        active
     }
     // Host helper. The kernel worker uses ranges to release PolicyLock between
     // batches while completing every candidate bank in the same cleanup run.
@@ -570,14 +812,17 @@ impl Engine {
                 .caches
                 .maintain(now, &mut work);
             self.update_cache_candidates(handle);
+            self.reap_idle_forward(index);
         }
     }
+    fn cache_eligible(packet: &Packet) -> bool {
+        packet.cacheable
+            && likely(matches!(packet.connection.protocol, 6 | 17))
+            && packet.flow.protocol == packet.connection.protocol
+            && packet.flow.ipv6 == packet.connection.ipv6
+    }
     fn cache_bank(&self, interface_index: u32, packet: &Packet) -> Option<Handle<Interface>> {
-        if !packet.cacheable
-            || unlikely(!matches!(packet.connection.protocol, 6 | 17))
-            || packet.flow.protocol != packet.connection.protocol
-            || packet.flow.ipv6 != packet.connection.ipv6
-        {
+        if !Self::cache_eligible(packet) {
             return None;
         }
         self.interfaces.find(|interface| {
@@ -612,6 +857,7 @@ impl Engine {
     fn cache_bytes(&self) -> usize {
         self.interfaces.iter().map(|c| c.caches.bytes()).sum()
     }
+    // Call only while the controller session is online.
     fn account(
         &mut self,
         interface_index: u32,
@@ -621,7 +867,7 @@ impl Engine {
     ) {
         if allow {
             self.stats.allowed = self.stats.allowed.saturating_add(1);
-            if self.online && likely(matches!(packet.connection.protocol, 6 | 17)) {
+            if likely(matches!(packet.connection.protocol, 6 | 17)) {
                 self.bandwidth_add_with_work(interface_index, packet, work);
             }
         } else {
@@ -629,19 +875,25 @@ impl Engine {
         }
     }
     pub fn non_ip(&mut self) {
-        self.stats.received = self.stats.received.saturating_add(1);
-        self.stats.non_ip = self.stats.non_ip.saturating_add(1);
-        self.stats.allowed = self.stats.allowed.saturating_add(1);
+        if self.online {
+            self.stats.received = self.stats.received.saturating_add(1);
+            self.stats.non_ip = self.stats.non_ip.saturating_add(1);
+            self.stats.allowed = self.stats.allowed.saturating_add(1);
+        }
     }
     pub fn malformed(&mut self) {
-        self.stats.received = self.stats.received.saturating_add(1);
-        self.stats.malformed = self.stats.malformed.saturating_add(1);
-        self.stats.dropped = self.stats.dropped.saturating_add(1);
+        if self.online {
+            self.stats.received = self.stats.received.saturating_add(1);
+            self.stats.malformed = self.stats.malformed.saturating_add(1);
+            self.stats.dropped = self.stats.dropped.saturating_add(1);
+        }
     }
     pub fn resource_drop(&mut self) {
-        self.stats.received = self.stats.received.saturating_add(1);
-        self.stats.overflow = self.stats.overflow.saturating_add(1);
-        self.stats.dropped = self.stats.dropped.saturating_add(1);
+        if self.online {
+            self.stats.received = self.stats.received.saturating_add(1);
+            self.stats.overflow = self.stats.overflow.saturating_add(1);
+            self.stats.dropped = self.stats.dropped.saturating_add(1);
+        }
     }
     fn event_room(&self, packet: &Packet) -> bool {
         self.has_room(connection_header_len(&packet.connection) + packet.payload_len as usize)
@@ -667,28 +919,52 @@ impl Engine {
         nbl: usize,
         now: u64,
         work: &mut BandwidthWork,
-    ) -> Option<Action> {
-        let allow = if !self.running(interface_index) {
+    ) -> (Option<Action>, Option<Handle<Interface>>) {
+        let interface = self
+            .interfaces
+            .find(|interface| interface.interface_index == interface_index);
+        let active = interface.is_some_and(|handle| {
+            // SAFETY: the handle was just found in this live list.
+            let interface = unsafe { self.interfaces.get(handle) };
+            interface.running || interface.forwarding
+        });
+        if !self.online {
+            return (
+                Some(Action {
+                    nbl,
+                    finish: if active {
+                        self.fallback()
+                    } else {
+                        Finish::Drop
+                    },
+                }),
+                interface,
+            );
+        }
+        let allow = if !active {
             false
-        } else if !self.online {
-            self.fallback() == Finish::Allow
         } else {
-            let bank = self.cache_bank(interface_index, packet)?;
-            // SAFETY: cache_bank found this live node under exclusive engine access.
-            let allow = unsafe { self.interfaces.get_mut(bank) }.caches.apply(
-                &packet.connection,
-                now,
-                self.cache_ttl,
-            )?;
+            let handle = interface.expect("active interface has a live handle");
+            // SAFETY: the live handle remains valid throughout this locked call.
+            let bank = unsafe { self.interfaces.get_mut(handle) };
+            if bank.dirty || !Self::cache_eligible(packet) {
+                return (None, interface);
+            }
+            let Some(allow) = bank.caches.apply(&packet.connection, now, self.cache_ttl) else {
+                return (None, interface);
+            };
             self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
             allow
         };
         self.stats.received = self.stats.received.saturating_add(1);
         self.account(interface_index, packet, allow, work);
-        Some(Action {
-            nbl,
-            finish: if allow { Finish::Allow } else { Finish::Drop },
-        })
+        (
+            Some(Action {
+                nbl,
+                finish: if allow { Finish::Allow } else { Finish::Drop },
+            }),
+            interface,
+        )
     }
     // The driver returns cache hits here: one lookup, no packet capture or second
     // policy-lock acquisition. Only misses proceed to the unlocked event copy.
@@ -710,7 +986,7 @@ impl Engine {
         now: u64,
         work: &mut BandwidthWork,
     ) -> Result<bool, Action> {
-        if let Some(action) = self.immediate(interface_index, packet, nbl, now, work) {
+        if let (Some(action), _) = self.immediate(interface_index, packet, nbl, now, work) {
             Err(action)
         } else {
             Ok(self.event_room(packet))
@@ -740,6 +1016,39 @@ impl Engine {
         let mut work = BandwidthWork::prepare(self.bandwidth_plan());
         self.submit_with_work(interface_index, packet, nbl, cancel, now, record, &mut work)
     }
+    // Re-establish forward-only membership atomically with publication. The
+    // row can be reaped while a classifier captures bytes outside PolicyLock.
+    pub fn submit_forward_with_work(
+        &mut self,
+        interface_index: u32,
+        packet: Packet,
+        nbl: usize,
+        now: u64,
+        record: Option<Vec<u8>>,
+        work: &mut BandwidthWork,
+    ) -> Submission {
+        if !self.online {
+            // The controller may disconnect while this classifier captures the
+            // packet. Retire its now-idle row without collecting traffic stats.
+            self.reap_idle_forward(interface_index);
+            return Submission::Finish(Action {
+                nbl,
+                finish: self.fallback(),
+            });
+        }
+        if !self.ensure_forward(interface_index) {
+            self.resource_drop();
+            return Submission::Finish(Action {
+                nbl,
+                finish: Finish::Drop,
+            });
+        }
+        let result = self.submit_with_work(interface_index, packet, nbl, None, now, record, work);
+        if matches!(result, Submission::Finish(_)) {
+            self.reap_idle_forward(interface_index);
+        }
+        result
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn submit_with_work(
         &mut self,
@@ -751,7 +1060,8 @@ impl Engine {
         record: Option<Vec<u8>>,
         work: &mut BandwidthWork,
     ) -> Submission {
-        if let Some(action) = self.immediate(interface_index, &packet, nbl, now, work) {
+        let (action, interface) = self.immediate(interface_index, &packet, nbl, now, work);
+        if let Some(action) = action {
             return Submission::Finish(action);
         }
         self.stats.received = self.stats.received.saturating_add(1);
@@ -789,6 +1099,19 @@ impl Engine {
                 finish: Finish::Drop,
             });
         }
+        let Some(interface) = interface else {
+            self.account(interface_index, &packet, false, work);
+            return Submission::Finish(Action {
+                nbl,
+                finish: Finish::Drop,
+            });
+        };
+        let Some(interface_pending) = (unsafe { self.interfaces.get(interface) })
+            .pending
+            .checked_add(1)
+        else {
+            return self.overflow(interface_index, &packet, nbl, work);
+        };
         let Ok(handle) = self.pending.try_push_back(Pending {
             id,
             nbl,
@@ -808,6 +1131,7 @@ impl Engine {
         };
         // SAFETY: both nodes are live and no handles escape the locked engine.
         unsafe { self.pending.get_mut(handle) }.event = Some(event);
+        unsafe { self.interfaces.get_mut(interface) }.pending = interface_pending;
         self.next_id += 1;
         self.pending_count += 1;
         self.stats.queued = self.stats.queued.saturating_add(1);
@@ -841,12 +1165,27 @@ impl Engine {
             unsafe { self.pending.remove(handle) };
         }
         self.pending_count -= 1;
-        self.account(
-            p.interface_index,
-            &p.packet,
-            finish == Finish::Allow,
-            bandwidth,
-        );
+        let interface = self
+            .interfaces
+            .find(|interface| interface.interface_index == p.interface_index);
+        if !p.invalidated
+            && let Some(interface) = interface
+        {
+            // SAFETY: this handle was found in the live interface list above.
+            let interface = unsafe { self.interfaces.get_mut(interface) };
+            interface.pending = interface.pending.saturating_sub(1);
+        }
+        if self.online {
+            self.account(
+                p.interface_index,
+                &p.packet,
+                finish == Finish::Allow,
+                bandwidth,
+            );
+        }
+        if let Some(interface) = interface {
+            self.reap_idle_forward_handle(interface);
+        }
         Action { nbl: p.nbl, finish }
     }
     pub fn verdict(&mut self, id: u64, verdict: Verdict, now: u64) -> Result<Action, VerdictError> {
@@ -917,7 +1256,9 @@ impl Engine {
         // SAFETY: the handle was just found under exclusive engine access.
         let p = *unsafe { self.pending.get(handle) };
         let finish = if p.invalidated {
-            self.stats.invalidated = self.stats.invalidated.saturating_add(1);
+            if self.online {
+                self.stats.invalidated = self.stats.invalidated.saturating_add(1);
+            }
             Finish::Drop
         } else if !self.online {
             self.fallback()
@@ -931,7 +1272,9 @@ impl Engine {
         let handle = self.pending.find(|p| {
             p.id != 0 && p.interface_index == interface_index && p.cancel == Some(cancel)
         })?;
-        self.stats.cancelled = self.stats.cancelled.saturating_add(1);
+        if self.online {
+            self.stats.cancelled = self.stats.cancelled.saturating_add(1);
+        }
         // Cancellation never admits bytes and cannot consume bandwidth storage.
         Some(self.claim(handle, Finish::Cancel, &mut BandwidthWork::empty()))
     }
@@ -999,10 +1342,27 @@ impl Engine {
     pub fn bandwidth_plan(&self) -> Option<BandwidthPlan> {
         self.online.then(|| self.bandwidth.plan()).flatten()
     }
-    pub fn install_bandwidth_work(&mut self, work: &mut BandwidthWork) {
-        if self.online {
-            self.bandwidth.install(work);
+    // The synchronous slow path retries only the accounting operation, never
+    // the packet decision. A session reset invalidates its captured epoch.
+    pub fn complete_bandwidth(
+        &mut self,
+        deferred: &DeferredBandwidth,
+        work: &mut BandwidthWork,
+    ) -> Option<BandwidthPlan> {
+        if !self.online || self.bandwidth_epoch != deferred.epoch {
+            return None;
         }
+        match self.bandwidth.try_add(
+            deferred.interface_index,
+            &deferred.connection,
+            deferred.bytes,
+            work,
+        ) {
+            Ok(Some(added)) => self.bandwidth_count += usize::from(added),
+            Ok(None) => self.stats.overflow = self.stats.overflow.saturating_add(1),
+            Err(plan) => return Some(plan),
+        }
+        None
     }
     #[cfg(test)]
     fn bandwidth_add(&mut self, interface_index: u32, p: &Packet) {
@@ -1017,10 +1377,20 @@ impl Engine {
     ) {
         match self
             .bandwidth
-            .add(interface_index, &p.connection, p.ip_len, work)
+            .try_add(interface_index, &p.connection, p.ip_len, work)
         {
-            Some(added) => self.bandwidth_count += usize::from(added),
-            None => self.stats.overflow = self.stats.overflow.saturating_add(1),
+            Ok(Some(added)) => self.bandwidth_count += usize::from(added),
+            Err(plan) if work.defer_missing => {
+                debug_assert!(work.deferred.is_none());
+                work.deferred = Some(DeferredBandwidth {
+                    interface_index,
+                    connection: p.connection,
+                    bytes: p.ip_len,
+                    epoch: self.bandwidth_epoch,
+                    plan,
+                });
+            }
+            Ok(None) | Err(_) => self.stats.overflow = self.stats.overflow.saturating_add(1),
         }
     }
     pub fn begin_bandwidth(&mut self, table: &mut BandwidthTable) -> bool {
@@ -1173,6 +1543,19 @@ mod tests {
     fn record(p: &Packet) -> Option<Vec<u8>> {
         allocate_record(connection_header_len(&p.connection) + p.payload_len as usize)
     }
+    fn complete_deferred(e: &mut Engine, work: &mut BandwidthWork) -> bool {
+        let Some(deferred) = work.take_deferred() else {
+            return false;
+        };
+        let mut plan = deferred.plan();
+        loop {
+            let mut prepared = BandwidthWork::prepare(Some(plan));
+            match e.complete_bandwidth(&deferred, &mut prepared) {
+                Some(next) => plan = next,
+                None => return true,
+            }
+        }
+    }
     fn submit(e: &mut Engine, interface_index: u32, t: usize) -> u64 {
         let p = packet();
         match e.submit(interface_index, p, t, None, 100, record(&p)) {
@@ -1180,6 +1563,290 @@ mod tests {
             _ => panic!("expected pending"),
         }
     }
+    #[test]
+    fn forward_only_rows_remain_bounded_and_reuse_the_idle_row() {
+        let mut e = Engine::new();
+        e.connect();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        let p = packet();
+        let mut first_row = core::ptr::null();
+        for index in 1..=1000 {
+            let mut work = BandwidthWork::prepare(e.bandwidth_plan());
+            let Submission::Pending(id) =
+                e.submit_forward_with_work(index, p, index as usize, 100, record(&p), &mut work)
+            else {
+                panic!("expected pending forward packet");
+            };
+            drop(work);
+            assert_eq!(
+                e.verdict(id, Verdict::Drop, 101).unwrap().nbl,
+                index as usize
+            );
+            assert_eq!(e.interfaces.len(), 1);
+            let row = e.interfaces.front().unwrap() as *const Interface;
+            if index == 1 {
+                first_row = row;
+            } else {
+                assert_eq!(row, first_row);
+            }
+        }
+        let address = e.interfaces.front().unwrap() as *const Interface;
+        let mut work = BandwidthWork::prepare(e.bandwidth_plan());
+        let Submission::Pending(id) =
+            e.submit_forward_with_work(1000, p, 1001, 102, record(&p), &mut work)
+        else {
+            panic!("expected pending forward packet");
+        };
+        e.verdict(id, Verdict::Drop, 103).unwrap();
+        assert_eq!(e.interfaces.front().unwrap() as *const Interface, address);
+        e.disconnect();
+        assert!(e.interfaces.is_empty());
+    }
+
+    #[test]
+    fn forward_rows_survive_pending_and_live_cache_until_expiry() {
+        let mut e = Engine::new();
+        e.connect();
+        let p = packet();
+        let mut work = BandwidthWork::prepare(e.bandwidth_plan());
+        let Submission::Pending(first) =
+            e.submit_forward_with_work(7, p, 1, 100, record(&p), &mut work)
+        else {
+            panic!("expected first pending packet");
+        };
+        let Submission::Pending(second) =
+            e.submit_forward_with_work(7, p, 2, 100, record(&p), &mut work)
+        else {
+            panic!("expected second pending packet");
+        };
+        drop(work);
+        assert!(!e.reap_idle_forward(7));
+        e.verdict(first, Verdict::Drop, 101).unwrap();
+        assert_eq!(e.interfaces.len(), 1);
+        e.verdict(second, Verdict::PermanentAccept, 101).unwrap();
+        assert_eq!(e.interfaces.len(), 1);
+        assert!(!e.reap_idle_forward(7));
+        e.clean(60101);
+        assert_eq!(e.interfaces.len(), 1);
+        e.disconnect();
+        assert!(e.interfaces.is_empty());
+    }
+
+    #[test]
+    fn forwarding_rechecks_membership_after_unlocked_packet_capture() {
+        let mut e = Engine::new();
+        e.connect();
+        let p = packet();
+        let mut work = BandwidthWork::prepare(e.bandwidth_plan());
+        let Submission::Pending(first) =
+            e.submit_forward_with_work(7, p, 1, 100, record(&p), &mut work)
+        else {
+            panic!("expected first pending packet");
+        };
+        assert!(e.preflight_with_work(7, &p, 2, 100, &mut work).unwrap());
+        e.verdict(first, Verdict::Drop, 101).unwrap();
+        assert!(e.ensure_forward(8));
+        assert!(e.reap_idle_forward(8));
+        assert!(
+            e.interfaces
+                .iter()
+                .all(|interface| interface.interface_index != 7)
+        );
+        let Submission::Pending(second) =
+            e.submit_forward_with_work(7, p, 2, 102, record(&p), &mut work)
+        else {
+            panic!("forward membership must be restored before publication");
+        };
+        assert_eq!(e.verdict(second, Verdict::Accept, 103).unwrap().nbl, 2);
+        assert_eq!(e.interfaces.len(), 1);
+        e.configure(8000, 60000, false);
+        assert!(e.ensure_forward(7));
+        assert!(e.preflight_with_work(7, &p, 3, 104, &mut work).unwrap());
+        e.disconnect();
+        assert_eq!(
+            e.submit_forward_with_work(7, p, 3, 104, record(&p), &mut work),
+            Submission::Finish(Action {
+                nbl: 3,
+                finish: Finish::Allow,
+            })
+        );
+        assert!(e.interfaces.is_empty());
+    }
+
+    #[test]
+    fn disconnected_forward_after_capture_does_not_account_for_fallback() {
+        for fail_closed in [false, true] {
+            let mut e = Engine::new();
+            e.configure(8000, 60000, fail_closed);
+            e.connect();
+            let p = packet();
+            let mut work = BandwidthWork::defer_missing();
+            assert!(e.ensure_forward(7));
+            assert!(e.preflight_with_work(7, &p, 1, 100, &mut work).unwrap());
+            e.disconnect();
+            let finish = if fail_closed {
+                Finish::Drop
+            } else {
+                Finish::Allow
+            };
+            assert_eq!(
+                e.submit_forward_with_work(7, p, 1, 101, record(&p), &mut work),
+                Submission::Finish(Action { nbl: 1, finish })
+            );
+            assert_eq!(e.stats, Stats::EMPTY);
+            assert_eq!(e.bandwidth_count, 0);
+            assert!(work.take_deferred().is_none());
+            assert!(e.interfaces.is_empty());
+        }
+    }
+
+    #[test]
+    fn traffic_statistics_stop_offline_and_restart_with_a_new_session() {
+        for fail_closed in [false, true] {
+            let mut e = Engine::new();
+            e.configure(8000, 60000, fail_closed);
+            assert!(e.attach(101));
+            assert!(e.restart(101));
+            let p = packet();
+            let fallback = if fail_closed {
+                Finish::Drop
+            } else {
+                Finish::Allow
+            };
+            assert_eq!(
+                e.preflight(101, &p, 1, 100),
+                Err(Action {
+                    nbl: 1,
+                    finish: fallback,
+                })
+            );
+            e.non_ip();
+            e.malformed();
+            e.resource_drop();
+            assert_eq!(e.stats(), Stats::EMPTY);
+            assert!(!e.bandwidth.has_storage());
+
+            e.connect();
+            e.read(&mut [0; MAX_LOG_RECORD]);
+            let first = submit(&mut e, 101, 2);
+            e.verdict(first, Verdict::Accept, 101).unwrap();
+            assert_eq!(e.stats().received, 1);
+            assert_eq!(e.stats().allowed, 1);
+            assert_eq!(e.bandwidth_count, 1);
+            e.non_ip();
+            e.malformed();
+            e.resource_drop();
+            assert_eq!(e.stats().received, 4);
+            assert_eq!(e.stats().allowed, 2);
+            assert_eq!(e.stats().dropped, 2);
+            assert_eq!(e.stats().non_ip, 1);
+            assert_eq!(e.stats().malformed, 1);
+            assert_eq!(e.stats().overflow, 1);
+            assert!(matches!(
+                e.submit(101, p, 3, Some(7), 102, record(&p)),
+                Submission::Pending(_)
+            ));
+            let _second = submit(&mut e, 101, 4);
+            e.invalidate(101, false);
+            e.disconnect();
+            assert_eq!(e.stats(), Stats::EMPTY);
+            assert!(!e.bandwidth.has_storage());
+            assert!(e.retired_bandwidth.has_storage());
+            assert_eq!(e.cancel(101, 7).unwrap().finish, Finish::Cancel);
+            assert_eq!(e.take_due(103).unwrap().finish, Finish::Drop);
+            e.non_ip();
+            e.malformed();
+            e.resource_drop();
+            assert_eq!(e.stats(), Stats::EMPTY);
+            while let Some(retired) = e.take_retired_storage() {
+                drop(retired);
+            }
+            assert!(!e.retired_bandwidth.has_storage());
+
+            e.connect();
+            e.read(&mut [0; MAX_LOG_RECORD]);
+            let next = submit(&mut e, 101, 5);
+            e.verdict(next, Verdict::Accept, 101).unwrap();
+            assert_eq!(e.stats().received, 1);
+            assert_eq!(e.stats().allowed, 1);
+            e.bandwidth();
+            assert_eq!(bandwidth_rows(&mut e), [(101, 17, false, 0, 100, 0)]);
+        }
+    }
+
+    #[test]
+    fn invalidated_forward_claim_does_not_change_new_pending_count() {
+        let mut e = Engine::new();
+        e.connect();
+        let p = packet();
+        let mut work = BandwidthWork::prepare(e.bandwidth_plan());
+        let Submission::Pending(old) =
+            e.submit_forward_with_work(7, p, 1, 100, record(&p), &mut work)
+        else {
+            panic!("expected old packet");
+        };
+        e.invalidate(7, false);
+        let Submission::Pending(new) =
+            e.submit_forward_with_work(7, p, 2, 101, record(&p), &mut work)
+        else {
+            panic!("expected new packet");
+        };
+        assert!(e.verdict(old, Verdict::Accept, 102).is_err());
+        assert_eq!(e.take_due_with_work(102, &mut work).unwrap().nbl, 1);
+        assert!(!e.reap_idle_forward(7));
+        assert_eq!(e.verdict(new, Verdict::Accept, 103).unwrap().nbl, 2);
+        assert_eq!(e.interfaces.len(), 1);
+        e.disconnect();
+        assert!(e.interfaces.is_empty());
+    }
+
+    #[test]
+    fn replacing_idle_forward_row_preserves_pending_and_attached_rows() {
+        let mut e = Engine::new();
+        e.connect();
+        let p = packet();
+        let mut work = BandwidthWork::prepare(e.bandwidth_plan());
+        let Submission::Pending(first) =
+            e.submit_forward_with_work(1, p, 1, 100, record(&p), &mut work)
+        else {
+            panic!("expected pending packet");
+        };
+        e.verdict(first, Verdict::Drop, 101).unwrap();
+        let Submission::Pending(still_pending) =
+            e.submit_forward_with_work(1, p, 2, 102, record(&p), &mut work)
+        else {
+            panic!("expected pending packet");
+        };
+        let Submission::Pending(other) =
+            e.submit_forward_with_work(2, p, 3, 102, record(&p), &mut work)
+        else {
+            panic!("expected pending packet");
+        };
+        e.verdict(other, Verdict::Drop, 103).unwrap();
+        assert_eq!(e.interfaces.len(), 2);
+        e.verdict(still_pending, Verdict::Drop, 103).unwrap();
+        assert_eq!(e.interfaces.len(), 1);
+        assert!(e.attach(1));
+        assert!(e.ensure_forward(2));
+        assert!(e.reap_idle_forward(2));
+        assert_eq!(e.interfaces.len(), 2);
+        assert!(
+            e.interfaces
+                .iter()
+                .any(|interface| interface.interface_index == 1 && interface.ndis_attached)
+        );
+        e.disconnect();
+        assert_eq!(e.interfaces.len(), 1);
+    }
+
+    #[test]
+    fn forwarding_reap_never_removes_an_attached_ndis_row() {
+        let mut e = default_engine();
+        assert!(e.ensure_forward(101));
+        assert!(!e.reap_idle_forward(101));
+        assert!(e.preflight(101, &packet(), 1, 100).unwrap());
+    }
+
     #[test]
     fn pending_events_grow_past_old_counts_and_preserve_every_id_and_packet() {
         const COUNT: usize = 4097;
@@ -1423,6 +2090,126 @@ mod tests {
     }
 
     #[test]
+    fn matching_group_edges_do_not_hide_interleaved_counters() {
+        let mut e = engine();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        let mut tcp = packet();
+        tcp.connection.protocol = 6;
+        tcp.connection.local_port = 11;
+        let mut udp = packet();
+        udp.connection.local_port = 22;
+        let mut other_tcp = tcp;
+        other_tcp.connection.local_port = 33;
+        e.bandwidth_add(101, &tcp);
+        e.bandwidth_add(101, &udp);
+        e.bandwidth_add(101, &other_tcp);
+
+        e.bandwidth();
+        assert_eq!(
+            bandwidth_rows(&mut e),
+            [
+                (101, 6, false, 11, 100, 0),
+                (101, 6, false, 33, 100, 0),
+                (101, 17, false, 22, 100, 0),
+            ]
+        );
+        assert_eq!(e.bandwidth_count, 0);
+    }
+
+    #[test]
+    fn rejected_single_group_keeps_all_counters_for_retry() {
+        let mut e = engine();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        e.bandwidth_add(101, &packet());
+        let mut table = BandwidthTable::new();
+        assert!(e.begin_bandwidth(&mut table));
+        let before = table.store.bytes();
+        table.report(|_| false);
+        assert_eq!(table.store.bytes(), before);
+        assert_eq!(table.store.len(), 1);
+        assert!(e.finish_bandwidth(&mut table));
+        e.bandwidth();
+        assert_eq!(bandwidth_rows(&mut e), [(101, 17, false, 0, 100, 0)]);
+    }
+
+    #[test]
+    fn reversed_two_groups_preserve_unqueued_counters() {
+        let mut e = engine();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        let mut udp = packet();
+        udp.connection.local_port = 11;
+        let mut tcp = packet();
+        tcp.connection.protocol = 6;
+        tcp.connection.local_port = 22;
+        let mut other_udp = udp;
+        other_udp.connection.local_port = 33;
+        e.bandwidth_add(101, &udp);
+        e.bandwidth_add(101, &tcp);
+        e.bandwidth_add(101, &other_udp);
+
+        let mut table = BandwidthTable::new();
+        assert!(e.begin_bandwidth(&mut table));
+        let epoch = table.epoch();
+        let mut groups = 0;
+        table.report(|data| {
+            groups += 1;
+            groups == 1 && e.queue_bandwidth(epoch, data).is_ok()
+        });
+        assert_eq!(groups, 2);
+        assert!(e.finish_bandwidth(&mut table));
+        assert_eq!(bandwidth_rows(&mut e), [(101, 6, false, 22, 100, 0)]);
+        e.bandwidth();
+        assert_eq!(
+            bandwidth_rows(&mut e),
+            [(101, 17, false, 11, 100, 0), (101, 17, false, 33, 100, 0)]
+        );
+    }
+
+    #[test]
+    fn partial_three_group_report_keeps_every_unqueued_delta() {
+        let mut e = engine();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        for n in 0..9 {
+            let mut p = packet();
+            p.connection.local_port = n + 1;
+            p.connection.protocol = if n % 3 == 2 { 17 } else { 6 };
+            p.connection.ipv6 = n % 3 == 1;
+            e.bandwidth_add(101, &p);
+        }
+        let mut table = BandwidthTable::new();
+        assert!(e.begin_bandwidth(&mut table));
+        let epoch = table.epoch();
+        let mut groups = 0;
+        table.report(|data| {
+            groups += 1;
+            groups == 1 && e.queue_bandwidth(epoch, data).is_ok()
+        });
+        assert_eq!(groups, 2);
+        assert!(e.finish_bandwidth(&mut table));
+        assert_eq!(
+            bandwidth_rows(&mut e),
+            [
+                (101, 6, false, 1, 100, 0),
+                (101, 6, false, 4, 100, 0),
+                (101, 6, false, 7, 100, 0)
+            ]
+        );
+        e.bandwidth();
+        assert_eq!(
+            bandwidth_rows(&mut e),
+            [
+                (101, 6, true, 2, 100, 0),
+                (101, 6, true, 5, 100, 0),
+                (101, 6, true, 8, 100, 0),
+                (101, 17, false, 3, 100, 0),
+                (101, 17, false, 6, 100, 0),
+                (101, 17, false, 9, 100, 0),
+            ]
+        );
+        assert_eq!(e.bandwidth_count, 0);
+    }
+
+    #[test]
     fn partial_bandwidth_report_retains_deltas_and_merges_concurrent_full_keys() {
         let mut e = engine();
         e.read(&mut [0; MAX_LOG_RECORD]);
@@ -1473,6 +2260,198 @@ mod tests {
         assert_eq!(e.bandwidth_count, 0);
         e.bandwidth();
         assert!(!e.has_events());
+    }
+
+    #[test]
+    fn partial_report_reclaims_sent_storage_before_retry() {
+        let mut e = engine();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        let mut tcp = packet();
+        tcp.connection.protocol = 6;
+        for n in 0..512u32 {
+            tcp.connection.remote_ip[..4].copy_from_slice(&n.to_le_bytes());
+            e.bandwidth_add(101, &tcp);
+        }
+        let udp = packet();
+        e.bandwidth_add(101, &udp);
+        let before = e.bandwidth.bytes();
+        let mut table = BandwidthTable::new();
+        assert!(e.begin_bandwidth(&mut table));
+        let epoch = table.epoch();
+        let mut groups = 0;
+        table.report(|data| {
+            groups += 1;
+            groups == 1 && e.queue_bandwidth(epoch, data).is_ok()
+        });
+        assert_eq!(groups, 2);
+        assert!(e.finish_bandwidth(&mut table));
+        assert_eq!(e.bandwidth_count, 1);
+        assert!(e.retry_bandwidth.bytes() < before / 4);
+        let mut output = vec![0; 20_000];
+        assert!(e.read(&mut output) > 0);
+        e.bandwidth();
+        assert_eq!(bandwidth_rows(&mut e), [(101, 17, false, 0, 100, 0)]);
+        assert_eq!(e.bandwidth_count, 0);
+    }
+
+    #[test]
+    fn unused_prepared_bandwidth_work_does_not_publish_an_empty_bank() {
+        let mut e = engine();
+        let p = packet();
+        let mut work = BandwidthWork::prepare(e.bandwidth_plan());
+        assert!(e.preflight_with_work(101, &p, 1, 100, &mut work).unwrap());
+        drop(work);
+        assert_eq!(e.bandwidth_count, 0);
+        assert!(!e.bandwidth.has_storage());
+        e.bandwidth();
+        assert!(!e.bandwidth.has_storage());
+    }
+
+    #[test]
+    fn bandwidth_preparation_occurs_only_after_actual_accounting_needs_it() {
+        let mut e = engine();
+        let p = packet();
+        e.configure(2000, 60000, true);
+        let mut bandwidth = BandwidthWork::defer_missing();
+        assert!(
+            e.preflight_with_work(101, &p, 1, 100, &mut bandwidth)
+                .unwrap()
+        );
+        assert!(!complete_deferred(&mut e, &mut bandwidth));
+        let Submission::Pending(id) =
+            e.submit_with_work(101, p, 1, None, 100, record(&p), &mut bandwidth)
+        else {
+            panic!("expected pending packet");
+        };
+        assert!(!complete_deferred(&mut e, &mut bandwidth));
+        assert!(!e.bandwidth.has_storage());
+        let mut cache = CacheWork::prepare(e.cache_plan(id, Verdict::PermanentAccept, 101));
+        assert_eq!(
+            e.verdict_with_work(
+                id,
+                Verdict::PermanentAccept,
+                101,
+                &mut cache,
+                &mut bandwidth
+            )
+            .unwrap()
+            .finish,
+            Finish::Allow
+        );
+        assert_eq!(e.bandwidth_count, 0);
+        assert!(complete_deferred(&mut e, &mut bandwidth));
+        assert_eq!(e.bandwidth_count, 1);
+        assert_eq!(
+            e.preflight_with_work(101, &p, 2, 102, &mut bandwidth)
+                .unwrap_err()
+                .finish,
+            Finish::Allow
+        );
+        assert!(!complete_deferred(&mut e, &mut bandwidth));
+        e.bandwidth();
+        assert_eq!(e.bandwidth_count, 0);
+        assert_eq!(
+            e.preflight_with_work(101, &p, 3, 103, &mut bandwidth)
+                .unwrap_err()
+                .finish,
+            Finish::Allow
+        );
+        assert!(complete_deferred(&mut e, &mut bandwidth));
+        assert_eq!(e.bandwidth_count, 1);
+    }
+
+    #[test]
+    fn deferred_bandwidth_covers_fail_open_timeout_and_capture_failure() {
+        let mut e = engine();
+        let p = packet();
+        let mut bandwidth = BandwidthWork::defer_missing();
+        assert_eq!(
+            e.submit_with_work(101, p, 1, None, 100, None, &mut bandwidth),
+            Submission::Finish(Action {
+                nbl: 1,
+                finish: Finish::Allow
+            })
+        );
+        assert!(complete_deferred(&mut e, &mut bandwidth));
+        assert_eq!(e.bandwidth_count, 1);
+        e.bandwidth();
+        assert_eq!(e.bandwidth_count, 0);
+        let Submission::Pending(_) =
+            e.submit_with_work(101, p, 2, None, 100, record(&p), &mut bandwidth)
+        else {
+            panic!("expected pending packet");
+        };
+        assert!(!complete_deferred(&mut e, &mut bandwidth));
+        assert!(e.take_due_with_work(2099, &mut bandwidth).is_none());
+        assert_eq!(
+            e.take_due_with_work(2100, &mut bandwidth).unwrap().finish,
+            Finish::Allow
+        );
+        assert!(complete_deferred(&mut e, &mut bandwidth));
+        assert_eq!(e.bandwidth_count, 1);
+    }
+
+    #[test]
+    fn fail_open_accounts_when_pending_publication_fails() {
+        for fail_event in [false, true] {
+            let mut e = engine();
+            e.events.fail_allocations = fail_event;
+            e.pending.fail_allocations = !fail_event;
+            let p = packet();
+            let mut bandwidth = BandwidthWork::defer_missing();
+            assert_eq!(
+                e.submit_with_work(101, p, 1, None, 100, record(&p), &mut bandwidth),
+                Submission::Finish(Action {
+                    nbl: 1,
+                    finish: Finish::Allow
+                })
+            );
+            assert!(complete_deferred(&mut e, &mut bandwidth));
+            assert_eq!(e.bandwidth_count, 1);
+            assert_eq!(e.pending_count, 0);
+        }
+    }
+
+    #[test]
+    fn deferred_bandwidth_does_not_cross_a_session_reset() {
+        let mut e = engine();
+        let p = packet();
+        let mut bandwidth = BandwidthWork::defer_missing();
+        assert!(matches!(
+            e.submit_with_work(101, p, 1, None, 100, None, &mut bandwidth),
+            Submission::Finish(Action {
+                finish: Finish::Allow,
+                ..
+            })
+        ));
+        e.disconnect();
+        e.connect();
+        assert!(complete_deferred(&mut e, &mut bandwidth));
+        assert_eq!(e.bandwidth_count, 0);
+        assert!(!e.bandwidth.has_storage());
+    }
+
+    #[test]
+    fn concurrent_deferred_same_key_accounts_each_packet_once() {
+        let mut e = engine();
+        let p = packet();
+        let mut first = BandwidthWork::defer_missing();
+        let mut second = BandwidthWork::defer_missing();
+        for work in [&mut first, &mut second] {
+            assert!(matches!(
+                e.submit_with_work(101, p, 1, None, 100, None, work),
+                Submission::Finish(Action {
+                    finish: Finish::Allow,
+                    ..
+                })
+            ));
+        }
+        assert!(complete_deferred(&mut e, &mut first));
+        assert!(complete_deferred(&mut e, &mut second));
+        assert_eq!(e.bandwidth_count, 1);
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        e.bandwidth();
+        assert_eq!(bandwidth_rows(&mut e), [(101, 17, false, 0, 200, 0)]);
     }
 
     #[test]
@@ -3224,40 +4203,6 @@ mod tests {
         e.clear_cache();
         e.clean(102);
         assert_eq!(e.cache_bytes(), 0);
-    }
-    #[test]
-    fn cache_allocation_failure_does_not_change_current_packet_verdict() {
-        unsafe fn fail(_: usize) -> *mut u8 {
-            core::ptr::null_mut()
-        }
-        unsafe fn free(_: *mut u8, _: usize) {
-            panic!("no allocation should exist");
-        }
-        for verdict in [
-            Verdict::PermanentAccept,
-            Verdict::PermanentBlock,
-            Verdict::PermanentDrop,
-        ] {
-            let allocator = unsafe { CacheAllocator::new(fail, free) };
-            let mut e = Box::new(Engine::with_cache_allocator(allocator));
-            assert!(e.attach(101));
-            assert!(e.restart(101));
-            e.connect();
-            let k = 101;
-            let id = submit(&mut e, k, 1);
-            let action = e.verdict(id, verdict, 101).unwrap();
-            assert_eq!(
-                action.finish,
-                if verdict.allows() {
-                    Finish::Allow
-                } else {
-                    Finish::Drop
-                }
-            );
-            assert_eq!(e.cache_bytes(), 0);
-            assert_eq!(e.stats().cache_allocation_failures, 1);
-            assert_eq!(e.preflight(k, &packet(), 2, 102), Ok(true));
-        }
     }
     #[test]
     fn cache_ignores_ethernet_but_separates_protocol_and_interface() {

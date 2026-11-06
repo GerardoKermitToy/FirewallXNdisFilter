@@ -88,15 +88,12 @@ pub(crate) unsafe fn packet_context(nbl: *mut NET_BUFFER_LIST) -> *mut PacketCon
 #[inline]
 pub(crate) unsafe fn allocate_packet_context(nbl: *mut NET_BUFFER_LIST) -> *mut PacketContext {
     unsafe {
-        if api::NdisAllocateNetBufferListContext(
+        api::NdisAllocateNetBufferListContext(
             nbl,
             size_of::<PacketContext>() as u16,
             0,
             CONTEXT_TAG,
-        ) != HV_WDK_NDIS_STATUS_SUCCESS as NDIS_STATUS
-        {
-            return null_mut();
-        }
+        );
         let context = context_data(nbl);
         ptr::write_bytes(context, 0, 1);
         (*context).signature = CONTEXT_TAG;
@@ -275,9 +272,6 @@ pub(crate) unsafe fn copy_receive(
             return null_mut();
         }
         let copy = api::NdisAllocateNetBufferList(nbl_pool, 0, 0);
-        if copy.is_null() {
-            return null_mut();
-        }
         set_first_nb(copy, null_mut());
         set_next_nbl(copy, null_mut());
         let mut tail: *mut NET_BUFFER = null_mut();
@@ -288,15 +282,11 @@ pub(crate) unsafe fn copy_receive(
                 free_receive_copy(copy);
                 return null_mut();
             }
-            let storage = api::ExAllocatePool2(
+            let storage = crate::native::pool_allocation(api::ExAllocatePool2(
                 HV_WDK_POOL_FLAG_NON_PAGED as POOL_FLAGS,
                 length as SIZE_T,
                 TAG,
-            );
-            if storage.is_null() {
-                free_receive_copy(copy);
-                return null_mut();
-            }
+            ));
             let data = api::NdisGetDataBuffer(nb, length, storage, 1, 0);
             if data.is_null() {
                 api::ExFreePoolWithTag(storage, TAG);
@@ -307,19 +297,8 @@ pub(crate) unsafe fn copy_receive(
                 ptr::copy_nonoverlapping(data.cast::<u8>(), storage.cast::<u8>(), length as usize);
             }
             let mdl = api::IoAllocateMdl(storage, length, 0, 0, null_mut());
-            if mdl.is_null() {
-                api::ExFreePoolWithTag(storage, TAG);
-                free_receive_copy(copy);
-                return null_mut();
-            }
             api::MmBuildMdlForNonPagedPool(mdl);
             let created = api::NdisAllocateNetBuffer(nb_pool, mdl, 0, length as SIZE_T);
-            if created.is_null() {
-                api::IoFreeMdl(mdl);
-                api::ExFreePoolWithTag(storage, TAG);
-                free_receive_copy(copy);
-                return null_mut();
-            }
             set_next_nb(created, null_mut());
             if tail.is_null() {
                 set_first_nb(copy, created);
@@ -470,11 +449,6 @@ pub(crate) fn reset_map_mdl_call_count() {
 #[cfg(test)]
 pub(crate) fn map_mdl_call_count() -> usize {
     tests::map_mdl_call_count()
-}
-
-#[cfg(test)]
-pub(crate) fn fail_next_context_allocation() {
-    tests::fail_next_context_allocation();
 }
 
 #[cfg(test)]

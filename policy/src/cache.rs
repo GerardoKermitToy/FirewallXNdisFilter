@@ -17,7 +17,7 @@ fn fingerprint(hash: u64) -> u8 {
     (hash >> 57) as u8
 }
 
-// Cache storage has its own fallible allocator for unlocked preparation/retirement.
+// Cache storage has its own allocator for unlocked preparation/retirement.
 #[derive(Clone, Copy)]
 pub struct CacheAllocator {
     allocate: unsafe fn(usize) -> *mut u8,
@@ -27,7 +27,7 @@ impl CacheAllocator {
     /// # Safety
     /// Functions must allocate/free nonpaged, 16-byte-aligned storage, accept the
     /// original allocation size on free, and remain valid for every cache buffer.
-    /// Allocation failure must return null rather than panic or bugcheck.
+    /// For a valid nonzero size the allocation function must not return null.
     pub const unsafe fn new(
         allocate: unsafe fn(usize) -> *mut u8,
         free: unsafe fn(*mut u8, usize),
@@ -73,9 +73,6 @@ impl Buffer {
             return None;
         }
         let data = unsafe { (allocator.allocate)(size) };
-        if unlikely(data.is_null()) {
-            return None;
-        }
         // Only control bytes (including the wrap mirror) need initialization.
         // Payloads stay uninitialized until insertion publishes a fingerprint.
         // Allocation/initialization is OUTSIDE the policy spin lock.
@@ -348,12 +345,14 @@ impl CachePlan {
 pub struct CacheWork {
     growth: Option<Allocation>,
     retired: [Buffer; 8],
+    retired_count: usize,
 }
 impl CacheWork {
     pub const fn empty() -> Self {
         Self {
             growth: None,
             retired: [const { Buffer::EMPTY }; 8],
+            retired_count: 0,
         }
     }
     pub fn prepare(plan: Option<CachePlan>) -> Self {
@@ -366,12 +365,12 @@ impl CacheWork {
         if buffer.data.is_null() {
             return true;
         }
-        if let Some(slot) = self.retired.iter_mut().find(|b| b.data.is_null()) {
-            *slot = mem::replace(buffer, Buffer::EMPTY);
-            true
-        } else {
-            false // Keep ownership in the table until a fresh work batch arrives.
+        if self.retired_count == self.retired.len() {
+            return false; // Keep ownership until a fresh work batch arrives.
         }
+        self.retired[self.retired_count] = mem::replace(buffer, Buffer::EMPTY);
+        self.retired_count += 1;
+        true
     }
 }
 
@@ -400,6 +399,16 @@ impl<const N: usize> Cache<N> {
             return Some(CachePlan {
                 ipv6: N == 16,
                 capacity: INITIAL_CAPACITY,
+                allocator,
+            });
+        }
+        // Shrink only on a new insertion, never on hits or timer work. A
+        // quarter-size destination still has room for the existing entries and
+        // at least capacity/32 new keys while the old slots migrate in batches.
+        if capacity > INITIAL_CAPACITY && self.current.len < capacity / 8 {
+            return Some(CachePlan {
+                ipv6: N == 16,
+                capacity: (capacity / 4).max(INITIAL_CAPACITY),
                 allocator,
             });
         }

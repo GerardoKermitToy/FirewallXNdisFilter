@@ -988,47 +988,26 @@ fn resources_receive_uses_private_deep_copy_and_never_returns_original_or_privat
 }
 
 #[test]
-fn context_allocation_failure_unwinds_retained_send_and_reports_resources() {
-    let f = Fixture::new();
-    let mut a = f.adapter();
-    let mut nbl = Box::<NET_BUFFER_LIST>::default();
-    packet::fail_next_context_allocation();
-    unsafe {
-        start(&mut *a);
-        send((&mut *a as *mut Adapter).cast(), &mut *nbl, 0, 0);
-        assert_eq!(a.active, 0);
-        assert_eq!(
-            nbl.__bindgen_anon_2.Status,
-            HV_WDK_NDIS_RESOURCES as NDIS_STATUS
-        );
-        stop(&mut *a);
-    }
-    state(|s| assert_eq!(s.resource_drops, 1));
-}
-
-#[test]
-fn resource_receive_copy_failure_at_every_allocation_stage_never_retains_original() {
+fn resource_receive_data_view_failure_never_retains_original() {
     let f = Fixture::new();
     let mut a = f.adapter();
     let mut source = Source::new();
     unsafe {
         start(&mut *a);
     }
-    for fail_at in 1..=6 {
-        packet::reset_test_allocator(Some(fail_at));
-        unsafe {
-            receive(
-                (&mut *a as *mut Adapter).cast(),
-                &mut *source.nbl,
-                0,
-                1,
-                NDIS_RECEIVE_FLAGS_RESOURCES,
-            );
-            assert_eq!(a.active, 0);
-            assert!(source.nbl.Context.is_null());
-        }
-        packet::assert_test_allocator_no_leaks();
+    packet::reset_test_allocator(Some(3));
+    unsafe {
+        receive(
+            (&mut *a as *mut Adapter).cast(),
+            &mut *source.nbl,
+            0,
+            1,
+            NDIS_RECEIVE_FLAGS_RESOURCES,
+        );
+        assert_eq!(a.active, 0);
+        assert!(source.nbl.Context.is_null());
     }
+    packet::assert_test_allocator_no_leaks();
     unsafe {
         stop(&mut *a);
     }
@@ -1216,7 +1195,7 @@ fn cancel_send_is_interface_scoped_and_does_not_claim_receive_with_equal_numeric
 }
 
 #[test]
-fn oid_sync_pending_allocation_failure_and_closed_rundown_preserve_single_completion() {
+fn oid_sync_pending_and_closed_rundown_preserve_single_completion() {
     let f = Fixture::new();
     let mut a = f.adapter();
     let mut request = NDIS_OID_REQUEST::default();
@@ -1251,13 +1230,6 @@ fn oid_sync_pending_allocation_failure_and_closed_rundown_preserve_single_comple
                 request.DATA.QUERY_INFORMATION.BytesNeeded
             ),
             (123, 456)
-        );
-        state(|s| {
-            s.fail_at = Some(s.allocation_attempts + 1);
-        });
-        assert_eq!(
-            oid((&mut *a as *mut Adapter).cast(), &mut request),
-            HV_WDK_NDIS_RESOURCES as NDIS_STATUS
         );
         state(|s| s.oid_open = false);
         assert_eq!(
@@ -1314,7 +1286,7 @@ fn oid_copy_result_copies_only_request_kind_specific_result_fields() {
 }
 
 #[test]
-fn attach_rejects_gate_or_media_before_allocating_and_unwinds_every_failure_stage() {
+fn attach_rejects_gate_or_media_and_unwinds_nonallocation_failures() {
     let _f = Fixture::new();
     let mut p = NDIS_FILTER_ATTACH_PARAMETERS::default();
     unsafe {
@@ -1333,19 +1305,7 @@ fn attach_rejects_gate_or_media_before_allocating_and_unwinds_every_failure_stag
         state(|s| assert_eq!(s.allocation_attempts, 0));
         p.MiniportMediaType = NdisMedium802_3;
         p.BaseMiniportIfIndex = 8;
-        for fail_at in 1..=4 {
-            state(|s| {
-                s.allocation_attempts = 0;
-                s.fail_at = Some(fail_at);
-            });
-            assert_eq!(
-                filter_attach(null_mut(), null_mut(), &mut p),
-                HV_WDK_NDIS_RESOURCES as NDIS_STATUS
-            );
-            state(|s| assert!(s.allocations.is_empty()));
-        }
         state(|s| {
-            s.fail_at = None;
             s.attach_ok = false;
         });
         assert_eq!(
@@ -1418,13 +1378,7 @@ fn snapshot_errors_do_not_invent_partial_success_or_allocate_arithmetic_maximum(
         );
         ADAPTER_COUNT = 0;
         attach_one();
-        state(|s| s.fail_at = Some(s.allocation_attempts + 1));
-        assert_eq!(
-            query_adapter_info(out.as_mut_ptr(), out.len() as u32, &mut transferred),
-            HV_WDK_STATUS_INSUFFICIENT_RESOURCES as NTSTATUS
-        );
         state(|s| {
-            s.fail_at = None;
             s.snapshot_growth = MAX_STAGING_ATTEMPTS as usize;
         });
         assert_eq!(

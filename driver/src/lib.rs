@@ -83,8 +83,8 @@ unsafe extern "C" {
     fn hv_bugcheck() -> !;
 }
 struct NonPagedAllocator;
-// SAFETY: the shim returns nonpaged pool aligned to at least 16 bytes and uses
-// fallible allocation without a driver-defined aggregate byte quota.
+// SAFETY: the shim returns nonpaged pool aligned to at least 16 bytes and
+// bugchecks if ExAllocatePool2 fails.
 unsafe impl GlobalAlloc for NonPagedAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if unlikely(layout.align() > 16) {
@@ -109,7 +109,7 @@ unsafe fn cache_allocate(size: usize) -> *mut u8 {
 unsafe fn cache_free(data: *mut u8, size: usize) {
     unsafe { hv_cache_free(data, size) }
 }
-// SAFETY: matching fallible, nonpaged pool functions; buffers are freed unlocked.
+// SAFETY: matching nonpaged pool functions; buffers are freed unlocked.
 const CACHE_ALLOCATOR: CacheAllocator = unsafe { CacheAllocator::new(cache_allocate, cache_free) };
 static STATE: State = State(UnsafeCell::new(Engine::with_cache_allocator(
     CACHE_ALLOCATOR,
@@ -132,33 +132,24 @@ fn with_state<R>(f: impl FnOnce(&mut Engine) -> R) -> R {
         result
     }
 }
-// Reserve before the one accounting operation, not while PolicyLock is held.
-// Concurrent insertion/report/reset can invalidate a capacity hint, so recheck
-// under the same lock that invokes the callback. Hits need no extra lock pass.
-fn with_bandwidth<R>(f: impl FnOnce(&mut Engine, &mut BandwidthWork) -> R) -> R {
-    let mut callback = Some(f);
-    let mut work = BandwidthWork::empty();
-    loop {
-        let attempt = with_state(|engine| {
-            if let Some(plan) = engine.bandwidth_plan()
-                && !work.satisfies(plan)
-                && !work.allocation_failed()
-            {
-                return Err(plan);
-            }
-            engine.install_bandwidth_work(&mut work);
-            Ok(callback.take().unwrap()(engine, &mut work))
-        });
-        match attempt {
-            Ok(result) => return result,
-            Err(plan) => {
-                // Unused prepared buffers and migrated indexes are freed here,
-                // after with_state has released PolicyLock.
-                drop(work);
-                work = BandwidthWork::prepare(Some(plan));
+// Decide once under PolicyLock. Only a genuinely missing bandwidth resource
+// causes synchronous unlocked preparation and a retry of accounting alone.
+fn with_bandwidth<R>(f: impl FnOnce(&mut Engine, &mut BandwidthWork, u64) -> R) -> R {
+    let mut work = BandwidthWork::defer_missing();
+    let result = with_state(|engine| f(engine, &mut work, unsafe { hv_now() }));
+    if let Some(deferred) = work.take_deferred() {
+        let mut plan = deferred.plan();
+        loop {
+            // Unused reserves and retired indexes are freed outside PolicyLock.
+            drop(work);
+            work = BandwidthWork::prepare(Some(plan));
+            match with_state(|engine| engine.complete_bandwidth(&deferred, &mut work)) {
+                Some(next) => plan = next,
+                None => break,
             }
         }
     }
+    result
 }
 fn finish_value(finish: Finish) -> u32 {
     match finish {
@@ -187,7 +178,7 @@ fn reclaim_retired() {
 }
 fn drain() {
     loop {
-        let action = with_bandwidth(|e, work| e.take_due_with_work(unsafe { hv_now() }, work));
+        let action = with_bandwidth(|e, work, now| e.take_due_with_work(now, work));
         if let Some(action) = action {
             finish(action)
         } else {
@@ -441,7 +432,7 @@ fn classify(nbl: usize, interface_index: u32, input: PacketInput, session: u32) 
                 };
                 view
             },
-            allocate_record,
+            |length| alloc::vec![0; length],
         );
         let view = match view {
             Ok(view) => view,
@@ -509,7 +500,7 @@ fn classify(nbl: usize, interface_index: u32, input: PacketInput, session: u32) 
     }
     // Only NDIS sends have a cancel ID; WFP route metadata stays in the shim.
     let cancel = input.cancel();
-    let wants_event = match with_bandwidth(|e, work| {
+    let wants_event = match with_bandwidth(|e, work, now| {
         if input.is_forward() {
             if !e.is_online() {
                 return Err(Action {
@@ -525,7 +516,7 @@ fn classify(nbl: usize, interface_index: u32, input: PacketInput, session: u32) 
                 });
             }
         }
-        e.preflight_with_work(interface_index, &packet, nbl, unsafe { hv_now() }, work)
+        e.preflight_with_work(interface_index, &packet, nbl, now, work)
     }) {
         Ok(wants_event) => wants_event,
         Err(action) => return finish_code(action.finish),
@@ -534,23 +525,24 @@ fn classify(nbl: usize, interface_index: u32, input: PacketInput, session: u32) 
         match capture_packet(unsafe { hv_first_nb(nbl) }, nbl, &packet) {
             Ok(record) => record,
             Err(()) => {
-                with_state(|e| e.malformed());
+                with_state(|e| {
+                    e.malformed();
+                    if input.is_forward() {
+                        e.reap_idle_forward(interface_index);
+                    }
+                });
                 return 1;
             }
         }
     } else {
         None
     };
-    match with_bandwidth(|e, work| {
-        e.submit_with_work(
-            interface_index,
-            packet,
-            nbl,
-            cancel,
-            unsafe { hv_now() },
-            record,
-            work,
-        )
+    match with_bandwidth(|e, work, now| {
+        if input.is_forward() {
+            e.submit_forward_with_work(interface_index, packet, nbl, now, record, work)
+        } else {
+            e.submit_with_work(interface_index, packet, nbl, cancel, now, record, work)
+        }
     }) {
         Submission::Pending(_) => -1,
         Submission::Finish(a) => finish_code(a.finish),
@@ -685,8 +677,8 @@ pub unsafe extern "C" fn HvWrite(data: *const u8, len: u32) -> i32 {
                 // harmless no-op (never a cache write), as on asynchronous kext I/O.
                 let plan = with_state(|e| e.cache_plan(id, verdict, unsafe { hv_now() }));
                 let mut work = CacheWork::prepare(plan);
-                let action = with_bandwidth(|e, bandwidth| {
-                    e.verdict_with_work(id, verdict, unsafe { hv_now() }, &mut work, bandwidth)
+                let action = with_bandwidth(|e, bandwidth, now| {
+                    e.verdict_with_work(id, verdict, now, &mut work, bandwidth)
                         .ok()
                 });
                 drop(work);

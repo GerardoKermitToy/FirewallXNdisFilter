@@ -3,7 +3,7 @@ extern crate alloc;
 #[path = "../../driver/src/packet_snapshot.rs"]
 mod packet_snapshot;
 
-use hyperv_policy::{engine::allocate_record, packet::SNAPSHOT};
+use hyperv_policy::packet::SNAPSHOT;
 use packet_snapshot::{ParserScratch, Snapshot, SnapshotError};
 
 fn view(bytes: &[u8], storage: *mut u8, split: bool) -> Snapshot {
@@ -71,7 +71,7 @@ fn split_and_contiguous_nbs_reuse_one_lazy_scratch() {
                 |length| {
                     allocations += 1;
                     assert_eq!(length, SNAPSHOT);
-                    allocate_record(length)
+                    vec![0; length]
                 },
             )
             .unwrap();
@@ -88,28 +88,6 @@ fn split_and_contiguous_nbs_reuse_one_lazy_scratch() {
 }
 
 #[test]
-fn required_scratch_oom_is_an_error_and_does_not_publish_a_view() {
-    let bytes = vec![0xa5; 1500];
-    let mut scratch = ParserScratch::default();
-    let mut probes = 0;
-    let result = scratch.read(
-        |storage| {
-            probes += 1;
-            assert!(storage.is_null());
-            view(&bytes, storage, true)
-        },
-        |_| None,
-    );
-    assert!(matches!(result, Err(SnapshotError::Resource)));
-    assert_eq!(probes, 1);
-    assert!(
-        scratch
-            .read(|storage| view(&bytes, storage, true), allocate_record)
-            .is_ok()
-    );
-}
-
-#[test]
 fn failed_mapping_retry_remains_malformed_and_reuses_existing_scratch() {
     let mut scratch = ParserScratch::default();
     let mut probes = 0;
@@ -121,7 +99,7 @@ fn failed_mapping_retry_remains_malformed_and_reuses_existing_scratch() {
                 ..Snapshot::default()
             }
         },
-        allocate_record,
+        |length| vec![0; length],
     );
     assert!(matches!(result, Err(SnapshotError::Malformed)));
     assert_eq!(probes, 2);
@@ -166,7 +144,7 @@ fn invalid_lengths_are_rejected_without_exposing_unbounded_storage() {
     assert!(matches!(
         scratch.read(
             |storage| view(&bytes, storage, true),
-            |_| Some(vec![0; SNAPSHOT - 1])
+            |_| vec![0; SNAPSHOT - 1]
         ),
         Err(SnapshotError::Resource)
     ));

@@ -218,13 +218,6 @@ unsafe fn create_ndis_packet(
             return null_mut();
         }
         let context = packet::allocate_packet_context(nbl);
-        if unlikely(context.is_null()) {
-            if resources {
-                packet::free_receive_copy(nbl);
-            }
-            release_active(a, 1);
-            return null_mut();
-        }
         (*context).adapter = a.cast();
         (*context).port = port;
         (*context).flags = if resources { 0 } else { flags };
@@ -603,11 +596,7 @@ pub(super) unsafe extern "C" fn oid(
             return HV_WDK_NDIS_CLOSING as NDIS_STATUS;
         }
         let mut clone = null_mut();
-        let status = api::NdisAllocateCloneOidRequest((*a).filter, request, TAG, &mut clone);
-        if unlikely(status != HV_WDK_NDIS_SUCCESS as NDIS_STATUS) {
-            api::ExReleaseRundownProtection(addr_of_mut!((*a).oid_rundown));
-            return status;
-        }
+        api::NdisAllocateCloneOidRequest((*a).filter, request, TAG, &mut clone);
         addr_of_mut!((*clone).SourceReserved)
             .cast::<PNDIS_OID_REQUEST>()
             .write_unaligned(request);
@@ -834,16 +823,12 @@ pub(super) unsafe fn query_adapter_info(
                         status = HV_WDK_STATUS_INTEGER_OVERFLOW as NTSTATUS;
                         break;
                     };
-                    snapshot = api::ExAllocatePool2(
+                    snapshot = pool_allocation(api::ExAllocatePool2(
                         (HV_WDK_POOL_FLAG_NON_PAGED | HV_WDK_POOL_FLAG_UNINITIALIZED) as u64,
                         bytes as u64,
                         INFO_TAG,
-                    )
+                    ))
                     .cast();
-                    if unlikely(snapshot.is_null()) {
-                        status = HV_WDK_STATUS_INSUFFICIENT_RESOURCES as NTSTATUS;
-                        break;
-                    }
                     allocated_count = u64::from(count);
                     continue;
                 }
@@ -952,15 +937,12 @@ pub(super) unsafe extern "C" fn filter_attach(
         if (*p).MiniportMediaType != NdisMedium802_3 || !registry::target_adapter(p, &mut guid) {
             return HV_WDK_NDIS_NOT_SUPPORTED as NDIS_STATUS;
         }
-        let a = api::ExAllocatePool2(
+        let a = pool_allocation(api::ExAllocatePool2(
             HV_WDK_POOL_FLAG_NON_PAGED as u64,
             size_of::<Adapter>() as u64,
             TAG,
-        )
+        ))
         .cast::<Adapter>();
-        if unlikely(a.is_null()) {
-            return HV_WDK_NDIS_RESOURCES as NDIS_STATUS;
-        }
         (*a).filter = filter;
         (*a).interface_index = (*p).BaseMiniportIfIndex;
         (*a).id = NEXT_ADAPTER.fetch_add(1, Ordering::SeqCst).wrapping_add(1) as u64;
@@ -969,10 +951,6 @@ pub(super) unsafe extern "C" fn filter_attach(
         api::KeInitializeSpinLock(addr_of_mut!((*a).lock.SpinLock));
         api::ExInitializeRundownProtection(addr_of_mut!((*a).oid_rundown));
         (*a).classification_lock = api::NdisAllocateRWLock(filter);
-        if unlikely((*a).classification_lock.is_null()) {
-            free_adapter(a);
-            return HV_WDK_NDIS_RESOURCES as NDIS_STATUS;
-        }
         let mut nbl_pool: NET_BUFFER_LIST_POOL_PARAMETERS = zeroed();
         nbl_pool.Header.Type = NDIS_OBJECT_TYPE_DEFAULT as u8;
         nbl_pool.Header.Revision = NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1 as u8;
@@ -980,20 +958,12 @@ pub(super) unsafe extern "C" fn filter_attach(
         nbl_pool.ProtocolId = NDIS_PROTOCOL_ID_DEFAULT as u8;
         nbl_pool.PoolTag = TAG;
         (*a).nbl_pool = api::NdisAllocateNetBufferListPool(filter, &nbl_pool);
-        if unlikely((*a).nbl_pool.is_null()) {
-            free_adapter(a);
-            return HV_WDK_NDIS_RESOURCES as NDIS_STATUS;
-        }
         let mut nb_pool: NET_BUFFER_POOL_PARAMETERS = zeroed();
         nb_pool.Header.Type = NDIS_OBJECT_TYPE_DEFAULT as u8;
         nb_pool.Header.Revision = NET_BUFFER_POOL_PARAMETERS_REVISION_1 as u8;
         nb_pool.Header.Size = HV_WDK_NB_POOL_SIZE as u16;
         nb_pool.PoolTag = TAG;
         (*a).nb_pool = api::NdisAllocateNetBufferPool(filter, &nb_pool);
-        if unlikely((*a).nb_pool.is_null()) {
-            free_adapter(a);
-            return HV_WDK_NDIS_RESOURCES as NDIS_STATUS;
-        }
         let attached = policy::HvAttach((*a).interface_index);
         policy::HvDrain();
         if attached == 0 {

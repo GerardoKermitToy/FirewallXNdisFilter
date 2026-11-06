@@ -75,11 +75,12 @@ pub(super) unsafe fn target_adapter(p: PNDIS_FILTER_ATTACH_PARAMETERS, guid: *mu
                 {
                     break;
                 }
-                let info = ExAllocatePool2(HV_WDK_POOL_FLAG_NON_PAGED as u64, needed as u64, TAG)
-                    .cast::<KEY_VALUE_PARTIAL_INFORMATION>();
-                if info.is_null() {
-                    break;
-                }
+                let info = pool_allocation(ExAllocatePool2(
+                    HV_WDK_POOL_FLAG_NON_PAGED as u64,
+                    needed as u64,
+                    TAG,
+                ))
+                .cast::<KEY_VALUE_PARTIAL_INFORMATION>();
                 let status = ZwQueryValueKey(
                     key,
                     &mut name,

@@ -3,16 +3,13 @@
 //! and write individual entries/index slots.
 
 use crate::{cache::tuple_hash, storage::List};
-use alloc::{
-    alloc::{alloc, dealloc},
-    vec::Vec,
-};
+use alloc::{alloc::dealloc, boxed::Box, vec::Vec};
 use core::{
     alloc::Layout,
     mem::{self, MaybeUninit},
     ptr::{self, NonNull},
 };
-use hyperv_protocol::{BandwidthEntry, Connection, Direction};
+use hyperv_protocol::{Connection, Direction};
 use likely_stable::unlikely;
 
 const PAGE_ENTRIES: usize = 128;
@@ -41,12 +38,10 @@ struct Entry {
     tx: u64,
     rx: u64,
     hash: u64,
-    active: bool,
 }
 impl Entry {
     fn matches(&self, interface_index: u32, connection: &Connection) -> bool {
-        self.active
-            && self.interface_index == interface_index
+        self.interface_index == interface_index
             && self.connection.protocol == connection.protocol
             && self.connection.ipv6 == connection.ipv6
             && self.connection.local_ip == connection.local_ip
@@ -82,20 +77,14 @@ struct Page {
 // uninitialized entry array is deliberately left untouched in the allocation.
 struct PreparedPage(NonNull<Page>);
 impl PreparedPage {
-    fn prepare() -> Option<Self> {
-        // SAFETY: Page has a nonzero layout and this pointer is uniquely owned.
-        let page = unsafe { alloc(Layout::new::<Page>()) }.cast::<Page>();
-        if unlikely(page.is_null()) {
-            return None;
-        }
-        // SAFETY: the fallible allocation was checked for null above.
-        let page = unsafe { NonNull::new_unchecked(page) };
+    fn prepare() -> Self {
+        let page = NonNull::from(Box::leak(Box::<Page>::new_uninit())).cast::<Page>();
         // SAFETY: only the header needs initialization. MaybeUninit<Entry> may
         // remain uninitialized, and no reference to an Entry is created here.
         unsafe {
             ptr::addr_of_mut!((*page.as_ptr()).header).write(PageHeader { next: None, len: 0 });
         }
-        Some(Self(page))
+        Self(page)
     }
     fn into_raw(self) -> NonNull<Page> {
         let page = self.0;
@@ -172,7 +161,19 @@ impl Pages {
             Some(NonNull::new_unchecked(slot))
         }
     }
-    fn visit(&self, visitor: &mut impl FnMut(&Entry)) {
+    fn first_group(&self) -> Option<BandwidthGroup> {
+        let page = self.head?;
+        // SAFETY: the initialized header bounds the initialized entry prefix.
+        let len = unsafe { ptr::addr_of!((*page.as_ptr()).header.len).read() };
+        if len == 0 {
+            return None;
+        }
+        let entries =
+            unsafe { ptr::addr_of!((*page.as_ptr()).entries) }.cast::<MaybeUninit<Entry>>();
+        let entry = unsafe { &*entries.cast::<Entry>() };
+        Some(entry.group())
+    }
+    fn visit_while(&self, visitor: &mut impl FnMut(&Entry) -> bool) -> bool {
         let mut next = self.head;
         while let Some(page) = next {
             // SAFETY: only initialized header fields and initialized Entry slots
@@ -188,31 +189,80 @@ impl Pages {
                 unsafe { ptr::addr_of!((*page.as_ptr()).entries) }.cast::<MaybeUninit<Entry>>();
             for index in 0..len {
                 let entry = unsafe { &*entries.add(index).cast::<Entry>() };
-                if entry.active {
-                    visitor(entry);
+                if !visitor(entry) {
+                    return false;
                 }
             }
         }
+        true
     }
-    fn visit_mut(&mut self, visitor: &mut impl FnMut(&mut Entry)) {
-        let mut next = self.head;
-        while let Some(page) = next {
-            // SAFETY: exclusive chain access is narrowed to one initialized Entry
-            // at a time. No &mut Page can invalidate stored index pointers.
-            let (next_page, len) = unsafe {
+    fn visit(&self, visitor: &mut impl FnMut(&Entry)) {
+        self.visit_while(&mut |entry| {
+            visitor(entry);
+            true
+        });
+    }
+    // After a partial report, keep only groups after the last queued group.
+    // Entries move in page order, so a copy cannot overwrite a future source.
+    fn retain_after(&mut self, group: BandwidthGroup) -> usize {
+        let Some(mut destination) = self.head else {
+            return 0;
+        };
+        let mut count = 0;
+        let mut offset = 0;
+        let mut source = self.head;
+        while let Some(page) = source {
+            // SAFETY: pages and their initialized prefixes belong to this chain.
+            let (next, len) = unsafe {
                 (
                     ptr::addr_of!((*page.as_ptr()).header.next).read(),
                     ptr::addr_of!((*page.as_ptr()).header.len).read(),
                 )
             };
-            next = next_page;
             let entries =
-                unsafe { ptr::addr_of_mut!((*page.as_ptr()).entries) }.cast::<MaybeUninit<Entry>>();
+                unsafe { ptr::addr_of!((*page.as_ptr()).entries) }.cast::<MaybeUninit<Entry>>();
             for index in 0..len {
-                let entry = unsafe { &mut *entries.add(index).cast::<Entry>() };
-                visitor(entry);
+                let entry = unsafe { entries.add(index).cast::<Entry>() };
+                if unsafe { (*entry).group() <= group } {
+                    continue;
+                }
+                if offset == PAGE_ENTRIES {
+                    destination =
+                        unsafe { ptr::addr_of!((*destination.as_ptr()).header.next).read() }
+                            .expect("survivors fit in existing pages");
+                    offset = 0;
+                }
+                let target = unsafe { ptr::addr_of_mut!((*destination.as_ptr()).entries) }
+                    .cast::<MaybeUninit<Entry>>();
+                // SAFETY: the destination is not ahead of the source, and no
+                // index points into these detached pages after sealing.
+                unsafe { ptr::copy(entry, target.add(offset).cast::<Entry>(), 1) };
+                offset += 1;
+                count += 1;
             }
+            source = next;
         }
+        if count == 0 {
+            *self = Self::new();
+            return 0;
+        }
+        // SAFETY: destination is the final retained page. Detach the unused
+        // suffix before freeing it, keeping the retained chain well-formed.
+        let mut discarded = unsafe {
+            let next = ptr::addr_of!((*destination.as_ptr()).header.next).read();
+            ptr::addr_of_mut!((*destination.as_ptr()).header.next).write(None);
+            ptr::addr_of_mut!((*destination.as_ptr()).header.len).write(offset);
+            next
+        };
+        self.tail = Some(destination);
+        while let Some(page) = discarded {
+            discarded = unsafe { ptr::addr_of!((*page.as_ptr()).header.next).read() };
+            unsafe { dealloc(page.as_ptr().cast(), Layout::new::<Page>()) };
+            self.count -= 1;
+            #[cfg(test)]
+            allocation_tracking::freed_page();
+        }
+        count
     }
     fn bytes(&self) -> usize {
         self.count.saturating_mul(mem::size_of::<Page>())
@@ -265,10 +315,7 @@ impl Index {
             return None;
         }
         Layout::array::<IndexSlot>(capacity).ok()?;
-        let mut slots = Vec::new();
-        if unlikely(slots.try_reserve_exact(capacity).is_err()) {
-            return None;
-        }
+        let mut slots = Vec::with_capacity(capacity);
         slots.resize(capacity, IndexSlot::EMPTY);
         Some(Self { slots })
     }
@@ -423,33 +470,55 @@ impl Bank {
             .find(hash, interface_index, connection)
             .or_else(|| self.previous.find(hash, interface_index, connection))
     }
-    fn add(&mut self, value: Entry, work: &mut BandwidthWork) -> Option<bool> {
+    fn add(
+        &mut self,
+        value: Entry,
+        work: &mut BandwidthWork,
+    ) -> Result<Option<bool>, BandwidthPlan> {
         if self.sealed {
-            return None;
+            return Ok(None);
         }
         if let Some(mut entry) = self.find(value.hash, value.interface_index, &value.connection) {
             // SAFETY: exclusive bank access and a stable, initialized entry.
             let entry = unsafe { entry.as_mut() };
             entry.tx = entry.tx.saturating_add(value.tx);
             entry.rx = entry.rx.saturating_add(value.rx);
-            return Some(false);
+            return Ok(Some(false));
         }
-        let count = self.count.checked_add(1)?;
-        let needed = self.needed_index_capacity()?;
+        // A lookup has already proved this is a new key. Only now prepare
+        // missing resources; a concurrent insertion can make a reserve stale.
+        if let Some(plan) = self.plan()
+            && !work.satisfies(plan)
+            && !work.preparation_failed()
+        {
+            return Err(plan);
+        }
+        self.install(work);
+        let Some(count) = self.count.checked_add(1) else {
+            return Ok(None);
+        };
+        let Some(needed) = self.needed_index_capacity() else {
+            return Ok(None);
+        };
         if self.pages.needs_page()
             || (needed != 0 && self.spare.capacity() < needed)
             || (self.previous.capacity() != 0 && self.count >= self.load_limit())
         {
-            return None;
+            return Ok(None);
         }
         // Locate a slot before publishing an entry. Nothing fallible remains
         // after push, so a failed preparation cannot leave an orphan active key.
         let position = if needed != 0 {
-            self.spare.vacant(value.hash)?
+            self.spare.vacant(value.hash)
         } else {
-            self.current.vacant(value.hash)?
+            self.current.vacant(value.hash)
         };
-        let entry = self.pages.push(value)?;
+        let Some(position) = position else {
+            return Ok(None);
+        };
+        let Some(entry) = self.pages.push(value) else {
+            return Ok(None);
+        };
         if needed != 0 {
             debug_assert_eq!(self.previous.capacity(), 0);
             mem::swap(&mut self.current, &mut self.spare);
@@ -459,7 +528,7 @@ impl Bank {
         self.current.write(position, value.hash, entry);
         self.count = count;
         self.migrate(work);
-        Some(true)
+        Ok(Some(true))
     }
     fn migrate(&mut self, work: &mut BandwidthWork) {
         let capacity = self.previous.capacity();
@@ -490,33 +559,44 @@ impl Bank {
             self.cursor = 0;
         }
     }
-    fn remove_group(&mut self, group: BandwidthGroup) -> usize {
-        // Reported/detached pages are never reactivated for live insertion.
-        self.sealed = true;
-        let mut removed = 0;
-        self.pages.visit_mut(&mut |entry| {
-            if entry.active && entry.group() == group {
-                entry.active = false;
-                removed += 1;
-            }
-        });
-        self.count -= removed;
-        // Detached indexes are never searched again. In particular, removing a
-        // reported entry need not disturb either old or current probe chains.
-        removed
+    fn seal(&mut self) {
+        // The detached index is never searched after the first successful group.
+        if !self.sealed {
+            self.sealed = true;
+            self.current = Index::new();
+            self.previous = Index::new();
+            self.spare = Index::new();
+            self.cursor = 0;
+        }
+    }
+}
+
+/// One accounting operation that needs unlocked preparation. It stays on the
+/// caller's stack; it is never queued to a thread or retained by the engine.
+pub struct DeferredBandwidth {
+    pub(crate) interface_index: u32,
+    pub(crate) connection: Connection,
+    pub(crate) bytes: u64,
+    pub(crate) epoch: u64,
+    pub(crate) plan: BandwidthPlan,
+}
+impl DeferredBandwidth {
+    pub fn plan(&self) -> BandwidthPlan {
+        self.plan
     }
 }
 
 /// Prepared resources and one retired index for a single locked accounting
 /// callback. Construct and DROP this value outside PolicyLock, even on a hit,
-/// stale preparation or failed allocation. Preparation only builds requested
-/// resources and may return a partial reserve after OOM.
+/// stale preparation or invalid size. Preparation builds only requested resources.
 pub struct BandwidthWork {
     owner: List<Bank>,
     page: Option<PreparedPage>,
     index: Index,
     retired: Index,
     failed: bool,
+    pub(crate) defer_missing: bool,
+    pub(crate) deferred: Option<DeferredBandwidth>,
 }
 impl BandwidthWork {
     pub const fn empty() -> Self {
@@ -526,7 +606,20 @@ impl BandwidthWork {
             index: Index::new(),
             retired: Index::new(),
             failed: false,
+            defer_missing: false,
+            deferred: None,
         }
+    }
+    /// Allow a single accounting operation to request synchronous preparation
+    /// after the policy callback releases its lock.
+    pub fn defer_missing() -> Self {
+        Self {
+            defer_missing: true,
+            ..Self::empty()
+        }
+    }
+    pub fn take_deferred(&mut self) -> Option<DeferredBandwidth> {
+        self.deferred.take()
     }
     pub fn prepare(plan: Option<BandwidthPlan>) -> Self {
         let mut work = Self::empty();
@@ -535,8 +628,7 @@ impl BandwidthWork {
                 work.failed = true;
             }
             if plan.page {
-                work.page = PreparedPage::prepare();
-                work.failed |= work.page.is_none();
+                work.page = Some(PreparedPage::prepare());
             }
             if plan.index_capacity != 0 {
                 match Index::prepare(plan.index_capacity) {
@@ -552,7 +644,7 @@ impl BandwidthWork {
             && (!plan.page || self.page.is_some())
             && self.index.capacity() >= plan.index_capacity
     }
-    pub fn allocation_failed(&self) -> bool {
+    pub fn preparation_failed(&self) -> bool {
         self.failed
     }
 }
@@ -606,6 +698,7 @@ impl BandwidthStore {
             None
         }
     }
+    #[allow(dead_code)] // Used by the standalone aggregation benchmark and tests.
     pub(crate) fn install(&mut self, work: &mut BandwidthWork) {
         #[cfg(test)]
         if self.fail_allocations {
@@ -625,6 +718,7 @@ impl BandwidthStore {
             .saturating_sub(before)
             .saturating_add(bank.bytes());
     }
+    #[allow(dead_code)] // Also used by the standalone aggregation benchmark.
     pub(crate) fn add(
         &mut self,
         interface_index: u32,
@@ -632,28 +726,57 @@ impl BandwidthStore {
         bytes: u64,
         work: &mut BandwidthWork,
     ) -> Option<bool> {
+        self.try_add(interface_index, connection, bytes, work)
+            .ok()
+            .flatten()
+    }
+    pub(crate) fn try_add(
+        &mut self,
+        interface_index: u32,
+        connection: &Connection,
+        bytes: u64,
+        work: &mut BandwidthWork,
+    ) -> Result<Option<bool>, BandwidthPlan> {
         let (tx, rx) = match connection.direction {
             Direction::Outbound => (bytes, 0),
             Direction::Inbound => (0, bytes),
         };
-        self.add_value(
+        self.try_add_value(
             Entry {
                 interface_index,
                 connection: *connection,
                 tx,
                 rx,
                 hash: bandwidth_hash(interface_index, connection),
-                active: true,
             },
             work,
         )
     }
     fn add_value(&mut self, value: Entry, work: &mut BandwidthWork) -> Option<bool> {
-        self.install(work);
-        if self.banks.len() != 1 {
-            return None;
+        self.try_add_value(value, work).ok().flatten()
+    }
+    fn try_add_value(
+        &mut self,
+        value: Entry,
+        work: &mut BandwidthWork,
+    ) -> Result<Option<bool>, BandwidthPlan> {
+        if self.banks.is_empty() {
+            #[cfg(test)]
+            if self.fail_allocations {
+                return Ok(None);
+            }
+            if let Some(plan) = self.plan()
+                && !work.satisfies(plan)
+                && !work.preparation_failed()
+            {
+                return Err(plan);
+            }
+            self.banks.append(&mut work.owner);
         }
-        let bank = self.banks.front_mut()?;
+        if self.banks.len() != 1 {
+            return Ok(None);
+        }
+        let bank = self.banks.front_mut().expect("one bandwidth bank");
         let before = bank.bytes();
         let result = bank.add(value, work);
         self.payload_bytes = self
@@ -661,6 +784,12 @@ impl BandwidthStore {
             .saturating_sub(before)
             .saturating_add(bank.bytes());
         self.count = bank.count;
+        if result == Ok(None) && self.count == 0 {
+            // A partially prepared empty bank has no counters to preserve. Move
+            // it to work for destruction after the caller releases PolicyLock.
+            self.payload_bytes = 0;
+            work.owner.append(&mut self.banks);
+        }
         result
     }
     /// O(1) ownership transfer for retry/retirement, never a live-key merge.
@@ -673,9 +802,9 @@ impl BandwidthStore {
         other.count = 0;
         other.payload_bytes = 0;
     }
-    /// Outside-lock, failure-atomic consolidation of detached bank chains. Only
-    /// active entries are copied; failed preparation leaves every source delta
-    /// and allocation intact. The successful swap destroys old banks unlocked.
+    /// Outside-lock, failure-atomic consolidation of detached bank chains.
+    /// Failed preparation leaves every source delta and allocation intact.
+    /// The successful swap destroys old banks unlocked.
     pub(crate) fn consolidate(&mut self) -> bool {
         if self.banks.len() <= 1 {
             return true;
@@ -705,46 +834,43 @@ impl BandwidthStore {
             bank.pages.visit(visitor);
         }
     }
+    pub(crate) fn first_group(&self) -> Option<BandwidthGroup> {
+        self.banks.front()?.pages.first_group()
+    }
+    pub(crate) fn visit_report_while(
+        &self,
+        visitor: &mut impl FnMut(BandwidthGroup, &Connection, u64, u64) -> bool,
+    ) -> bool {
+        for bank in self.banks.iter() {
+            if !bank.pages.visit_while(&mut |entry| {
+                visitor(entry.group(), &entry.connection, entry.tx, entry.rx)
+            }) {
+                return false;
+            }
+        }
+        true
+    }
+    // Successful groups are a sorted prefix. Compact only after a partial
+    // report, and release the detached index before moving any entries.
+    pub(crate) fn retain_after(&mut self, group: BandwidthGroup) {
+        let bank = self
+            .banks
+            .front_mut()
+            .expect("unreported entries have a bank");
+        let before = bank.bytes();
+        bank.seal();
+        bank.count = bank.pages.retain_after(group);
+        self.count = bank.count;
+        self.payload_bytes = self
+            .payload_bytes
+            .saturating_sub(before)
+            .saturating_add(bank.bytes());
+    }
+    #[allow(dead_code)] // Also used by the standalone aggregation benchmark.
     pub(crate) fn visit_totals(&self, visitor: &mut impl FnMut(u32, &Connection, u64, u64)) {
         self.visit(&mut |entry| {
             visitor(entry.interface_index, &entry.connection, entry.tx, entry.rx);
         });
-    }
-    pub(crate) fn next_group(&self, after: Option<BandwidthGroup>) -> Option<BandwidthGroup> {
-        let mut result = None;
-        self.visit(&mut |entry| {
-            let group = entry.group();
-            if after.is_none_or(|after| group > after) && result.is_none_or(|best| group < best) {
-                result = Some(group);
-            }
-        });
-        result
-    }
-    pub(crate) fn visit_group(
-        &self,
-        group: BandwidthGroup,
-        visitor: &mut impl FnMut(BandwidthEntry),
-    ) {
-        self.visit_totals(&mut |interface_index, connection, tx, rx| {
-            if interface_index == group.interface_index
-                && connection.protocol == group.protocol
-                && connection.ipv6 == group.ipv6
-            {
-                visitor(BandwidthEntry {
-                    local_ip: connection.local_ip,
-                    local_port: connection.local_port,
-                    remote_ip: connection.remote_ip,
-                    remote_port: connection.remote_port,
-                    transmitted_bytes: tx,
-                    received_bytes: rx,
-                });
-            }
-        });
-    }
-    pub(crate) fn remove_group(&mut self, group: BandwidthGroup) {
-        for bank in self.banks.iter_mut() {
-            self.count -= bank.remove_group(group);
-        }
     }
 }
 
@@ -795,7 +921,7 @@ mod tests {
     ) -> bool {
         let plan = store.plan();
         let mut work = BandwidthWork::prepare(plan);
-        assert!(!work.allocation_failed());
+        assert!(!work.preparation_failed());
         assert!(plan.is_none_or(|plan| work.satisfies(plan)));
         store.add(interface, connection, bytes, &mut work).unwrap()
     }
@@ -814,12 +940,11 @@ mod tests {
             tx,
             rx,
             hash: 63,
-            active: true,
         }
     }
     fn add_forced(store: &mut BandwidthStore, value: Entry) -> bool {
         let mut work = BandwidthWork::prepare(store.plan());
-        assert!(!work.allocation_failed());
+        assert!(!work.preparation_failed());
         store.add_value(value, &mut work).unwrap()
     }
 
@@ -1039,7 +1164,7 @@ mod tests {
             }
         );
         let empty = BandwidthWork::empty();
-        assert!(!empty.allocation_failed());
+        assert!(!empty.preparation_failed());
         assert!(!empty.satisfies(plan));
         let mut work = BandwidthWork::prepare(Some(plan));
         assert!(work.satisfies(plan));
@@ -1092,7 +1217,7 @@ mod tests {
         assert!(none.owner.is_empty());
         assert!(none.page.is_none());
         assert_eq!(none.index.capacity(), 0);
-        assert!(!none.allocation_failed());
+        assert!(!none.preparation_failed());
     }
 
     #[test]
@@ -1103,12 +1228,13 @@ mod tests {
             index_capacity: usize::MAX,
         };
         let mut failed = BandwidthWork::prepare(Some(invalid));
-        assert!(failed.allocation_failed());
+        assert!(failed.preparation_failed());
         assert!(!failed.satisfies(invalid));
         let mut store = BandwidthStore::new();
         assert_eq!(store.add(1, &connection(1), 7, &mut failed), None);
         assert_eq!(store.len(), 0);
-        let bank = store.banks.front().unwrap();
+        assert!(!store.has_storage());
+        let bank = failed.owner.front().unwrap();
         assert_eq!(unsafe { bank.pages.tail.unwrap().as_ref() }.header.len, 0);
         let mut work = BandwidthWork::prepare(store.plan());
         store.fail_allocations = true;
@@ -1154,7 +1280,37 @@ mod tests {
     }
 
     #[test]
-    fn detached_consolidation_sums_deltas_saturates_and_skips_reported_slots() {
+    fn partial_report_compacts_interleaved_entries_in_place() {
+        let mut store = BandwidthStore::new();
+        for n in 0..768 {
+            assert!(add(&mut store, 1 + n % 3, &connection(n), u64::from(n) + 1));
+        }
+        let before = store.bytes();
+        store.retain_after(BandwidthGroup {
+            interface_index: 1,
+            protocol: 6,
+            ipv6: false,
+        });
+        assert_eq!(store.len(), 512);
+        assert_eq!(store.banks.front().unwrap().current.capacity(), 0);
+        assert_eq!(store.banks.front().unwrap().pages.count, 4);
+        assert!(store.bytes() < before);
+        let mut observed = Vec::new();
+        store.visit_totals(&mut |interface, connection, tx, rx| {
+            observed.push((interface, connection.remote_ip, tx, rx));
+        });
+        let expected: Vec<_> = (0..768)
+            .filter(|n| n % 3 != 0)
+            .map(|n| (1 + n % 3, connection(n).remote_ip, u64::from(n) + 1, 0))
+            .collect();
+        assert_eq!(observed, expected);
+        store = BandwidthStore::new();
+        assert!(!store.has_storage());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn detached_consolidation_sums_deltas_saturates_and_skips_reported_entries() {
         let mut first = BandwidthStore::new();
         let mut second = BandwidthStore::new();
         let outbound = connection(1);
@@ -1171,7 +1327,7 @@ mod tests {
             protocol: 6,
             ipv6: false,
         };
-        first.remove_group(removed);
+        first.retain_after(removed);
         assert_eq!(first.len(), 1);
         assert_eq!(
             first.add(9, &outbound, 1, &mut BandwidthWork::empty()),
@@ -1188,29 +1344,27 @@ mod tests {
         assert!(first.consolidate());
         assert_eq!(first.banks.len(), 1);
         assert_eq!(first.len(), 2);
-        let group = first.next_group(None).unwrap();
-        assert_eq!(group, removed);
         let mut entries = Vec::new();
-        first.visit_group(group, &mut |entry| entries.push(entry));
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].remote_ip, connection(6).remote_ip);
-        assert_eq!(entries[0].transmitted_bytes, 456);
-        let group = first.next_group(Some(group)).unwrap();
-        assert_eq!(group.interface_index, 9);
-        entries.clear();
-        first.visit_group(group, &mut |entry| entries.push(entry));
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].transmitted_bytes, u64::MAX);
-        assert_eq!(entries[0].received_bytes, u64::MAX);
-        assert_eq!(first.next_group(Some(group)), None);
-        first.remove_group(group);
+        first.visit_totals(&mut |index, connection, tx, rx| {
+            entries.push((index, connection.remote_ip, tx, rx));
+        });
+        entries.sort_unstable_by_key(|entry| entry.0);
+        assert_eq!(
+            entries,
+            [
+                (3, connection(6).remote_ip, 456, 0),
+                (9, outbound.remote_ip, u64::MAX, u64::MAX),
+            ]
+        );
+        first.retain_after(removed);
         assert_eq!(first.len(), 1);
-        first.remove_group(group);
-        assert_eq!(first.len(), 1);
-        first.remove_group(removed);
+        first.retain_after(BandwidthGroup {
+            interface_index: 9,
+            protocol: 6,
+            ipv6: false,
+        });
         assert!(first.is_empty());
         assert!(first.has_storage());
-        assert_eq!(first.next_group(None), None);
         let mut visits = 0;
         first.visit_totals(&mut |_, _, _, _| visits += 1);
         assert_eq!(visits, 0);

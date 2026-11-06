@@ -390,6 +390,7 @@ fn icmp_echo_verdicts_allow_each_packet_without_cache_or_tcp_udp_bandwidth() {
             engine.connect();
             for sequence in 0..4 {
                 for (index, bytes) in [(7, &request), (8, &response)] {
+                    assert!(engine.ensure_forward(index));
                     let packet = parse(bytes, ipv6, Direction::Outbound);
                     assert!(!packet.cacheable);
                     assert_eq!(packet.flow.l2_len, 0);

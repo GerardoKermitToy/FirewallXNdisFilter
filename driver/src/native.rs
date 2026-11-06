@@ -168,6 +168,25 @@ pub(crate) extern "C" fn hv_bugcheck() -> ! {
         )
     }
 }
+#[cold]
+#[inline(never)]
+fn pool_allocation_failed() -> ! {
+    #[cfg(not(test))]
+    unsafe {
+        KeBugCheckEx(HV_WDK_NO_PAGES_AVAILABLE as u32, 0, 0, 0, 0)
+    }
+    #[cfg(test)]
+    panic!("ExAllocatePool2 failed")
+}
+
+#[inline]
+pub(crate) fn pool_allocation(pointer: PVOID) -> PVOID {
+    if pointer.is_null() {
+        pool_allocation_failed();
+    }
+    pointer
+}
+
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
 extern "C" fn hv_lock() -> usize {
@@ -193,11 +212,11 @@ extern "C" fn hv_allocate(size: usize) -> *mut u8 {
         if size == 0 {
             null_mut()
         } else {
-            ExAllocatePool2(
+            pool_allocation(ExAllocatePool2(
                 (HV_WDK_POOL_FLAG_NON_PAGED | HV_WDK_POOL_FLAG_UNINITIALIZED) as u64,
                 size as u64,
                 TAG,
-            )
+            ))
             .cast()
         }
     }
@@ -214,11 +233,11 @@ extern "C" fn hv_cache_allocate(size: usize) -> *mut u8 {
         if size == 0 {
             null_mut()
         } else {
-            ExAllocatePool2(
+            pool_allocation(ExAllocatePool2(
                 (HV_WDK_POOL_FLAG_NON_PAGED | HV_WDK_POOL_FLAG_UNINITIALIZED) as u64,
                 size as u64,
                 CACHE_TAG,
-            )
+            ))
             .cast()
         }
     }
@@ -385,6 +404,15 @@ unsafe extern "C" fn pending_dpc(_: *mut KDPC, _: PVOID, _: PVOID, _: PVOID) {
 #[cfg(not(test))]
 unsafe extern "C" fn cache_dpc(_: *mut KDPC, _: PVOID, _: PVOID, _: PVOID) {
     hv_request_cache_cleanup();
+}
+
+#[cfg(test)]
+#[test]
+fn pool_allocation_failure_bugchecks_instead_of_returning_null() {
+    let mut byte = 0u8;
+    let pointer = (&mut byte as *mut u8).cast();
+    assert_eq!(pool_allocation(pointer), pointer);
+    assert!(std::panic::catch_unwind(|| pool_allocation(null_mut())).is_err());
 }
 
 #[cfg(test)]

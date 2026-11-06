@@ -576,11 +576,7 @@ pub(crate) unsafe extern "C" fn hv_wfp_native_initialize(driver: PDRIVER_OBJECT)
         }
         (*WFP_DEVICE).Flags &= !DO_DEVICE_INITIALIZING;
         WORK_ITEM = sys::IoAllocateWorkItem(WFP_DEVICE);
-        if WORK_ITEM.is_null() {
-            HV_WDK_STATUS_INSUFFICIENT_RESOURCES as NTSTATUS
-        } else {
-            HV_WDK_STATUS_SUCCESS as NTSTATUS
-        }
+        HV_WDK_STATUS_SUCCESS as NTSTATUS
     }
 }
 #[unsafe(no_mangle)]
@@ -1021,14 +1017,6 @@ pub(crate) unsafe extern "C" fn hv_wfp_clone(
             return ptr::null_mut();
         }
         let context = allocate_packet_context(nbl);
-        if context.is_null() {
-            if grouped {
-                sys::FwpsFreeNetBufferList0(nbl);
-            } else {
-                sys::FwpsFreeCloneNetBufferList0(nbl, 0);
-            }
-            return ptr::null_mut();
-        }
         (*context).owner = if grouped {
             OWNER_WFP_REASSEMBLED
         } else {

@@ -824,8 +824,6 @@ fn actual_classification_validation_self_exemption_allocation_failures_and_chain
         state(|s| s.clone_status = failed_status());
         assert!(blocked(&packet.classify(false, flags)));
         state(|s| s.clone_status = 0);
-        crate::native_packet::fail_next_context_allocation();
-        assert!(blocked(&packet.classify(false, flags)));
         assert!(state(|s| s.live.is_empty()));
     }
     let mut second = NET_BUFFER_LIST::default();

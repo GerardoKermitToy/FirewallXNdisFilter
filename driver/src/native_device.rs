@@ -419,22 +419,18 @@ unsafe extern "C" fn hv_initialize(driver: PDRIVER_OBJECT, registry: PUNICODE_ST
         let read_work_item = IoAllocateWorkItem(CONTROL_DEVICE);
         READ_WORK_ITEM.store(read_work_item, Ordering::Release);
         CACHE_WORK_ITEM = IoAllocateWorkItem(CONTROL_DEVICE);
-        if read_work_item.is_null() || CACHE_WORK_ITEM.is_null() {
-            status = HV_WDK_STATUS_INSUFFICIENT_RESOURCES;
-        } else {
-            (*CONTROL_DEVICE).Flags |= DO_BUFFERED_IO;
-            if STANDALONE_WFP {
-                status = IoCreateSymbolicLink(addr_of_mut!(LINK_NAME), addr_of_mut!(DEVICE_NAME));
-                if nt_success(status) {
-                    STANDALONE_LINK_CREATED = true;
-                }
-            }
+        (*CONTROL_DEVICE).Flags |= DO_BUFFERED_IO;
+        if STANDALONE_WFP {
+            status = IoCreateSymbolicLink(addr_of_mut!(LINK_NAME), addr_of_mut!(DEVICE_NAME));
             if nt_success(status) {
-                schedule_read();
-                (*CONTROL_DEVICE).Flags &= !DO_DEVICE_INITIALIZING;
-                registry::signal_driver_ready();
-                return HV_WDK_STATUS_SUCCESS;
+                STANDALONE_LINK_CREATED = true;
             }
+        }
+        if nt_success(status) {
+            schedule_read();
+            (*CONTROL_DEVICE).Flags &= !DO_DEVICE_INITIALIZING;
+            registry::signal_driver_ready();
+            return HV_WDK_STATUS_SUCCESS;
         }
         unload(driver);
         status

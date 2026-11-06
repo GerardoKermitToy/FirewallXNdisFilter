@@ -25,7 +25,7 @@ impl ParserScratch {
     pub fn read(
         &mut self,
         mut snapshot: impl FnMut(*mut u8) -> Snapshot,
-        allocate: impl FnOnce(usize) -> Option<Vec<u8>>,
+        allocate: impl FnOnce(usize) -> Vec<u8>,
     ) -> Result<Snapshot, SnapshotError> {
         let storage = self
             .bytes
@@ -33,7 +33,7 @@ impl ParserScratch {
             .map_or(core::ptr::null_mut(), |bytes| bytes.as_mut_ptr());
         let mut view = snapshot(storage);
         if view.data.is_null() && view.frame_len != 0 && self.bytes.is_none() {
-            let mut bytes = allocate(SNAPSHOT).ok_or(SnapshotError::Resource)?;
+            let mut bytes = allocate(SNAPSHOT);
             if bytes.len() < SNAPSHOT {
                 return Err(SnapshotError::Resource);
             }

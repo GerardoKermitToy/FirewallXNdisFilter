@@ -1,6 +1,5 @@
-use alloc::alloc::{alloc, dealloc};
+use alloc::{alloc::dealloc, boxed::Box};
 use core::{alloc::Layout, marker::PhantomData, ptr::NonNull};
-use likely_stable::unlikely;
 
 struct Node<T> {
     previous: Option<Handle<T>>,
@@ -18,9 +17,8 @@ impl<T> Clone for Handle<T> {
     }
 }
 
-// Fallible, fixed-size allocations: growth never relocates live elements or
-// copies an ever-growing array while the driver's policy spin lock is held.
-// The kernel uses fallible nonpaged allocation without an aggregate byte quota.
+// Fixed-size nodes do not relocate live elements or copy a growing array while
+// the driver's policy spin lock is held. Length overflow remains checked.
 pub(crate) struct List<T> {
     head: Option<Handle<T>>,
     tail: Option<Handle<T>>,
@@ -52,21 +50,14 @@ impl<T> List<T> {
         let Some(len) = self.len.checked_add(1) else {
             return Err(value);
         };
-        // SAFETY: this is a nonzero layout, freed with the same layout below.
-        // The driver supplies fallible, nonpaged GlobalAlloc at DISPATCH_LEVEL.
-        let node = unsafe { alloc(Layout::new::<Node<T>>()) }.cast::<Node<T>>();
-        if unlikely(node.is_null()) {
-            return Err(value);
-        }
-        // SAFETY: the fallible allocation was checked for null above.
-        let node = unsafe { NonNull::new_unchecked(node) };
+        let node = Box::new(Node {
+            previous: self.tail,
+            next: None,
+            value,
+        });
+        let node = NonNull::from(Box::leak(node));
         let handle = Handle(node);
         unsafe {
-            node.as_ptr().write(Node {
-                previous: self.tail,
-                next: None,
-                value,
-            });
             if let Some(tail) = self.tail {
                 (*tail.0.as_ptr()).next = Some(handle);
             } else {

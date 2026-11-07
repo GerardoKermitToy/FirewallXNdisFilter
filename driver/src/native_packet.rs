@@ -20,13 +20,10 @@ use tests::calls as api;
 pub(crate) const TAG: u32 = u32::from_be_bytes(*b"gVHH");
 const CONTEXT_TAG: u32 = u32::from_be_bytes(*b"nVHH");
 
-// The discriminants are the shared packet-owner contract, not NDIS directions.
 pub(crate) const OWNER_NDIS: u32 = 0;
-pub(crate) const OWNER_WFP_CLONE: u32 = 1;
-pub(crate) const OWNER_WFP_REASSEMBLED: u32 = 2;
 const NDIS_PATH_SEND: u32 = 0;
 
-/// Driver-owned NBL context, matching the former HV_NBL_CONTEXT exactly.
+/// Driver-owned NBL context for NDIS ownership and completion.
 /// NDIS context backfill guarantees pointer alignment, not 16-byte alignment.
 #[repr(C)]
 pub(crate) struct PacketContext {
@@ -34,27 +31,21 @@ pub(crate) struct PacketContext {
     pub(crate) signature: u32,
     pub(crate) flags: u32,
     pub(crate) direction: u32,
-    pub(crate) forward_interface: u32,
-    pub(crate) forward_sub_interface: u32,
-    pub(crate) compartment: u32,
     pub(crate) port: NDIS_PORT_NUMBER,
     pub(crate) owner: u32,
     pub(crate) copied: u8,
     pub(crate) forwarded: u8,
-    pub(crate) ipv6: u8,
-    pub(crate) segmented: u8,
 }
 
 const _: () = {
     assert!(align_of::<PacketContext>() <= align_of::<*mut c_void>());
     assert!(size_of::<PacketContext>().is_multiple_of(size_of::<*mut c_void>()));
     assert!(size_of::<PacketContext>() <= u16::MAX as usize);
-    assert!(size_of::<PacketContext>() == 48);
+    assert!(size_of::<PacketContext>() == 32);
     assert!(offset_of!(PacketContext, signature) == 8);
-    assert!(offset_of!(PacketContext, port) == 32);
-    assert!(offset_of!(PacketContext, owner) == 36);
-    assert!(offset_of!(PacketContext, copied) == 40);
-    assert!(offset_of!(PacketContext, segmented) == 43);
+    assert!(offset_of!(PacketContext, port) == 20);
+    assert!(offset_of!(PacketContext, owner) == 24);
+    assert!(offset_of!(PacketContext, copied) == 28);
 };
 
 #[inline]
@@ -185,6 +176,33 @@ pub(crate) unsafe fn map_mdl(mdl: *mut MDL) -> *mut u8 {
             )
             .cast()
         }
+    }
+}
+
+/// Read one byte relative to the current NB data start without changing offsets.
+/// Used for local TCP LSO completion, including split MDL chains.
+pub(crate) unsafe fn read_byte(nb: *mut NET_BUFFER, mut offset: u32) -> Option<u8> {
+    unsafe {
+        if nb.is_null() || offset >= data_length(nb) {
+            return None;
+        }
+        let mut mdl = current_mdl(nb);
+        let mut skip = current_mdl_offset(nb);
+        while !mdl.is_null() {
+            let length = (*mdl).ByteCount;
+            if skip > length {
+                return None;
+            }
+            let available = length - skip;
+            if offset < available {
+                let data = map_mdl(mdl);
+                return (!data.is_null()).then(|| *data.add((skip + offset) as usize));
+            }
+            offset -= available;
+            skip = 0;
+            mdl = (*mdl).Next;
+        }
+        None
     }
 }
 
@@ -328,20 +346,11 @@ pub(crate) unsafe fn copy_receive(
 pub(crate) unsafe fn snapshot_offload(nbl: *mut NET_BUFFER_LIST) -> u32 {
     unsafe {
         let context = packet_context(nbl);
-        if (*context).owner == OWNER_NDIS {
-            return u32::from(if (*context).direction == NDIS_PATH_SEND {
-                send_segmented(nbl)
-            } else {
-                receive_coalesced(nbl)
-            });
-        }
-        u32::from(
-            (*nbl).NetBufferListInfo[TcpRecvSegCoalesceInfo as usize] as usize as u32 != 0
-                || (*context).segmented != 0
-                || (*nbl).NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize] as usize as u32
-                    != 0
-                || !(*nbl).NetBufferListInfo[TcpReceiveBytesTransferred as usize].is_null(),
-        )
+        u32::from(if (*context).direction == NDIS_PATH_SEND {
+            send_segmented(nbl)
+        } else {
+            receive_coalesced(nbl)
+        })
     }
 }
 

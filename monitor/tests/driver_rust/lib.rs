@@ -1,7 +1,7 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-// The same modules as the SYS, without WDK layouts or WFP test stubs.
+// The same modules as the SYS, without WDK layouts.
 #[path = "../../../driver/src/adapter_info.rs"]
 mod adapter_info;
 #[path = "../../../driver/src/device_control.rs"]

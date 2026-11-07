@@ -427,7 +427,7 @@ int main() {
     }
     CHECK(ReadBindingAdapters(config.Get(), adapter_instances) == S_OK && adapter_instances.size() == 4096);
     config->components.push_back(target);
-    CHECK(ReadBindingAdapters(config.Get(), adapter_instances) == E_UNEXPECTED && adapter_instances.empty());
+    CHECK(ReadBindingAdapters(config.Get(), adapter_instances) == S_OK && adapter_instances.size() == 4097);
     CHECK(config->mutations == 0);
     std::puts("PASS: adapter GetClassGuid/E_POINTER regression, class-scoped inventory, fail-closed COM errors and bounds; fake COM only.");
     return 0;

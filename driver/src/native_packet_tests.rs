@@ -401,10 +401,7 @@ fn context_uses_exact_owner_layout_and_pointer_aligned_backfill() {
     reset(None);
     assert_eq!(TAG, 0x6756_4848);
     assert_eq!(CONTEXT_TAG, 0x6e56_4848);
-    assert_eq!(
-        (OWNER_NDIS, OWNER_WFP_CLONE, OWNER_WFP_REASSEMBLED),
-        (0, 1, 2)
-    );
+    assert_eq!(OWNER_NDIS, 0);
     let mut nbl = NET_BUFFER_LIST::default();
     unsafe {
         let context = allocate_packet_context(&mut nbl);
@@ -769,6 +766,28 @@ fn split_snapshots_require_scratch_and_report_observed_length_on_mapping_failure
 }
 
 #[test]
+fn single_byte_reads_walk_split_mdls_without_mutating_offsets() {
+    reset(None);
+    let mut input = Input::new(&[b"xxabc", b"defyy"], 2, 6);
+    let nb = &mut *input.nb as *mut NET_BUFFER;
+    unsafe {
+        assert_eq!(read_byte(nb, 0), Some(b'a'));
+        assert_eq!(read_byte(nb, 2), Some(b'c'));
+        assert_eq!(read_byte(nb, 3), Some(b'd'));
+        assert_eq!(read_byte(nb, 5), Some(b'f'));
+        assert_eq!(read_byte(nb, 6), None);
+        assert_eq!(read_byte(null_mut(), 0), None);
+        assert_eq!(current_mdl_offset(nb), 2);
+        assert_eq!((*nb).__bindgen_anon_1.__bindgen_anon_1.DataOffset, 2);
+        input.mdls[1].MdlFlags = 0;
+        assert_eq!(read_byte(nb, 3), None); // failed mapping
+        (*nb).__bindgen_anon_1.__bindgen_anon_1.CurrentMdlOffset = 6;
+        assert_eq!(read_byte(nb, 0), None); // invalid current offset
+    }
+    assert_no_leaks();
+}
+
+#[test]
 fn offload_detection_preserves_ndis_path_and_uso_uro_low_dword_semantics() {
     reset(None);
     let mut nbl = NET_BUFFER_LIST::default();
@@ -796,34 +815,6 @@ fn offload_detection_preserves_ndis_path_and_uso_uro_low_dword_semantics() {
         nbl.NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize] = null_mut();
         nbl.NetBufferListInfo[UdpSegmentationOffloadInfo as usize] = 1 as PVOID;
         assert_eq!(snapshot_offload(&mut nbl), 1);
-        free_packet_context(&mut nbl);
-    }
-    assert_no_leaks();
-}
-
-#[test]
-fn wfp_offload_snapshot_retains_preclone_scalar_profile_and_transfer_marker() {
-    reset(None);
-    let mut nbl = NET_BUFFER_LIST::default();
-    unsafe {
-        let context = allocate_packet_context(&mut nbl);
-        for owner in [OWNER_WFP_CLONE, OWNER_WFP_REASSEMBLED] {
-            (*context).owner = owner;
-            assert_eq!(snapshot_offload(&mut nbl), 0);
-            (*context).segmented = 1;
-            assert_eq!(snapshot_offload(&mut nbl), 1);
-            (*context).segmented = 0;
-            for slot in [TcpLargeSendNetBufferListInfo, TcpRecvSegCoalesceInfo] {
-                nbl.NetBufferListInfo[slot as usize] = (1usize << 32) as PVOID;
-                assert_eq!(snapshot_offload(&mut nbl), 0);
-                nbl.NetBufferListInfo[slot as usize] = 1usize as PVOID;
-                assert_eq!(snapshot_offload(&mut nbl), 1);
-                nbl.NetBufferListInfo[slot as usize] = null_mut();
-            }
-            nbl.NetBufferListInfo[TcpReceiveBytesTransferred as usize] = (1usize << 32) as PVOID;
-            assert_eq!(snapshot_offload(&mut nbl), 1);
-            nbl.NetBufferListInfo[TcpReceiveBytesTransferred as usize] = null_mut();
-        }
         free_packet_context(&mut nbl);
     }
     assert_no_leaks();

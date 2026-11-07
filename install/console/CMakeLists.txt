@@ -1,8 +1,6 @@
 add_library(hyperv_xndis_filter_setup STATIC
     Management.cpp
     WindowsSetup.cpp
-    Target.cpp
-    Hns.cpp
     Package.cpp
     DriverStore.cpp
 )
@@ -13,7 +11,7 @@ target_compile_definitions(hyperv_xndis_filter_setup PUBLIC
     _WIN32_WINNT=0x0A00 WINVER=0x0A00
 )
 target_link_libraries(hyperv_xndis_filter_setup PUBLIC
-    ole32 oleaut32 runtimeobject uuid advapi32 wbemuuid iphlpapi setupapi newdev wintrust crypt32
+    ole32 oleaut32 uuid advapi32 iphlpapi setupapi newdev wintrust crypt32
 )
 set_target_properties(hyperv_xndis_filter_setup PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")

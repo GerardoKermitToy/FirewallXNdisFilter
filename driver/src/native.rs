@@ -48,8 +48,6 @@ static mut DRIVER_HANDLE: NDIS_HANDLE = null_mut();
 static mut DEVICE_HANDLE: NDIS_HANDLE = null_mut();
 static mut CONTROL_DEVICE: PDEVICE_OBJECT = null_mut();
 static mut FILTER_NDIS_VERSION: u32 = 0;
-static mut STANDALONE_WFP: bool = false;
-static mut STANDALONE_LINK_CREATED: bool = false;
 static mut READY_EVENT_HANDLE: HANDLE = null_mut();
 static mut READY_EVENT: PKEVENT = null_mut();
 static mut POLICY_LOCK: KSPIN_LOCK = 0;
@@ -248,22 +246,6 @@ extern "C" fn hv_cache_allocate(size: usize) -> *mut u8 {
 unsafe extern "C" fn hv_cache_free(data: *mut u8, _: usize) {
     unsafe { ExFreePoolWithTag(data.cast(), CACHE_TAG) }
 }
-#[cfg(not(test))]
-#[unsafe(no_mangle)]
-pub(crate) extern "C" fn hv_wfp_driver_stopping() -> u8 {
-    u8::from(is_stopping())
-}
-#[cfg(not(test))]
-#[unsafe(no_mangle)]
-pub(crate) extern "C" fn hv_wfp_session_acquire() -> u8 {
-    unsafe { ExAcquireRundownProtection(addr_of_mut!(CLASSIFICATION_RUNDOWN)) }
-}
-#[cfg(not(test))]
-#[unsafe(no_mangle)]
-pub(crate) extern "C" fn hv_wfp_session_release() {
-    unsafe { ExReleaseRundownProtection(addr_of_mut!(CLASSIFICATION_RUNDOWN)) }
-}
-
 unsafe fn close_classification_session() {
     unsafe {
         if CLASSIFICATION_CLOSED {
@@ -298,10 +280,6 @@ unsafe fn open_classification_session() {
         #[cfg(not(test))]
         {
             crate::HvConnect();
-            unsafe extern "C" {
-                fn HvWfpReportStatus();
-            }
-            HvWfpReportStatus();
         }
         #[cfg(test)]
         {

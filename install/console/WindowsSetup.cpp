@@ -123,7 +123,7 @@ std::vector<Path> Paths(Network& network) {
         HRESULT result = enumerator->Next(1, &entry.path, &fetched);
         if (result == S_FALSE && fetched == 0 && !entry.path) break;
         Check(result, L"Read HyperVXNdisFilter binding path");
-        if (result != S_OK || fetched != 1 || !entry.path || paths.size() == 4096) throw Error{L"Invalid or excessive NetCfg binding paths."};
+        if (result != S_OK || fetched != 1 || !entry.path) throw Error{L"Invalid NetCfg binding path."};
         result = entry.path->IsEnabled();
         if (result != S_OK && result != S_FALSE) {
             Check(result, L"Read HyperVXNdisFilter binding state");
@@ -235,7 +235,26 @@ public:
         if (GetLastError() != ERROR_NO_MORE_FILES) throw Error{L"Read process list: " + ErrorCode(GetLastError())};
     }
 
-    Targets ResolveTargets() override { return ResolveWindowsTargets(); }
+    Targets ResolveTargets() override {
+        std::unique_ptr<Network> readonly;
+        if (!network_) readonly = std::make_unique<Network>(false);
+        Network& network = network_ ? *network_ : *readonly;
+        if (!network.Component()) return {};
+        Targets targets;
+        for (const auto& entry : Paths(network)) {
+            const GUID& guid = entry.binding.adapter;
+            if (std::any_of(targets.begin(), targets.end(), [&](const Adapter& target) { return target.guid == guid; })) continue;
+            NET_LUID luid{};
+            GUID round_trip{};
+            if (ConvertInterfaceGuidToLuid(&guid, &luid) != NO_ERROR || !luid.Value ||
+                ConvertInterfaceLuidToGuid(&luid, &round_trip) != NO_ERROR || round_trip != guid) {
+                throw Error{L"A filter binding path no longer has a valid NETIO adapter identity."};
+            }
+            targets.push_back({guid, luid.Value, GuidText(guid)});
+        }
+        ValidateTargets(targets);
+        return targets;
+    }
     bool HasService() override { return KeyExists(kServiceKey); }
     bool HasComponent() override {
         if (network_) return static_cast<bool>(network_->Component());
@@ -247,21 +266,13 @@ public:
         package_ = std::filesystem::canonical(package);
         files_ = LockAndVerifyPackage(package_);
         store_files_ = LockMatchingWindowsDriverPackages(files_);
-        Print(L"Package signatures, catalog membership, target-restricted INF and existing Driver Store files verified.\n");
+        Print(L"Package signatures, catalog membership, Ethernet LWF INF and existing Driver Store files verified.\n");
     }
 
     void VerifyConfiguration(const Targets& targets) override {
         ValidateTargets(targets);
         TargetConfig config;
-        CheckWin32(ReadTargetConfig(config, false), L"Read configured target allowlist (schema 3 required; reinstall older configurations)");
-        if (HvTargetsRead32(config.data.data()) != targets.size()) {
-            throw Error{L"Configured target set changed. Uninstall and reinstall explicitly; no automatic retargeting is allowed."};
-        }
-        for (const auto& target : targets) {
-            if (!config.Matches(target.guid, target.luid)) {
-                throw Error{L"Configured GUID/NET_LUID does not match a current HNS ICS host vNIC. Uninstall and reinstall explicitly; no automatic retargeting is allowed."};
-            }
-        }
+        CheckWin32(ReadTargetConfig(config, false), L"Read binding configuration (schema 4 required; uninstall and reinstall older configurations)");
     }
 
     bool Confirm(const std::wstring& action) override {
@@ -276,28 +287,16 @@ public:
 
     void WriteDisarmedConfiguration(const Targets& targets) override {
         ValidateTargets(targets);
-        TargetConfig config;
-        unsigned int size = 0;
-        if (!HvTargetsSize(static_cast<unsigned int>(targets.size()), &size)) throw Error{L"Target configuration size overflow."};
-        config.data.resize(size);
-        HvTargetsWrite32(config.data.data(), static_cast<unsigned int>(targets.size()));
-        for (size_t i = 0; i < targets.size(); ++i) {
-            auto* entry = config.data.data() + 4 + i * HV_TARGET_ENTRY_SIZE;
-            CopyMemory(entry, &targets[i].guid, sizeof(GUID));
-            HvTargetsWrite64(entry + 16, targets[i].luid);
-        }
         RegistryKey key;
         CheckWin32(RegCreateKeyExW(HKEY_LOCAL_MACHINE, kConfigKey, 0, nullptr, 0,
-                                  kDurableConfigAccess, nullptr, &key.value, nullptr), L"Create target configuration");
-        const DWORD disarmed = 0, version = HV_TARGET_CONFIG_VERSION;
+                                  kDurableConfigAccess, nullptr, &key.value, nullptr), L"Create binding configuration");
+        const DWORD disarmed = 0, version = kBindingConfigVersion;
         CheckWin32(RegSetValueExW(key.value, L"AutoRepairAllowed", 0, REG_DWORD,
                                  reinterpret_cast<const BYTE*>(&disarmed), sizeof(disarmed)), L"Block runtime recovery during installation");
         CheckWin32(RegFlushKey(key.value), L"Persist installer-controlled recovery state");
         CheckWin32(RegSetValueExW(key.value, L"AllowBindings", 0, REG_DWORD,
                                  reinterpret_cast<const BYTE*>(&disarmed), sizeof(disarmed)), L"Disarm bindings before installation");
-        CheckWin32(RegFlushKey(key.value), L"Persist disarmed state before changing target identities");
-        CheckWin32(RegSetValueExW(key.value, L"TargetAdapters", 0, REG_BINARY,
-                                 config.data.data(), size), L"Write exact target GUID/NET_LUID allowlist");
+        CheckWin32(RegFlushKey(key.value), L"Persist disarmed state before changing configuration schema");
         CheckWin32(RegSetValueExW(key.value, L"ConfigVersion", 0, REG_DWORD,
                                  reinterpret_cast<const BYTE*>(&version), sizeof(version)), L"Write target configuration version");
         CheckWin32(RegFlushKey(key.value), L"Persist disarmed target configuration");
@@ -413,10 +412,16 @@ private:
         HRESULT operation = S_OK;
         bool changed = false;
         for (auto& entry : paths) {
-            const bool target = std::any_of(targets.begin(), targets.end(), [&](const Adapter& adapter) {
+            const auto target = std::find_if(targets.begin(), targets.end(), [&](const Adapter& adapter) {
                 return entry.binding.adapter == adapter.guid;
             });
-            if (!target || entry.binding.enabled == enabled) continue;
+            if (target == targets.end() || entry.binding.enabled == enabled) continue;
+            NET_LUID current{};
+            GUID round_trip{};
+            if (ConvertInterfaceGuidToLuid(&target->guid, &current) != NO_ERROR || current.Value != target->luid ||
+                ConvertInterfaceLuidToGuid(&current, &round_trip) != NO_ERROR || round_trip != target->guid) {
+                throw Error{L"A binding adapter identity changed during setup."};
+            }
             const HRESULT result = entry.path->Enable(enabled ? TRUE : FALSE);
             Check(result, enabled ? L"Enable exact target binding path" : L"Disable exact target binding path before arming");
             changed = true;

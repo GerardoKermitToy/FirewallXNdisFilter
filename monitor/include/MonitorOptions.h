@@ -17,7 +17,6 @@ struct Endpoint {
 
 struct Options {
     std::wstring out_path;
-    std::wstring sys_path; // Empty: HyperVXNdisFilter.sys beside the monitor EXE.
     unsigned duration_s = 0; // Omitted: run until Ctrl+C.
     unsigned poll_ms = 1000;
     unsigned verdict_delay_ms = 0;
@@ -43,6 +42,6 @@ bool ParseOptions(int argc, const wchar_t* const* argv, Options& options, std::s
 void PrintUsage(FILE* output = stdout);
 bool MatchesEndpoint(const Endpoint& endpoint, const std::string& ip, uint16_t port);
 bool ShowConnection(const Options& options, const Connection& connection);
-bool AlternateMatches(const Options& options, const Connection& connection, bool reverse = false);
+bool AlternateMatches(const Options& options, const Connection& connection);
 
 } // namespace pmkext::monitor

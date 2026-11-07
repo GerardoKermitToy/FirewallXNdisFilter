@@ -43,7 +43,7 @@ inline HRESULT ReadBindingAdapters(INetCfg* config, std::vector<GUID>& adapters)
             return S_OK;
         }
         if (hr != S_OK) return FAILED(hr) ? hr : E_UNEXPECTED;
-        if (fetched != 1 || !component || inspected.size() == 4096) return E_UNEXPECTED;
+        if (fetched != 1 || !component) return E_UNEXPECTED;
         GUID instance{};
         hr = component->GetInstanceGuid(&instance);
         if (hr != S_OK) return FAILED(hr) ? hr : E_UNEXPECTED;

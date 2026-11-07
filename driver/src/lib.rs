@@ -13,15 +13,15 @@ mod device_control;
 #[cfg(feature = "native-wdk")]
 mod native;
 #[cfg(feature = "native-wdk")]
-mod native_packet;
+mod native_local_address;
 #[cfg(feature = "native-wdk")]
-mod native_wfp;
+mod native_packet;
 mod packet_snapshot;
 mod send_guard;
 mod target_config;
+mod transit_packet;
 #[cfg(feature = "native-wdk")]
 mod wdk;
-mod wfp;
 
 use alloc::vec::Vec;
 use core::{
@@ -167,7 +167,7 @@ fn finish_code(finish: Finish) -> i32 {
 }
 fn finish(a: Action) {
     // SAFETY: claiming a pending entry transfers its one owned NBL. The native Rust
-    // layer retains its NDIS module or independent WFP packet rundown until finish.
+    // layer retains its NDIS module until finish.
     unsafe { hv_finish(a.nbl, finish_value(a.finish)) }
 }
 // Old per-interface cache banks move out one at a time, keeping the kernel
@@ -244,12 +244,6 @@ pub extern "C" fn HvDrain() {
     reclaim_retired();
     drain();
 }
-#[unsafe(no_mangle)]
-pub extern "C" fn HvForwardStop() {
-    with_state(|e| e.stop_forward());
-    reclaim_retired();
-    drain();
-}
 fn clean_caches() {
     // Fixed cutoff and bounds finish a full pass without chasing new insertions.
     // Migration only moves entries still live at a later time, so concurrent
@@ -275,8 +269,33 @@ pub extern "C" fn HvCleanCaches() {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn HvConnect() {
-    with_state(|e| e.connect());
+    #[cfg(feature = "native-wdk")]
+    let available = native_local_address::available();
+    with_state(|e| {
+        e.connect();
+        #[cfg(feature = "native-wdk")]
+        if !available {
+            e.log(
+                4,
+                "Local IP inventory unavailable; transit policy is temporarily bypassed",
+            );
+        }
+    });
     reclaim_retired();
+}
+
+#[cfg(feature = "native-wdk")]
+pub(crate) fn local_address_status(available: bool) {
+    with_state(|e| {
+        if available {
+            e.log(3, "Local IP inventory is ready");
+        } else {
+            e.log(
+                4,
+                "Local IP inventory unavailable; transit policy is temporarily bypassed",
+            );
+        }
+    });
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn HvDisconnect() {
@@ -297,7 +316,7 @@ pub extern "C" fn HvCancel(interface_index: u32, cancel: usize) {
 }
 
 // Copy the first NB directly into the final record allocation. Ethernet input
-// leaves link-header space for the prefix; IPFORWARD input has no link header.
+// leaves link-header space for the prefix.
 // No packet-sized local arrays or buffer accesses under the policy lock.
 fn capture_packet(nb: Handle, nbl: usize, packet: &Packet) -> Result<Option<Vec<u8>>, ()> {
     let layout = packet.capture_layout().ok_or(())?;
@@ -327,45 +346,6 @@ fn capture_packet(nb: Handle, nbl: usize, packet: &Packet) -> Result<Option<Vec<
     Ok(Some(data))
 }
 
-#[derive(Clone, Copy)]
-enum PacketInput {
-    Ethernet(NdisPath, usize),
-    Ip(wire::Direction, bool, bool),
-}
-impl PacketInput {
-    fn is_forward(self) -> bool {
-        matches!(self, Self::Ip(..))
-    }
-    fn direction(self) -> wire::Direction {
-        match self {
-            Self::Ethernet(path, _) => path.direction(),
-            Self::Ip(direction, _, _) => direction,
-        }
-    }
-    fn cancel(self) -> Option<usize> {
-        match self {
-            Self::Ethernet(NdisPath::Send, cancel) => Some(cancel),
-            _ => None,
-        }
-    }
-    fn parse(
-        self,
-        bytes: &[u8],
-        trusted: usize,
-        length: usize,
-        offload: bool,
-    ) -> Result<Option<Packet>, packet::ParseError> {
-        match self {
-            Self::Ethernet(_, _) => packet::parse(bytes, trusted, length, offload),
-            Self::Ip(_, ipv6, cacheable) => {
-                let mut packet = packet::parse_ip(bytes, trusted, length, ipv6, offload)?;
-                packet.cacheable &= cacheable;
-                Ok(Some(packet))
-            }
-        }
-    }
-}
-
 // Return -1 when policy owns the nbl; otherwise the caller finishes it after
 // releasing the per-module classification lock. Ownership stays in the native Rust layer.
 #[unsafe(no_mangle)]
@@ -378,54 +358,23 @@ pub extern "C" fn HvClassify(
     send_guard: Handle,
 ) -> i32 {
     let Some(path) = NdisPath::decode(path) else {
-        with_state(|e| e.malformed());
+        with_state(|e| e.malformed(interface_index, "invalid NDIS packet direction"));
         return 1;
     };
-    classify(
-        nbl,
-        interface_index,
-        PacketInput::Ethernet(path, cancel),
-        session,
-        send_guard,
-    )
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn HvClassifyIp(
-    nbl: usize,
-    interface_index: u32,
-    direction: u32,
-    family: u32,
-    cacheable: u32,
-    session: u32,
-) -> i32 {
-    let Some(direction) = wire::Direction::decode(direction) else {
-        with_state(|e| e.malformed());
-        return 1;
-    };
-    if !matches!(family, 4 | 6) || cacheable > 1 {
-        with_state(|e| e.malformed());
-        return 1;
-    }
-    classify(
-        nbl,
-        interface_index,
-        PacketInput::Ip(direction, family == 6, cacheable != 0),
-        session,
-        core::ptr::null_mut(),
-    )
+    classify(nbl, interface_index, path, cancel, session, send_guard)
 }
 fn classify(
     nbl: usize,
     interface_index: u32,
-    input: PacketInput,
+    path: NdisPath,
+    cancel: usize,
     session: u32,
     send_guard: Handle,
 ) -> i32 {
-    let mut first: Option<Packet> = None;
-    let mut saw_non_ip = false;
+    let mut batch = transit_packet::PacketBatch::new();
     let mut nb = unsafe { hv_first_nb(nbl) };
     if unlikely(nb.is_null()) {
-        with_state(|e| e.malformed());
+        with_state(|e| e.malformed(interface_index, "NBL contains no network buffers"));
         return 1;
     }
     // Borrow a contiguous prefix; lazily reuse nonpaged scratch for split MDLs.
@@ -455,8 +404,12 @@ fn classify(
             Ok(view) => view,
             Err(error) => {
                 with_state(|e| match error {
-                    SnapshotError::Resource => e.resource_drop(),
-                    SnapshotError::Malformed => e.malformed(),
+                    SnapshotError::Resource => {
+                        e.resource_drop(interface_index, "packet snapshot unavailable")
+                    }
+                    SnapshotError::Malformed => {
+                        e.malformed(interface_index, "invalid or unreadable packet buffer")
+                    }
                 });
                 return 1;
             }
@@ -464,7 +417,7 @@ fn classify(
         // SAFETY: the shim returns the readable bounded NB prefix or our own
         // scratch. No view escapes parsing or survives pending publication.
         let data = unsafe { core::slice::from_raw_parts(view.data, view.copied as usize) };
-        let parsed = input.parse(
+        let parsed = packet::parse(
             data,
             view.trusted as usize,
             view.frame_len as usize,
@@ -472,51 +425,110 @@ fn classify(
         );
         match parsed {
             Ok(Some(p)) => {
-                if unlikely(saw_non_ip) {
-                    with_state(|e| e.malformed());
-                    return 1;
-                }
-                if let Some(f) = &mut first {
-                    // A single legacy request cannot describe two different flows.
-                    if unlikely(f.merge(&p).is_err()) {
-                        with_state(|e| e.malformed());
-                        return 1;
+                #[cfg(feature = "native-wdk")]
+                let scope = {
+                    use native_local_address::LocalMatch;
+                    let matched = if p.flow.ipv6 {
+                        native_local_address::lookup_v6(p.flow.source, p.flow.destination)
+                    } else {
+                        let src = p.flow.source;
+                        let dst = p.flow.destination;
+                        native_local_address::lookup_v4(
+                            [src[0], src[1], src[2], src[3]],
+                            [dst[0], dst[1], dst[2], dst[3]],
+                        )
+                    };
+                    match matched {
+                        LocalMatch::Local => transit_packet::IpScope::Local,
+                        LocalMatch::Transit => transit_packet::IpScope::Transit,
+                        LocalMatch::Unknown => transit_packet::IpScope::Unknown,
                     }
-                } else {
-                    first = Some(p);
+                };
+                #[cfg(not(feature = "native-wdk"))]
+                let scope = transit_packet::IpScope::Transit;
+                if batch.observe_ip(p, scope).is_err() {
+                    with_state(|e| {
+                        e.malformed(interface_index, "IP and non-IP data share one NBL")
+                    });
+                    return 1;
                 }
             }
             Ok(None) => {
-                if unlikely(first.is_some()) {
-                    with_state(|e| e.malformed());
+                if batch.observe_non_ip().is_err() {
+                    with_state(|e| {
+                        e.malformed(interface_index, "IP and non-IP data share one NBL")
+                    });
                     return 1;
                 }
-                saw_non_ip = true;
             }
             Err(packet::ParseError::TooLarge) => {
-                with_state(|e| e.resource_drop());
+                with_state(|e| {
+                    e.resource_drop(interface_index, "IP packet exceeds the supported size")
+                });
                 return 1;
             }
-            Err(_) => {
-                with_state(|e| e.malformed());
+            Err(error) => {
+                let reason = match error {
+                    packet::ParseError::Truncated => "truncated Ethernet or IP packet",
+                    packet::ParseError::Malformed => "invalid Ethernet or IP packet",
+                    packet::ParseError::TooManyVlans => "unsupported VLAN stack",
+                    packet::ParseError::TooLarge => "IP packet exceeds the supported size",
+                };
+                with_state(|e| e.malformed(interface_index, reason));
                 return 1;
             }
         }
         nb = unsafe { hv_next_nb(nb) };
     }
-    let Some(mut packet) = first else {
-        return with_state(|e| {
-            with_send_guard(send_guard, |cancelled| {
+    let decision = match batch.finish() {
+        Ok(decision) => decision,
+        Err(_) => {
+            with_state(|e| e.malformed(interface_index, "NBL contains incompatible IP flows"));
+            return 1;
+        }
+    };
+    let mut packet = match decision {
+        transit_packet::BatchDecision::Mixed => {
+            return with_state(|e| {
+                let cancelled = with_send_guard(send_guard, |cancelled| cancelled);
                 if cancelled {
                     finish_code(Finish::Cancel)
                 } else {
-                    e.non_ip();
+                    e.mixed_packet_bypass(interface_index);
                     finish_code(Finish::Allow)
                 }
-            })
-        });
+            });
+        }
+        transit_packet::BatchDecision::Unknown => {
+            // Preserve host connectivity while membership is unavailable. This is
+            // a temporary transit-policy bypass and is reported to the controller.
+            return with_state(|_| {
+                with_send_guard(send_guard, |cancelled| {
+                    finish_code(if cancelled {
+                        Finish::Cancel
+                    } else {
+                        Finish::Allow
+                    })
+                })
+            });
+        }
+        kind @ (transit_packet::BatchDecision::Local | transit_packet::BatchDecision::NonIp) => {
+            return with_state(|e| {
+                with_send_guard(send_guard, |cancelled| {
+                    if cancelled {
+                        finish_code(Finish::Cancel)
+                    } else {
+                        if matches!(kind, transit_packet::BatchDecision::NonIp) {
+                            e.non_ip();
+                        }
+                        finish_code(Finish::Allow)
+                    }
+                })
+            });
+        }
+        transit_packet::BatchDecision::Transit(packet) => packet,
     };
-    packet.orient_direction(input.direction());
+    packet.orient(path);
     if session == 0 {
         // The native Rust layer can close the policy rundown while the LWF remains bound.
         // Do not publish a pending event into a session that is being torn down;
@@ -531,8 +543,7 @@ fn classify(
             })
         });
     }
-    // Only NDIS sends have a cancel ID; WFP route metadata stays in the shim.
-    let cancel = input.cancel();
+    let cancel = (path == NdisPath::Send).then_some(cancel);
     let wants_event = match with_bandwidth(|e, work, now| {
         with_send_guard(send_guard, |cancelled| {
             if cancelled {
@@ -540,21 +551,6 @@ fn classify(
                     nbl,
                     finish: Finish::Cancel,
                 });
-            }
-            if input.is_forward() {
-                if !e.is_online() {
-                    return Err(Action {
-                        nbl,
-                        finish: e.fallback(),
-                    });
-                }
-                if !e.ensure_forward(interface_index) {
-                    e.resource_drop();
-                    return Err(Action {
-                        nbl,
-                        finish: Finish::Drop,
-                    });
-                }
             }
             e.preflight_with_work(interface_index, &packet, nbl, now, work)
         })
@@ -567,10 +563,7 @@ fn classify(
             Ok(record) => record,
             Err(()) => {
                 with_state(|e| {
-                    e.malformed();
-                    if input.is_forward() {
-                        e.reap_idle_forward(interface_index);
-                    }
+                    e.malformed(interface_index, "could not capture the complete IP packet")
                 });
                 return 1;
             }
@@ -585,8 +578,6 @@ fn classify(
                     nbl,
                     finish: Finish::Cancel,
                 })
-            } else if input.is_forward() {
-                e.submit_forward_with_work(interface_index, packet, nbl, now, record.take(), work)
             } else {
                 e.submit_with_work(
                     interface_index,
@@ -605,81 +596,25 @@ fn classify(
     }
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvWfpInjectionError(
-    status: u32,
-    ipv6: u32,
-    route: u32,
-    completion: u32,
-    destination_interface: u32,
-    failures: u32,
-) {
-    let family = if ipv6 != 0 { "IPv6" } else { "IPv4" };
-    let route = match route {
-        1 => "network-receive",
-        2 => "network-send",
-        _ => "forward",
-    };
-    let stage = if completion != 0 {
-        "completion"
-    } else {
-        "submit"
-    };
+pub extern "C" fn HvPausedDrop(interface_index: u32) {
+    with_state(|e| e.paused_drop(interface_index));
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn HvResourceDrop(interface_index: u32) {
     with_state(|e| {
-        e.log_args(
-            4,
-            format_args!(
-                "WFP {family} {route} injection {stage} failed: status=0x{status:08X} destination_interface={destination_interface} failures={failures}"
-            ),
-        );
+        e.resource_drop(
+            interface_index,
+            "packet copy failed: invalid, unreadable or unsupported data",
+        )
     });
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvWfpFragmentDiagnostic(
-    kind: u32,
-    flags: u32,
-    source_interface: u32,
-    destination_interface: u32,
-    first_nb_bytes: u32,
-    chained: u32,
-    count: u32,
-) {
-    let kind = match kind {
-        0 => "fragment-permit-original",
-        1 => "fragment-group-normal-policy",
-        _ => "large-packet-normal-policy",
-    };
-    with_state(|e| {
-        e.log_args(
-            3,
-            format_args!(
-                "WFP DIAGNOSTIC IPv4 {kind}: flags=0x{flags:08X} source_interface={source_interface} destination_interface={destination_interface} first_nb_bytes={first_nb_bytes} chained={chained} count={count}"
-            ),
-        );
-    });
+pub extern "C" fn HvInvalidLso(interface_index: u32) {
+    with_state(|e| e.packet_warning(interface_index, "invalid TCP LSO completion metadata"));
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvWfpStatus(healthy: u32) {
-    with_state(|e| {
-        if healthy != 0 {
-            e.log(
-                3,
-                "WFP IPFORWARD V4/V6 registration is ready for all forwarding interfaces",
-            );
-        } else {
-            e.log(
-                4,
-                "WFP IPFORWARD is unavailable (BFE or registration); NDIS filtering is independent",
-            );
-        }
-    });
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn HvPausedDrop() {
-    with_state(|e| e.paused_drop());
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn HvResourceDrop() {
-    with_state(|e| e.resource_drop());
+pub extern "C" fn HvSendFailure(interface_index: u32, status: i32) {
+    with_state(|e| e.send_failure(interface_index, status));
 }
 
 // Nonblocking stream copy for the native Rust layer's cancel-safe read worker. Empty

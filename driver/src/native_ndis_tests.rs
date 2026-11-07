@@ -69,6 +69,8 @@ struct State {
     cancel_after_pause: Option<usize>,
     paused_drops: u32,
     resource_drops: u32,
+    invalid_lso_warnings: Vec<u32>,
+    send_failure_warnings: Vec<(u32, NDIS_STATUS)>,
     snapshot_growth: usize,
     nbl_pools: usize,
     nb_pools: usize,
@@ -109,6 +111,8 @@ impl Default for State {
             cancel_after_pause: None,
             paused_drops: 0,
             resource_drops: 0,
+            invalid_lso_warnings: Vec::new(),
+            send_failure_warnings: Vec::new(),
             snapshot_growth: 0,
             nbl_pools: 0,
             nb_pools: 0,
@@ -694,11 +698,17 @@ pub(super) mod calls {
             }
         }
     }
-    pub(crate) fn HvPausedDrop() {
+    pub(crate) fn HvPausedDrop(_index: u32) {
         state(|s| s.paused_drops += 1);
     }
-    pub(crate) fn HvResourceDrop() {
+    pub(crate) fn HvResourceDrop(_index: u32) {
         state(|s| s.resource_drops += 1);
+    }
+    pub(crate) fn HvInvalidLso(index: u32) {
+        state(|s| s.invalid_lso_warnings.push(index));
+    }
+    pub(crate) fn HvSendFailure(index: u32, status: i32) {
+        state(|s| s.send_failure_warnings.push((index, status)));
     }
     pub(crate) fn HvClassify(
         nbl: usize,
@@ -907,6 +917,35 @@ fn send_inline_completion_preserves_flags_and_drops_context_before_upper_ownersh
 }
 
 #[test]
+fn failed_lower_send_is_reported_without_changing_completion_status() {
+    for (status, report) in [
+        (HV_WDK_NDIS_SUCCESS as NDIS_STATUS, false),
+        (HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS, false),
+        (HV_WDK_NDIS_RESOURCES as NDIS_STATUS, true),
+    ] {
+        let f = Fixture::new();
+        let mut a = f.adapter();
+        let mut source = Source::new();
+        state(|s| s.inline = false);
+        unsafe {
+            start(&mut *a);
+            send((&mut *a as *mut Adapter).cast(), &mut *source.nbl, 0, 0);
+            assert_eq!(a.active, 1);
+            source.nbl.__bindgen_anon_2.Status = status;
+            send_complete((&mut *a as *mut Adapter).cast(), &mut *source.nbl, 0);
+            assert_eq!(source.nbl.__bindgen_anon_2.Status, status);
+            assert_eq!(a.active, 0);
+            stop(&mut *a);
+        }
+        let warnings = state(|s| s.send_failure_warnings.clone());
+        assert_eq!(warnings.len(), usize::from(report));
+        if report {
+            assert_eq!(warnings[0], (77, status));
+        }
+    }
+}
+
+#[test]
 fn locally_dropped_lso_uses_completion_metadata() {
     let f = Fixture::new();
     let mut a = f.adapter();
@@ -960,6 +999,7 @@ fn locally_dropped_lso_uses_completion_metadata() {
             HV_WDK_NDIS_RESOURCES as NDIS_STATUS
         );
         assert!(malformed.nbl.NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize].is_null());
+        assert_eq!(state(|s| s.invalid_lso_warnings.clone()), [77]);
         stop(&mut *a);
     }
 }
@@ -1038,6 +1078,7 @@ fn paused_malformed_lso_keeps_pause_status_and_clears_transmit_metadata() {
             HV_WDK_NDIS_PAUSED as NDIS_STATUS
         );
         assert!(source.nbl.NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize].is_null());
+        assert_eq!(state(|s| s.invalid_lso_warnings.clone()), [77]);
     }
 }
 

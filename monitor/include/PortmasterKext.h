@@ -72,8 +72,8 @@ const char* ToString(InfoType t);
 // HyperVXNdisFilter captures an IP packet, so its payload_layer is always 3.
 const char* PayloadLayerToString(uint8_t layer);
 const char* ProtocolToString(uint8_t proto);
-// 0=guest outbound (NDIS receive / forwarding from target), 1=guest inbound
-// (NDIS send / forwarding towards target). Both paths use the same wire API.
+// 0=NDIS receive (host incoming), 1=NDIS send (host outgoing).
+// These describe the interception point, not guaranteed guest ownership.
 const char* DirectionToString(uint8_t dir);
 
 std::string FormatIpv4(const uint8_t ip[4]);
@@ -82,13 +82,14 @@ bool NormalizeIpAddress(const std::wstring& literal, std::string& normalized);
 
 // One event identifies one owned NBL pending one verdict. For a homogeneous
 // multi-NB NBL, payload is the complete first NB IP packet, not concatenated NB
-// data. Unsupported/mixed batches are dropped. interface_index identifies the host
+// data. Invalid/unsupported batches drop; local/transit mixed NBLs bypass policy.
+// interface_index identifies the host
 // adapter at the interception point, not a guest NIC. No process/thread is inferred.
 struct Connection {
     bool     ipv6 = false;
     uint64_t id = 0;
     uint32_t interface_index = 0;
-    uint8_t  direction = 0;  // NDIS: guest out=0/in=1. IPFORWARD: source-relative=0, local=source.
+    uint8_t  direction = 0;  // NDIS: host receive=0, host send=1.
     uint8_t  protocol = 0;
     uint8_t  local_ip[16] = {};
     uint8_t  remote_ip[16] = {};
@@ -104,8 +105,8 @@ struct Connection {
 };
 
 // Retained API/wire types. This LWF does not manufacture connection-end
-// events. Bandwidth counts admitted guest outbound/inbound IP bytes in
-// tx/rx, with no PID. Each record is one host-interface/protocol/address-family
+// events. Bandwidth counts admitted host receive/send IP bytes in tx/rx,
+// with no PID. Each record is one host-interface/protocol/address-family
 // group; its interface_index is the BaseMiniportIfIndex, not a guest interface.
 struct ConnectionEnd {
     bool     ipv6 = false;
@@ -202,7 +203,7 @@ public:
     Driver& operator=(const Driver&) = delete;
 
     // Compatibility stub: returns a descriptive unsupported error. Install the
-    // NDIS LWF explicitly with dist/Install.exe for all HNS ICS Hyper-V host vNICs.
+    // NDIS LWF explicitly with dist/Install.exe.
     // Neither this call nor Cleanup ever modifies SCM state.
     bool Install(const std::wstring& sys_path, std::string& error,
                  bool inbound_udp_pid_fallback = true);

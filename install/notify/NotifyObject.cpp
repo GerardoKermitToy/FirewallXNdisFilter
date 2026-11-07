@@ -1,4 +1,4 @@
-// NetCfg notification object: deny enabled binding paths outside the target vNIC.
+// NetCfg notification object: require armed configuration and an unambiguous adapter.
 // Not registered or loaded by the build; NetCfg owns its installation lifecycle.
 #include "BindingPolicy.h"
 #include "NetCfgTrace.h"

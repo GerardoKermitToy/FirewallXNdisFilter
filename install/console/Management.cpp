@@ -1,5 +1,4 @@
 #include "Management.h"
-#include "../../driver/shim/target_config.h"
 
 #include <algorithm>
 #include <cwchar>
@@ -16,7 +15,7 @@ void RequireFresh(System& system) {
 
 void RevalidateTargets(System& system, const Targets& targets) {
     if (!SameTargets(targets, system.ResolveTargets())) {
-        throw Error{L"The HNS ICS host vNIC set changed. No alternate adapter will be selected; uninstall and reinstall explicitly."};
+        throw Error{L"The compatible filter binding path set changed during setup; retry setup."};
     }
 }
 
@@ -76,7 +75,7 @@ int Enable(System& system, const Targets& targets) {
     RevalidateTargets(system, targets);
     system.VerifyConfiguration(targets);
     system.AllowRuntimeRecovery();
-    system.Print(L"HyperVXNdisFilter is enabled only on the exact configured HNS ICS host vNICs.\n");
+    system.Print(L"HyperVXNdisFilter is enabled on the enumerated compatible Ethernet binding paths. New paths can be admitted if Windows enables them.\n");
     return 0;
 }
 
@@ -144,96 +143,20 @@ std::wstring Usage(Action executable) {
         : L"Usage: Install.exe [--package DIRECTORY] [--yes] [--what-if]\n       Install.exe --enable [--yes] [--what-if]\n       Install.exe --help\n\n";
     result += uninstall
         ? L"Disarms and removes only the hyperv_xndis_filter NetCfg component, then\nremoves ALL identified HyperVXNdisFilter package versions from Driver Store.\nPackages in use require reboot and another Uninstall.exe run; no forced file\ndeletion is performed. No Default Switch, VM, HNS, NAT or unrelated driver is changed.\n"
-        : L"Installs the optional NDIS LWF on all Hyper-V management-OS Ethernet\nvNICs associated with HNS networks of type ICS, regardless of names.\nThe package directory defaults to the directory containing this EXE.\n--enable resumes an installed, disarmed component after a requested reboot;\nit never retargets a changed ICS adapter set or creates HNS networks.\n";
+        : L"Installs the optional Ethernet NDIS LWF and enables the present compatible\nNetCfg binding paths. Adapters without a standard Ethernet LWF path (including\nWireGuard) are not covered. The package defaults to this EXE's directory.\n--enable resumes the installed component using its currently available paths.\n";
     result += L"\nRun from an elevated Administrator/SYSTEM console; stop hyperv_monitor first.\nConfirmation is required unless --yes is supplied. --what-if performs read-only\npreflight without a write lock, registry writes, package deletion or binding changes.\n--help and invalid arguments do not access WMI, NetCfg, registry or the driver.\n\nExit codes: 0 success/dry run, 1 failure, 2 invalid arguments,\n1223 cancelled, 3010 reboot required (configuration retained disarmed).\nThe programs never open the driver device or create an SCM service manually.\n";
     return result;
 }
 
-bool ParseGuid(const std::wstring& text, GUID& guid) {
-    if (text.size() != 36 && text.size() != 38) return false;
-    if (text.size() == 38 && (text.front() != L'{' || text.back() != L'}')) return false;
-    const std::wstring braced = text.size() == 36 ? L"{" + text + L"}" : text;
-    return SUCCEEDED(CLSIDFromString(braced.c_str(), &guid)) && guid != GUID_NULL;
-}
-
-GUID InternalPortGuid(const std::wstring& device_id) {
-    constexpr std::wstring_view prefix = L"Microsoft:";
-    GUID guid{};
-    if (!std::wstring_view(device_id).starts_with(prefix) ||
-        !ParseGuid(device_id.substr(prefix.size()), guid)) {
-        throw Error{L"The management-OS internal Ethernet port has no valid interface GUID."};
-    }
-    return guid;
-}
-
-std::vector<GUID> SelectIcsSwitches(const std::vector<HnsNetwork>& networks) {
-    std::vector<GUID> ids, switches;
-    for (const auto& network : networks) {
-        if (network.type != L"ICS") continue;
-        if (network.id == GUID_NULL || network.switch_id == GUID_NULL ||
-            std::find(ids.begin(), ids.end(), network.id) != ids.end()) {
-            throw Error{L"An HNS ICS network identity is invalid or ambiguous. No fallback is allowed."};
-        }
-        ids.push_back(network.id);
-        // Multiple HNS networks may reference one switch; select its host vNICs once.
-        if (std::find(switches.begin(), switches.end(), network.switch_id) == switches.end()) {
-            switches.push_back(network.switch_id);
-        }
-    }
-    return switches;
-}
-
 void ValidateTargets(const Targets& targets) {
-    unsigned int size = 0;
-    if (targets.size() > MAXDWORD || !HvTargetsSize(static_cast<unsigned int>(targets.size()), &size)) {
-        throw Error{L"Invalid target adapter count or registry byte-length overflow."};
-    }
     for (size_t i = 0; i < targets.size(); ++i) {
         if (targets[i].guid == GUID_NULL || targets[i].luid == 0) throw Error{L"Invalid target GUID/NET_LUID."};
         for (size_t j = 0; j < i; ++j) {
             if (targets[i].guid == targets[j].guid || targets[i].luid == targets[j].luid) {
-                throw Error{L"The HNS ICS target identities are ambiguous."};
+                throw Error{L"The binding adapter identities are ambiguous."};
             }
         }
     }
-}
-
-Targets SelectTargets(const std::vector<GUID>& switches, const std::vector<HostPort>& ports,
-                      const std::vector<Adapter>& adapters, const std::vector<HnsNetwork>& networks) {
-    const auto selected = SelectIcsSwitches(networks);
-    Targets targets;
-    for (const auto& switch_id : selected) {
-        if (std::count(switches.begin(), switches.end(), switch_id) != 1) {
-            throw Error{L"An HNS ICS Hyper-V switch is missing or ambiguous. No name-based fallback is allowed."};
-        }
-        for (const auto& port : ports) {
-            if (std::find(port.switches.begin(), port.switches.end(), switch_id) == port.switches.end()) continue;
-            if (port.switches.size() != 1) throw Error{L"An HNS ICS management-OS port has ambiguous switch associations."};
-            const GUID guid = InternalPortGuid(port.device_id);
-            const Adapter* target = nullptr;
-            for (const auto& adapter : adapters) {
-                if (adapter.guid != guid) continue;
-                if (target) throw Error{L"The exact host adapter is ambiguous."};
-                target = &adapter;
-            }
-            if (!target) throw Error{L"The exact host adapter was not found. No alternate adapter will be selected."};
-            if (!target->is_virtual || target->hardware || target->interface_type != 6 || !target->luid) {
-                throw Error{L"The target is not an Ethernet host vNIC with a valid NET_LUID."};
-            }
-            targets.push_back(*target);
-        }
-    }
-    ValidateTargets(targets);
-    // Match PowerShell's canonical GUID text ordering, independent of HNS/WMI enumeration order.
-    std::sort(targets.begin(), targets.end(), [](const Adapter& left, const Adapter& right) {
-        const auto& a = left.guid;
-        const auto& b = right.guid;
-        if (a.Data1 != b.Data1) return a.Data1 < b.Data1;
-        if (a.Data2 != b.Data2) return a.Data2 < b.Data2;
-        if (a.Data3 != b.Data3) return a.Data3 < b.Data3;
-        return std::lexicographical_compare(a.Data4, a.Data4 + 8, b.Data4, b.Data4 + 8);
-    });
-    return targets;
 }
 
 bool SameTarget(const Adapter& first, const Adapter& second) {
@@ -273,24 +196,22 @@ int Execute(const Options& options, System& system) {
     if (options.action != Action::Uninstall) system.RequireSupportedOS();
     system.RequireMonitorStopped();
     Targets targets;
-    if (options.action != Action::Uninstall) {
+    if (options.action == Action::Install) {
+        RequireFresh(system);
+        system.ValidatePackage(options.package);
+        system.Print(L"Compatible binding paths will be enumerated after installation while the filter is disarmed.\n");
+    } else if (options.action == Action::Enable) {
+        if (!system.HasComponent()) throw Error{L"HyperVXNdisFilter is not installed. Run Install.exe without --enable first."};
         targets = system.ResolveTargets();
         ValidateTargets(targets);
-        if (options.action == Action::Install) {
-            RequireFresh(system);
-            system.ValidatePackage(options.package);
-        } else {
-            if (!system.HasComponent()) throw Error{L"HyperVXNdisFilter is not installed. Run Install.exe without --enable first."};
-            system.VerifyConfiguration(targets);
-            ValidateBindings(system.ReadBindings(), targets, false);
-        }
-        if (targets.empty()) {
-            system.Print(L"No HNS ICS host vNIC targets were discovered. Setup will continue without NDIS bindings.\n");
-        }
+        system.VerifyConfiguration(targets);
+        ValidateBindings(system.ReadBindings(), targets, false);
         for (const auto& target : targets) {
-            system.Print(L"Exact target: " + target.name + L", NET_LUID=" + std::to_wstring(target.luid) + L"\n");
+            system.Print(L"Binding adapter: " + target.name + L", NET_LUID=" + std::to_wstring(target.luid) + L"\n");
         }
-        system.Print(L"WARNING: this is the host-vNIC path, not all VM-to-VM traffic. Blocking verdicts can disconnect it.\n");
+    }
+    if (options.action != Action::Uninstall) {
+        system.Print(L"WARNING: the filter can affect host connectivity on every compatible Ethernet path; blocking verdicts can disconnect it. Some adapters have no LWF binding path.\n");
     }
     if (options.action == Action::Uninstall) {
         const auto packages = system.ReadDriverPackages();
@@ -303,8 +224,8 @@ int Execute(const Options& options, System& system) {
     }
     const std::wstring operation = options.action == Action::Uninstall
         ? L"Disarm and uninstall ONLY HyperVXNdisFilter, including ALL its Driver Store package versions"
-        : options.action == Action::Enable ? L"Enable ONLY the configured HNS ICS host bindings"
-                                          : L"Install HyperVXNdisFilter and enable ONLY the discovered HNS ICS host bindings";
+        : options.action == Action::Enable ? L"Enable all current compatible HyperVXNdisFilter binding paths"
+                                          : L"Install HyperVXNdisFilter and enable its compatible Ethernet binding paths";
     if (!options.yes && !system.Confirm(operation)) {
         system.Print(L"Cancelled. No system state was changed.\n");
         return ERROR_CANCELLED;
@@ -322,8 +243,8 @@ int Execute(const Options& options, System& system) {
         system.Print(L"HyperVXNdisFilter and all its Driver Store package versions removed. No other component, switch, VM, HNS or NAT setting was changed.\n");
         return 0;
     }
-    RevalidateTargets(system, targets);
     if (options.action == Action::Enable) {
+        RevalidateTargets(system, targets);
         if (!system.HasComponent()) throw Error{L"The installed HyperVXNdisFilter component disappeared."};
         try {
             return Enable(system, targets);
@@ -338,6 +259,12 @@ int Execute(const Options& options, System& system) {
         system.WriteDisarmedConfiguration(targets);
         attempted_install = true;
         if (system.InstallComponent(options.package) == Change::RebootRequired) return NeedsReboot(system);
+        targets = system.ResolveTargets();
+        ValidateTargets(targets);
+        if (targets.empty()) system.Print(L"No compatible Ethernet binding paths are currently available.\n");
+        for (const auto& target : targets) {
+            system.Print(L"Binding adapter: " + target.name + L", NET_LUID=" + std::to_wstring(target.luid) + L"\n");
+        }
         ValidateBindings(system.ReadBindings(), targets, false);
         return Enable(system, targets);
     } catch (...) {

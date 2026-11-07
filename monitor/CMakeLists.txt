@@ -38,8 +38,8 @@ else()
     target_compile_options(pmkext PRIVATE -Wall -Wextra)
 endif()
 
-add_executable(hyperv_monitor src/main.cpp src/DriverLoader.cpp src/IcsInterfaces.cpp)
-target_link_libraries(hyperv_monitor PRIVATE pmkext advapi32 ole32 oleaut32 uuid iphlpapi)
+add_executable(hyperv_monitor src/main.cpp)
+target_link_libraries(hyperv_monitor PRIVATE pmkext advapi32)
 if(MSVC)
     target_compile_options(hyperv_monitor PRIVATE /W4 /permissive- /utf-8)
     # Help/invalid-CLI tests must run without elevation or device access. Actual
@@ -106,21 +106,11 @@ if(BUILD_TESTING)
             LABELS "no-driver"
         )
     endforeach()
-    add_executable(ics_interfaces_tests tests/ics_interfaces_tests.cpp src/IcsInterfaces.cpp)
-    target_link_libraries(ics_interfaces_tests PRIVATE pmkext ole32 oleaut32 uuid iphlpapi)
-    if(MSVC)
-        target_compile_options(ics_interfaces_tests PRIVATE /W4 /WX /permissive- /utf-8)
-    endif()
-    add_test(NAME ics_interfaces_tests COMMAND ics_interfaces_tests)
-    set_tests_properties(ics_interfaces_tests PROPERTIES TIMEOUT 15 LABELS "no-driver")
     find_program(CARGO_EXECUTABLE cargo REQUIRED)
     # These suites compile the production Rust native modules against generated
     # WDK layouts. Only kernel API side effects are faked; no C++ native copy.
-    foreach(suite IN ITEMS native_packet native_ndis native_device native_wfp)
-        if(suite STREQUAL "native_wfp")
-            set(test_name wfp_management_tests)
-            set(test_filter "native_wfp::")
-        elseif(suite STREQUAL "native_ndis")
+    foreach(suite IN ITEMS native_packet native_ndis native_device native_local_address)
+        if(suite STREQUAL "native_ndis")
             set(test_name native_ndis_tests)
             set(test_filter "native::ndis::")
         elseif(suite STREQUAL "native_device")
@@ -138,8 +128,7 @@ if(BUILD_TESTING)
             PASS_REGULAR_EXPRESSION "test result: ok\\. [1-9][0-9]* passed"
             WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/..")
     endforeach()
-    # Portable kernel logic uses its own host archive: adapter/header fixtures
-    # must not pull the WFP fake-native ABI into otherwise independent tests.
+    # Portable kernel logic uses its own host archive for adapter/header fixtures.
     set(DRIVER_RUST_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/driver-rust")
     set(DRIVER_RUST_LIBRARY "${DRIVER_RUST_TARGET_DIR}/release/hyperv_driver_tests.lib")
     add_custom_command(OUTPUT "${DRIVER_RUST_LIBRARY}"
@@ -177,13 +166,6 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME notify_object_tests COMMAND notify_object_tests $<TARGET_FILE:hyperv_xndis_filter_notify>)
     set_tests_properties(notify_object_tests PROPERTIES TIMEOUT 15 LABELS "no-driver")
-    add_executable(driver_loader_tests tests/driver_loader_tests.cpp)
-    target_link_libraries(driver_loader_tests PRIVATE pmkext)
-    if(MSVC)
-        target_compile_options(driver_loader_tests PRIVATE /W4 /WX /permissive- /utf-8)
-    endif()
-    add_test(NAME driver_loader_tests COMMAND driver_loader_tests)
-    set_tests_properties(driver_loader_tests PROPERTIES TIMEOUT 15 LABELS "no-driver")
     add_test(NAME monitor_help COMMAND hyperv_monitor --help)
     set_tests_properties(monitor_help PROPERTIES TIMEOUT 10 LABELS "no-driver"
                         PASS_REGULAR_EXPRESSION "positive seconds")

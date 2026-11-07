@@ -20,12 +20,11 @@ inline HRESULT ReadBindingAdapterInventory(INetCfg* config, std::vector<GUID>& a
     const auto release = [](MIB_IF_TABLE2* table) { if (table) FreeMibTable(table); };
     std::unique_ptr<MIB_IF_TABLE2, decltype(release)> table(raw, release);
     if (result != NO_ERROR) return HRESULT_FROM_WIN32(result);
-    if (!table || table->NumEntries > 4096) return E_UNEXPECTED;
+    if (!table) return E_UNEXPECTED;
     for (ULONG index = 0; index != table->NumEntries; ++index) {
         const auto& entry = table->Table[index];
         if (entry.InterfaceGuid == GUID_NULL || !entry.InterfaceLuid.Value) return E_UNEXPECTED;
         if (std::find(inspected.begin(), inspected.end(), entry.InterfaceGuid) != inspected.end()) continue;
-        if (inspected.size() == 4096) return E_UNEXPECTED;
         inspected.push_back(entry.InterfaceGuid);
     }
     adapters = std::move(inspected);

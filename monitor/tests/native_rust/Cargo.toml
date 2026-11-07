@@ -11,14 +11,11 @@ path = "lib.rs"
 doctest = false
 
 [features]
-default = ["native-wdk", "wfp-test"]
+default = ["native-wdk"]
 native-wdk = []
-wfp-fragment-diagnostic = []
-wfp-test = []
 
 [dependencies]
 hyperv-protocol = { path = "../../../protocol" }
-smoltcp.workspace = true
 likely_stable.workspace = true
 
 [build-dependencies]

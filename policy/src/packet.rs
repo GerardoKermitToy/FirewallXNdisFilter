@@ -3,7 +3,7 @@ use likely_stable::{likely, unlikely};
 
 pub const SNAPSHOT: usize = 320;
 
-// Raw C-shim values describe ownership on the host vNIC, not wire direction.
+// Raw native values describe NDIS ownership, not public wire direction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum NdisPath {
@@ -19,7 +19,8 @@ impl NdisPath {
         }
     }
     pub const fn direction(self) -> Direction {
-        // Host receive comes from the guest; host send goes towards the guest.
+        // On a guest-facing adapter receive is guest outbound, but this mapping
+        // applies to all adapters without claiming guest identity.
         match self {
             Self::Send => Direction::Inbound,
             Self::Receive => Direction::Outbound,
@@ -199,7 +200,7 @@ pub fn parse(
     Ok(Some(p))
 }
 
-// IPFORWARD starts at the IP header. Share all length/transport validation with
+// Parse at the IP header. Share all length/transport validation with
 // Ethernet input without inventing a link header or changing captured bytes.
 pub fn parse_ip(
     data: &[u8],
@@ -651,7 +652,7 @@ mod tests {
         let mut second = first;
         second[42 + EXTENSION..44 + EXTENSION].copy_from_slice(&443u16.to_be_bytes());
 
-        // WFP IPFORWARD starts at the IP header.
+        // Parsing without an Ethernet header starts at the IP header.
         let first_ip = parse_ip(&first[..SNAPSHOT], SNAPSHOT, first.len(), true, false).unwrap();
         let second_ip = parse_ip(&second[..SNAPSHOT], SNAPSHOT, second.len(), true, false).unwrap();
         assert_eq!(first_ip.flow, second_ip.flow);

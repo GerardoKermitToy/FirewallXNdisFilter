@@ -41,8 +41,10 @@ unsafe fn read_dword(key: HANDLE, mut name: UNICODE_STRING, fallback: u32) -> u3
 
 pub(super) unsafe fn target_adapter(p: PNDIS_FILTER_ATTACH_PARAMETERS, guid: *mut GUID) -> bool {
     unsafe {
+        // Schema 4 means all compatible Ethernet paths, not the former ICS list.
+        // The caller has already checked MiniportMediaType == NdisMedium802_3.
+        const BINDING_CONFIG_VERSION: u32 = 4;
         let mut path = wide!("\\Registry\\Machine\\SOFTWARE\\HyperVXNdisFilter\\Lwf");
-        let mut name = wide!("TargetAdapters");
         let mut attributes = object_attributes(
             &mut path,
             null_mut(),
@@ -53,82 +55,29 @@ pub(super) unsafe fn target_adapter(p: PNDIS_FILTER_ATTACH_PARAMETERS, guid: *mu
         if !nt_success(ZwOpenKey(&mut key, KEY_READ, &mut attributes)) {
             return false;
         }
-        let mut matched = false;
-        let prefix = offset_of!(KEY_VALUE_PARTIAL_INFORMATION, Data) as u32;
-        if read_dword(key, wide!("ConfigVersion"), 0) == 3
+        let mut actual: GUID = zeroed();
+        let matched = read_dword(key, wide!("ConfigVersion"), 0) == BINDING_CONFIG_VERSION
             && read_dword(key, wide!("AllowBindings"), 0) == 1
-        {
-            for _ in 0..3 {
-                let mut needed = 0;
-                let mut returned = 0;
-                let status = ZwQueryValueKey(
-                    key,
-                    &mut name,
-                    KeyValuePartialInformation,
-                    null_mut(),
-                    0,
-                    &mut needed,
-                );
-                if (status != HV_WDK_STATUS_BUFFER_TOO_SMALL
-                    && status != HV_WDK_STATUS_BUFFER_OVERFLOW)
-                    || needed < prefix + 4
-                {
-                    break;
-                }
-                let info = pool_allocation(ExAllocatePool2(
-                    HV_WDK_POOL_FLAG_NON_PAGED as u64,
-                    needed as u64,
-                    TAG,
-                ))
-                .cast::<KEY_VALUE_PARTIAL_INFORMATION>();
-                let status = ZwQueryValueKey(
-                    key,
-                    &mut name,
-                    KeyValuePartialInformation,
-                    info.cast(),
-                    needed,
-                    &mut returned,
-                );
-                if status == HV_WDK_STATUS_BUFFER_TOO_SMALL
-                    || status == HV_WDK_STATUS_BUFFER_OVERFLOW
-                {
-                    ExFreePoolWithTag(info.cast(), TAG);
-                    continue;
-                }
-                if nt_success(status)
-                    && returned >= prefix
-                    && returned <= needed
-                    && (*info).Type == REG_BINARY
-                    && (*info).DataLength <= returned - prefix
-                    && read_dword(key, wide!("ConfigVersion"), 0) == 3
-                    && read_dword(key, wide!("AllowBindings"), 0) == 1
-                {
-                    let mut actual: GUID = zeroed();
-                    if nt_success(ConvertInterfaceLuidToGuid(
-                        addr_of!((*p).BaseMiniportNetLuid),
-                        &mut actual,
-                    )) {
-                        matched = crate::target_config::HvTargetAdapterMatch(
-                            addr_of!((*info).Data).cast(),
-                            (*info).DataLength,
-                            addr_of!(actual).cast(),
-                            (*p).BaseMiniportNetLuid.Value,
-                        ) != 0;
-                        if matched {
-                            *guid = actual;
-                        }
-                    }
-                }
-                ExFreePoolWithTag(info.cast(), TAG);
-                break;
-            }
-        }
+            && (*p).BaseMiniportNetLuid.Value != 0
+            && nt_success(ConvertInterfaceLuidToGuid(
+                addr_of!((*p).BaseMiniportNetLuid),
+                &mut actual,
+            ))
+            && (actual.Data1 != 0
+                || actual.Data2 != 0
+                || actual.Data3 != 0
+                || actual.Data4 != [0; 8])
+            && read_dword(key, wide!("ConfigVersion"), 0) == BINDING_CONFIG_VERSION
+            && read_dword(key, wide!("AllowBindings"), 0) == 1;
         let _ = ZwClose(key);
+        if matched {
+            *guid = actual;
+        }
         matched
     }
 }
 
-pub(super) unsafe fn read_configuration(registry: PUNICODE_STRING) -> bool {
+pub(super) unsafe fn read_configuration(registry: PUNICODE_STRING) {
     unsafe {
         let mut attributes = object_attributes(
             registry,
@@ -139,7 +88,7 @@ pub(super) unsafe fn read_configuration(registry: PUNICODE_STRING) -> bool {
         let mut service = null_mut();
         let mut parameters = null_mut();
         if !nt_success(ZwOpenKey(&mut service, KEY_READ, &mut attributes)) {
-            return false;
+            return;
         }
         let mut name = wide!("Parameters");
         attributes = object_attributes(
@@ -148,18 +97,15 @@ pub(super) unsafe fn read_configuration(registry: PUNICODE_STRING) -> bool {
             OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
             null_mut(),
         );
-        let mut standalone = false;
         if nt_success(ZwOpenKey(&mut parameters, KEY_READ, &mut attributes)) {
             crate::HvConfigure(
                 read_dword(parameters, wide!("DecisionTimeoutMs"), DEFAULT_TIMEOUT_MS),
                 read_dword(parameters, wide!("CacheTtlMs"), 60000),
                 read_dword(parameters, wide!("FailClosed"), DEFAULT_FAIL_CLOSED),
             );
-            standalone = read_dword(parameters, wide!("StandaloneWfp"), 0) == 1;
             let _ = ZwClose(parameters);
         }
         let _ = ZwClose(service);
-        standalone
     }
 }
 

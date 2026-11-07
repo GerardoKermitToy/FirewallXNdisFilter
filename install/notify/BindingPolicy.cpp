@@ -14,7 +14,7 @@ HRESULT EvaluateBindingPath(DWORD flags, INetCfgBindingPath* path, const std::ve
     const HRESULT hr = InspectBindingPath(path, kFilterInstanceId, adapters, identity);
     TraceNetCfg("InspectBindingPath", hr, flags);
     if (FAILED(hr)) return hr;
-    const bool matches = configured && identity.adapters == 1 && targets.MatchesCurrentAdapter(identity.adapter);
+    const bool matches = configured && identity.adapters == 1 && TargetConfig::IsCurrentAdapter(identity.adapter);
     const HRESULT decision = BindingDecision(flags, identity.owns_path, configured, identity.adapters, matches);
     TraceNetCfg("BindingDecision", decision, flags);
     return decision;

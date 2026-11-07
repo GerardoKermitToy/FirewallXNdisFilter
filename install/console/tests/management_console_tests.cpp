@@ -26,37 +26,17 @@ void Throws(F&& action, const wchar_t* text) {
 
 GUID Guid(const wchar_t* text) {
     GUID result{};
-    Require(ParseGuid(text, result));
+    Require(SUCCEEDED(CLSIDFromString(text, &result)) && result != GUID_NULL);
     return result;
 }
 
-const GUID kDefaultSwitchId = Guid(L"{10000000-0002-0003-0405-060708090A0B}");
 const GUID target_guid = Guid(L"{9EB6CA05-3905-4420-A34F-4FA09DCC6A2D}");
 const GUID foreign_guid = Guid(L"{00000001-0002-0003-0405-060708090A0B}");
 const GUID wsl_guid = Guid(L"{00000011-0002-0003-0405-060708090A0B}");
 const GUID wsl_switch = Guid(L"{00000022-0002-0003-0405-060708090A0B}");
 
-HRESULT hns_lookup_status = S_OK, hns_create_status = S_OK;
-unsigned hns_create_calls = 0;
-HRESULT WINAPI FakeHnsLookup(LPCOLESTR name, LPCLSID clsid) {
-    if (!name || std::wcscmp(name, L"hns.1") != 0 || !clsid) return E_INVALIDARG;
-    *clsid = GUID_NULL;
-    return hns_lookup_status;
-}
-HRESULT WINAPI FakeHnsCreate(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*) {
-    ++hns_create_calls;
-    return hns_create_status;
-}
-
-Adapter Target() { return {target_guid, 1689399750295552ull, L"Renamed host vNIC", true, false, 6}; }
-Adapter WslTarget() { return {wsl_guid, 0x1122334455667788ull, L"Renamed WSL host vNIC", true, false, 6}; }
-
-Adapter SelectFixtureTarget(const std::vector<GUID>& switches, const std::vector<HostPort>& ports,
-                            const Targets& adapters) {
-    const auto targets = SelectTargets(switches, ports, adapters, {{L"ICS", kDefaultSwitchId, kDefaultSwitchId}});
-    Require(targets.size() == 1);
-    return targets.front();
-}
+Adapter Target() { return {target_guid, 1689399750295552ull, L"Ethernet adapter"}; }
+Adapter WslTarget() { return {wsl_guid, 0x1122334455667788ull, L"Virtual adapter"}; }
 
 class FakeSystem final : public System {
 public:
@@ -74,10 +54,10 @@ public:
     size_t fail_on_occurrence = 1;
     bool appear_after_confirm = false, remove_fails = false;
     bool service = false, component = false, config = false, allowed = false, recovery = false;
+    bool invalid_config = false;
     bool consent = true, foreign_enabled = false, target_enabled_on_install = false;
-    bool change_luid_after_install = false, change_target_after_confirm = false;
+    bool change_luid_after_install = false, change_target_after_confirm = false, change_target_on_disable = false;
     bool include_target = true, add_target_after_confirm = false, add_target_after_install = false;
-    bool use_fake_hns = false;
     bool change_wsl_after_confirm = false, change_wsl_luid_after_install = false, skip_wsl_enable = false;
     bool enable_has_effect = true, disable_has_effect = true, leave_service = false;
     Change install_result = Change::Complete, remove_result = Change::Complete, enable_result = Change::Complete, disable_result = Change::Complete;
@@ -99,7 +79,7 @@ public:
     }
     Targets ResolveTargets() override {
         Step("resolve");
-        if (use_fake_hns) return SelectTargets({}, {}, {}, ReadHnsNetworks(FakeHnsLookup, FakeHnsCreate));
+        Require(component, "paths cannot be inspected before component installation");
         return CurrentTargets();
     }
     bool HasService() override { Step("service"); return service; }
@@ -107,7 +87,8 @@ public:
     void ValidatePackage(const std::filesystem::path&) override { Step("package"); }
     void VerifyConfiguration(const Targets& adapters) override {
         Step("verify-config");
-        if (!config || !SameTargets(configured, adapters)) throw Error{L"stale configuration"};
+        ValidateTargets(adapters);
+        if (!config || invalid_config) throw Error{L"stale configuration"};
     }
     bool Confirm(const std::wstring&) override {
         Step("confirm");
@@ -166,8 +147,10 @@ public:
     }
     std::vector<Binding> ReadBindings() override { Step("bindings"); return bindings; }
     Change DisableTargets(const Targets& adapters) override {
-        Require(config && !allowed && SameTargets(configured, adapters), "disable must follow exact config validation and disarm");
+        Require(config && !allowed, "disable must follow configuration validation and disarm");
+        configured = adapters;
         Step("disable");
+        if (change_target_on_disable) ++target.luid;
         if (disable_has_effect) {
             for (auto& binding : bindings) {
                 for (const auto& adapter : adapters) if (binding.adapter == adapter.guid) binding.enabled = false;
@@ -176,7 +159,7 @@ public:
         return disable_result;
     }
     Change EnableTargets(const Targets& adapters) override {
-        Require(allowed && config && SameTargets(configured, adapters), "enable must follow exact config validation and arming");
+        Require(allowed && config && SameTargets(configured, adapters), "enable must follow disarm, stable snapshot and arming");
         Step("enable");
         if (enable_has_effect) {
             for (auto& binding : bindings) {
@@ -249,39 +232,6 @@ int main() {
             const wchar_t* dup[] = {L"Install.exe", L"--package", L"a", L"--package", L"b"};
             Require(!ParseOptions(Action::Install, 5, dup, opt, error));
         }},
-        {"target resolution uses switch connections and GUID, never alias", [] {
-            const HostPort port{L"Microsoft:{9EB6CA05-3905-4420-A34F-4FA09DCC6A2D}", {kDefaultSwitchId}};
-            auto target = Target();
-            const auto selected = SelectFixtureTarget({kDefaultSwitchId}, {port}, {target});
-            Require(SameTarget(selected, target));
-            target.name = L"a localized alias";
-            Require(SelectFixtureTarget({kDefaultSwitchId}, {port}, {target}).name == target.name);
-            Throws([&] { SelectFixtureTarget({}, {port}, {target}); }, L"missing or ambiguous");
-            Throws([&] { SelectFixtureTarget({kDefaultSwitchId, kDefaultSwitchId}, {port}, {target}); }, L"missing or ambiguous");
-            Throws([&] { SelectFixtureTarget({kDefaultSwitchId}, {port, port}, {target}); }, L"ambiguous");
-            Require(SelectTargets({kDefaultSwitchId}, {}, {target}, {{L"ICS", kDefaultSwitchId, kDefaultSwitchId}}).empty());
-            Require(SelectTargets({kDefaultSwitchId}, {{port.device_id, {foreign_guid}}}, {target}, {{L"ICS", kDefaultSwitchId, kDefaultSwitchId}}).empty());
-            Throws([&] { SelectFixtureTarget({kDefaultSwitchId}, {{port.device_id, {kDefaultSwitchId, foreign_guid}}}, {target}); }, L"ambiguous");
-            Throws([&] { SelectFixtureTarget({kDefaultSwitchId}, {port}, {}); }, L"not found");
-            Throws([&] { SelectFixtureTarget({kDefaultSwitchId}, {port}, {target, target}); }, L"ambiguous");
-            target.guid = foreign_guid;
-            target.name = L"vEthernet (Default Switch)";
-            Throws([&] { SelectFixtureTarget({kDefaultSwitchId}, {port}, {target}); }, L"not found");
-        }},
-        {"invalid port GUIDs and non-host Ethernet adapters are rejected", [] {
-            for (const auto text : {L"not-a-guid", L"Microsoft:not-a-guid", L"Microsoft:{00000000-0000-0000-0000-000000000000}", L"{9EB6CA05-3905-4420-A34F-4FA09DCC6A2D}"}) {
-                Throws([&] { InternalPortGuid(text); }, L"valid interface GUID");
-            }
-            const HostPort port{L"Microsoft:{9EB6CA05-3905-4420-A34F-4FA09DCC6A2D}", {kDefaultSwitchId}};
-            for (int condition = 0; condition != 4; ++condition) {
-                auto target = Target();
-                if (condition == 0) target.is_virtual = false;
-                if (condition == 1) target.hardware = true;
-                if (condition == 2) target.interface_type = 71;
-                if (condition == 3) target.luid = 0;
-                Throws([&] { SelectFixtureTarget({kDefaultSwitchId}, {port}, {target}); }, L"Ethernet host vNIC");
-            }
-        }},
         {"all exact target paths are required; foreign enabled paths are rejected", [] {
             const auto target = Target();
             ValidateBindings({{target.guid, false}, {target.guid, false}, {foreign_guid, false}}, {target}, true);
@@ -292,96 +242,8 @@ int main() {
             Throws([&] { ValidateBindings({{foreign_guid, false}}, {target}, false); }, L"No HyperVXNdisFilter binding");
             Throws([&] { ValidateBindings({{GUID_NULL, false}}, {target}, false); }, L"ambiguous");
         }},
-        {"unregistered HNS COM API produces an empty safe target set", [] {
-            for (HRESULT status : {CO_E_CLASSSTRING, REGDB_E_CLASSNOTREG}) {
-                hns_lookup_status = status; hns_create_calls = 0;
-                Require(ReadHnsNetworks(FakeHnsLookup, FakeHnsCreate).empty());
-                Require(hns_create_calls == 0);
-                hns_lookup_status = S_OK; hns_create_status = status;
-                Require(ReadHnsNetworks(FakeHnsLookup, FakeHnsCreate).empty());
-                Require(hns_create_calls == 1);
-            }
-        }},
-        {"other HNS COM errors remain failures", [] {
-            for (HRESULT status : {E_ACCESSDENIED, E_OUTOFMEMORY, E_FAIL}) {
-                hns_lookup_status = status; hns_create_calls = 0;
-                Throws([&] { ReadHnsNetworks(FakeHnsLookup, FakeHnsCreate); }, L"Find native HNS API");
-                Require(hns_create_calls == 0);
-                hns_lookup_status = S_OK; hns_create_status = status;
-                Throws([&] { ReadHnsNetworks(FakeHnsLookup, FakeHnsCreate); }, L"Connect to native HNS API");
-                Require(hns_create_calls == 1);
-            }
-        }},
-        {"ICS JSON selection depends on type and switch GUID, never names", [] {
-            const auto networks = ParseHnsNetworks(LR"json({"Success":true,"Output":[{"Name":"WSL (Hyper-V firewall)","Type":"NAT"},{"Name":"arbitrary","Type":"ICS","ID":"00000001-0002-0003-0405-060708090A0B","SwitchGuid":"00000022-0002-0003-0405-060708090A0B"},{"Type":"ICS","ID":"10000000-0002-0003-0405-060708090A0B","SwitchGuid":"10000000-0002-0003-0405-060708090A0B"}]})json");
-            Require(networks.size() == 2);
-            Require(SelectIcsSwitches(networks) == std::vector<GUID>{wsl_switch, kDefaultSwitchId});
-            Require(ParseHnsNetworks(LR"json({"Success":true,"Output":[]})json").empty());
-            for (const auto text : {
-                LR"json({"Success":false,"Output":[]})json", LR"json({"Output":[]})json",
-                LR"json({"Success":true,"Output":{}})json", LR"json({"Success":true,"Output":[{"Name":"Default Switch"}]})json",
-                LR"json({"Success":true,"Output":[{"Type":"ICS","ID":"not-a-guid","SwitchGuid":"not-a-guid"}]})json",
-                L"not JSON"}) {
-                Throws([&] { ParseHnsNetworks(text); }, L"HNS");
-            }
-        }},
-        {"all ICS switch identities are validated and shared switches are deduplicated", [] {
-            const HnsNetwork network{L"ICS", foreign_guid, wsl_switch};
-            Require(SelectIcsSwitches({network}) == std::vector<GUID>{wsl_switch});
-            Require(SelectIcsSwitches({{L"NAT", GUID_NULL, GUID_NULL}}).empty());
-            Require(SelectIcsSwitches({network, {L"ICS", kDefaultSwitchId, wsl_switch}}).size() == 1);
-            Throws([&] { SelectIcsSwitches({network, network}); }, L"invalid or ambiguous");
-            Throws([&] { SelectIcsSwitches({{L"ICS", GUID_NULL, wsl_switch}}); }, L"invalid or ambiguous");
-            Throws([&] { SelectIcsSwitches({{L"ICS", wsl_switch, GUID_NULL}}); }, L"invalid or ambiguous");
-        }},
-        {"ICS selection does not require Default Switch or WSL to exist", [] {
-            const HostPort port{L"Microsoft:{9EB6CA05-3905-4420-A34F-4FA09DCC6A2D}", {wsl_switch}};
-            const HnsNetwork network{L"ICS", foreign_guid, wsl_switch};
-            const auto selected = SelectTargets({wsl_switch}, {port}, {Target()}, {network});
-            Require(SameTargets(selected, {Target()}));
-            Require(SelectTargets({wsl_switch}, {port}, {Target()}, {}).empty());
-            Require(SelectTargets({wsl_switch}, {port}, {Target()}, {{L"NAT", foreign_guid, wsl_switch}}).empty());
-        }},
-        {"every management-OS Ethernet vNIC on an ICS switch is selected", [] {
-            const HnsNetwork network{L"ICS", wsl_switch, wsl_switch};
-            const HostPort first{L"Microsoft:{9EB6CA05-3905-4420-A34F-4FA09DCC6A2D}", {wsl_switch}};
-            const HostPort second{L"Microsoft:{00000011-0002-0003-0405-060708090A0B}", {wsl_switch}};
-            const auto targets = SelectTargets({wsl_switch}, {first, second}, {Target(), WslTarget()}, {network});
-            Require(SameTargets(targets, {Target(), WslTarget()}));
-            Require(SameTargets(targets, SelectTargets({wsl_switch}, {second, first}, {WslTarget(), Target()}, {network})));
-            Throws([&] { SelectTargets({}, {first}, {Target()}, {network}); }, L"missing or ambiguous");
-            Require(SelectTargets({wsl_switch}, {}, {Target()}, {network}).empty());
-            auto spoof = Target(); spoof.guid = foreign_guid; spoof.name = L"vEthernet (Default Switch)";
-            Throws([&] { SelectTargets({wsl_switch}, {first}, {spoof}, {network}); }, L"not found");
-            Throws([&] { SelectTargets({wsl_switch}, {first, first}, {Target()}, {network}); }, L"ambiguous");
-        }},
-        {"ICS topology selection grows beyond two targets and excludes non-ICS switches", [] {
-            std::vector<GUID> switches;
-            std::vector<HostPort> ports;
-            Targets adapters;
-            std::vector<HnsNetwork> networks;
-            for (unsigned i = 0; i < 129; ++i) {
-                const GUID switch_id{0x20000000 + i, 0, 0, {}};
-                const GUID adapter_id{0x30000000 + i, 0, 0, {}};
-                switches.push_back(switch_id);
-                ports.push_back({L"Microsoft:" + GuidText(adapter_id), {switch_id}});
-                adapters.push_back({adapter_id, 1000ull + i, L"arbitrary adapter", true, false, 6});
-                networks.push_back({L"ICS", switch_id, switch_id});
-            }
-            switches.push_back(kDefaultSwitchId);
-            ports.push_back({L"Microsoft:" + GuidText(target_guid), {kDefaultSwitchId}});
-            adapters.push_back(Target());
-            networks.push_back({L"NAT", kDefaultSwitchId, kDefaultSwitchId});
-            const auto targets = SelectTargets(switches, ports, adapters, networks);
-            Require(targets.size() == 129);
-            Require(std::none_of(targets.begin(), targets.end(), [](const Adapter& target) { return target.guid == target_guid; }));
-            std::reverse(networks.begin(), networks.end());
-            std::reverse(ports.begin(), ports.end());
-            const auto reordered = SelectTargets(switches, ports, adapters, networks);
-            Require(std::equal(targets.begin(), targets.end(), reordered.begin(), SameTarget));
-        }},
-        {"target allowlist rejects duplicate identities but has no two-adapter quota", [] {
-            ValidateTargets({Target(), WslTarget(), {wsl_switch, 777, L"third", true, false, 6}});
+        {"binding snapshot rejects duplicate identities but has no two-adapter quota", [] {
+            ValidateTargets({Target(), WslTarget(), {wsl_switch, 777, L"third"}});
             ValidateTargets({});
             Throws([&] { ValidateTargets({Target(), WslTarget(), WslTarget()}); }, L"ambiguous");
             auto wsl = WslTarget(); wsl.guid = target_guid;
@@ -396,32 +258,21 @@ int main() {
             Require(system.configured.empty() && system.bindings.size() == 2);
             Require(std::none_of(system.bindings.begin(), system.bindings.end(), [](const Binding& binding) { return binding.enabled; }));
             Require(system.At("write-disarmed") < system.At("install") && system.At("install") < system.At("arm"));
-            Require(std::any_of(system.messages.begin(), system.messages.end(), [](const auto& text) { return text.find(L"without NDIS bindings") != std::wstring::npos; }));
+            Require(std::any_of(system.messages.begin(), system.messages.end(), [](const auto& text) { return text.find(L"No compatible Ethernet binding paths") != std::wstring::npos; }));
             Require(Execute(Enable(), system) == 0);
             Require(system.configured.empty() && !system.bindings[0].enabled && !system.bindings[1].enabled);
             system.include_target = true;
-            Throws([&] { Execute(Enable(), system); }, L"stale configuration");
-            Require(!system.bindings[0].enabled && !system.bindings[1].enabled);
+            Require(Execute(Enable(), system) == 0);
+            Require(system.bindings[0].enabled && !system.bindings[1].enabled);
         }},
-        {"unregistered HNS class still installs the component without NDIS bindings", [] {
-            hns_lookup_status = CO_E_CLASSSTRING; hns_create_calls = 0;
-            FakeSystem system; system.include_target = false; system.use_fake_hns = true;
-            Require(Execute(Install(), system) == 0);
-            Require(system.Called("install") && system.component && system.service && system.config);
-            Require(system.configured.empty() && hns_create_calls == 0);
-            Require(std::none_of(system.bindings.begin(), system.bindings.end(), [](const Binding& binding) { return binding.enabled; }));
-            FakeSystem existing; existing.Installed(); existing.use_fake_hns = true;
-            Throws([&] { Execute(Enable(), existing); }, L"stale configuration");
-            existing.RequireNoMutation();
-        }},
-        {"new target during empty-set install aborts without retargeting", [] {
+        {"new paths after installation are part of the first snapshot", [] {
             for (const bool during_install : {false, true}) {
                 FakeSystem system; system.include_target = false;
                 system.add_target_after_confirm = !during_install;
                 system.add_target_after_install = during_install;
-                Throws([&] { Execute(Install(), system); }, L"changed");
-                Require(!system.Called("arm") && !system.allowed);
-                Require(system.Called("remove") == during_install);
+                Require(Execute(Install(), system) == 0);
+                Require(system.allowed && system.bindings[0].enabled);
+                Require(system.At("install") < system.At("resolve"));
             }
         }},
         {"empty target set rejects every enabled binding and rolls back", [] {
@@ -441,7 +292,7 @@ int main() {
         }},
         {"setup enables more than two exact targets without editing a foreign path", [] {
             FakeSystem system;
-            system.extra_targets = {WslTarget(), {wsl_switch, 777, L"third", true, false, 6}};
+            system.extra_targets = {WslTarget(), {wsl_switch, 777, L"third"}};
             Require(Execute(Install(), system) == 0);
             Require(system.configured.size() == 3 && system.bindings.size() == 4);
             Require(system.bindings[0].enabled && !system.bindings[1].enabled && system.bindings[2].enabled && system.bindings[3].enabled);
@@ -453,31 +304,25 @@ int main() {
             Require(system.bindings[0].enabled && !system.bindings[1].enabled && system.bindings[2].enabled);
             Require(system.At("disable") < system.At("arm") && system.At("arm") < system.At("enable"));
         }},
-        {"WSL recreation during confirmation or installation cannot arm targets", [] {
-            for (const bool during_install : {false, true}) {
-                FakeSystem system; system.extra_targets = {WslTarget()};
-                system.change_wsl_after_confirm = !during_install;
-                system.change_wsl_luid_after_install = during_install;
-                Throws([&] { Execute(Install(), system); }, L"changed");
-                Require(!system.Called("arm") && !system.allowed);
-                Require(system.Called("remove") == during_install);
-            }
+        {"adapter changes before post-install enumeration are included", [] {
+            FakeSystem system; system.extra_targets = {WslTarget()};
+            system.change_wsl_luid_after_install = true;
+            Require(Execute(Install(), system) == 0);
+            Require(system.allowed && system.bindings[0].enabled && system.bindings[2].enabled);
+            Require(system.configured[1].luid == WslTarget().luid + 1);
         }},
         {"partial two-adapter enable is failure, not single-adapter success", [] {
             FakeSystem system; system.extra_targets = {WslTarget()}; system.skip_wsl_enable = true;
             Throws([&] { Execute(Install(), system); }, L"did not enable");
             Require(system.Called("remove") && !system.allowed && !system.recovery);
         }},
-        {"resume never adds newly appearing WSL or drops a missing configured WSL", [] {
-            for (const bool disappears : {false, true}) {
-                FakeSystem system;
-                if (disappears) system.extra_targets = {WslTarget()};
-                system.Installed();
-                if (disappears) system.extra_targets.clear();
-                else system.extra_targets = {WslTarget()};
-                Throws([&] { Execute(Enable(), system); }, L"stale configuration");
-                system.RequireNoMutation();
-            }
+        {"resume uses current paths instead of an old stored adapter list", [] {
+            FakeSystem system; system.Installed();
+            system.extra_targets = {WslTarget()};
+            system.bindings.push_back({wsl_guid, false});
+            Require(Execute(Enable(), system) == 0);
+            Require(system.bindings[0].enabled && system.bindings.back().enabled);
+            Require(system.configured.size() == 2);
         }},
         {"both adapters require paths and reject an enabled foreign path", [] {
             const Targets targets{Target(), WslTarget()};
@@ -508,7 +353,7 @@ int main() {
             }
         }},
         {"preflight failures never reach mutation or installation", [] {
-            for (const auto stage : {"admin", "os", "monitor", "resolve", "package"}) {
+            for (const auto stage : {"admin", "os", "monitor", "package"}) {
                 FakeSystem system; system.fail = stage;
                 Throws([&] { Execute(Install(), system); }, L"injected");
                 system.RequireNoMutation();
@@ -535,10 +380,16 @@ int main() {
             Require(Execute(options, system) == 0);
             Require(!system.Called("confirm") && system.Called("admin") && system.Called("package") && system.Called("lock"));
         }},
-        {"target recreation during confirmation is rejected before writes", [] {
+        {"fresh install snapshots paths only after installation", [] {
             FakeSystem system; system.change_target_after_confirm = true;
-            Throws([&] { Execute(Install(), system); }, L"changed");
-            Require(!system.Called("write-disarmed") && !system.Called("install") && !system.Called("arm"));
+            Require(Execute(Install(), system) == 0);
+            Require(system.At("install") < system.At("resolve"));
+            Require(system.configured.front().guid == foreign_guid);
+        }},
+        {"path enumeration failure rolls back a new disarmed component", [] {
+            FakeSystem system; system.fail = "resolve";
+            Throws([&] { Execute(Install(), system); }, L"injected");
+            Require(system.Called("remove") && !system.allowed);
         }},
         {"write failure is disarmed but never removes a preexisting component", [] {
             FakeSystem system; system.fail = "write-disarmed";
@@ -564,6 +415,11 @@ int main() {
             Throws([&] { Execute(Install(), system); }, L"unexpectedly enabled");
             Require(system.Called("remove") && !system.Called("disable") && !system.Called("arm"));
         }},
+        {"identity churn after enumeration aborts before arming", [] {
+            FakeSystem system; system.change_target_on_disable = true;
+            Throws([&] { Execute(Install(), system); }, L"changed");
+            Require(system.Called("remove") && !system.Called("arm") && !system.allowed);
+        }},
         {"target disable failure cannot arm a fresh installation", [] {
             FakeSystem system; system.target_enabled_on_install = true; system.fail = "disable";
             Throws([&] { Execute(Install(), system); }, L"injected");
@@ -585,10 +441,10 @@ int main() {
             Require(system.At("disable") < system.At("arm") && system.At("arm") < system.At("enable"));
             Require(system.allowed && system.bindings[0].enabled && !system.Called("install"));
         }},
-        {"GUID/LUID changes after install cannot arm the component", [] {
+        {"post-install identity snapshot uses the current LUID", [] {
             FakeSystem system; system.change_luid_after_install = true;
-            Throws([&] { Execute(Install(), system); }, L"changed");
-            Require(system.Called("remove") && !system.Called("arm"));
+            Require(Execute(Install(), system) == 0);
+            Require(system.configured.front().luid == Target().luid + 1);
         }},
         {"arming and enable errors disarm and roll back fresh installs", [] {
             for (const auto stage : {"arm", "enable", "ready"}) {
@@ -622,7 +478,7 @@ int main() {
             FakeSystem missing;
             Throws([&] { Execute(Enable(), missing); }, L"not installed");
             missing.RequireNoMutation();
-            FakeSystem stale; stale.Installed(); ++stale.configured.front().luid;
+            FakeSystem stale; stale.Installed(); stale.invalid_config = true;
             Throws([&] { Execute(Enable(), stale); }, L"stale");
             stale.RequireNoMutation();
         }},

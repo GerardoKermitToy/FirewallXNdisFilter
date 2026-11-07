@@ -38,34 +38,24 @@ public:
         }
     }
 
-    void WriteConnection(const Connection& c, const char* prefix, bool reverse = false) {
-        constexpr uint8_t OutboundDirection = 0, InboundDirection = 1;
-        uint8_t direction = c.direction;
-        if (reverse) {
-            if (direction == OutboundDirection) direction = InboundDirection;
-            else if (direction == InboundDirection) direction = OutboundDirection;
-        }
+    void WriteConnection(const Connection& c, const char* prefix) {
         Write("%s[CONN %s] id=%llu interface_index=%u %s proto=%u(%s) layer=%u(%s)\n"
-              "          local(guest)=%s:%u  remote(peer)=%s:%u  payload=%u bytes\n",
+              "          local=%s:%u  remote=%s:%u  payload=%u bytes\n",
               prefix, c.ipv6 ? "v6" : "v4", static_cast<unsigned long long>(c.id),
-              static_cast<unsigned>(c.interface_index), DirectionToString(direction),
+              static_cast<unsigned>(c.interface_index), DirectionToString(c.direction),
               static_cast<unsigned>(c.protocol), ProtocolToString(c.protocol),
               static_cast<unsigned>(c.payload_layer), PayloadLayerToString(c.payload_layer),
-              (reverse ? c.RemoteIpString() : c.LocalIpString()).c_str(),
-              static_cast<unsigned>(reverse ? c.remote_port : c.local_port),
-              (reverse ? c.LocalIpString() : c.RemoteIpString()).c_str(),
-              static_cast<unsigned>(reverse ? c.local_port : c.remote_port),
+              c.LocalIpString().c_str(), static_cast<unsigned>(c.local_port),
+              c.RemoteIpString().c_str(), static_cast<unsigned>(c.remote_port),
               static_cast<unsigned>(c.payload_size));
     }
 
-    void WriteBandwidthEntry(const BandwidthEntry& entry, bool reverse = false) {
+    void WriteBandwidthEntry(const BandwidthEntry& entry) {
         Write("            %s:%u <-> %s:%u  tx=%llu rx=%llu\n",
-              (reverse ? entry.RemoteIpString() : entry.LocalIpString()).c_str(),
-              static_cast<unsigned>(reverse ? entry.remote_port : entry.local_port),
-              (reverse ? entry.LocalIpString() : entry.RemoteIpString()).c_str(),
-              static_cast<unsigned>(reverse ? entry.local_port : entry.remote_port),
-              static_cast<unsigned long long>(reverse ? entry.received_bytes : entry.transmitted_bytes),
-              static_cast<unsigned long long>(reverse ? entry.transmitted_bytes : entry.received_bytes));
+              entry.LocalIpString().c_str(), static_cast<unsigned>(entry.local_port),
+              entry.RemoteIpString().c_str(), static_cast<unsigned>(entry.remote_port),
+              static_cast<unsigned long long>(entry.transmitted_bytes),
+              static_cast<unsigned long long>(entry.received_bytes));
     }
 
     void WriteAdapters(const AdapterSnapshot& snapshot, const char* prefix) {

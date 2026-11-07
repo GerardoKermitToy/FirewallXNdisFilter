@@ -16,6 +16,8 @@ use likely_stable::{likely, unlikely};
 
 pub use crate::bandwidth::{BandwidthPlan, BandwidthWork, DeferredBandwidth};
 
+const LOG_WARNING: u8 = 4;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Finish {
     Allow,
@@ -43,21 +45,10 @@ struct Interface {
     interface_index: u32,
     running: bool,
     ndis_attached: bool,
-    forwarding: bool,
     dirty: bool,
     candidate: bool,
     pending: usize,
     caches: Caches,
-}
-impl Interface {
-    fn idle_forward(&self) -> bool {
-        self.forwarding
-            && !self.ndis_attached
-            && !self.dirty
-            && !self.candidate
-            && self.pending == 0
-            && self.caches.bytes() == 0
-    }
 }
 #[derive(Clone, Copy)]
 struct Pending {
@@ -366,7 +357,6 @@ pub struct Engine {
     pending: List<Pending>,
     pending_count: usize,
     interfaces: List<Interface>,
-    idle_forward: u32,
     cache_candidate_count: usize,
     cache_allocator: CacheAllocator,
     events: List<Event>,
@@ -398,7 +388,6 @@ impl Engine {
             pending: List::new(),
             pending_count: 0,
             interfaces: List::new(),
-            idle_forward: 0,
             cache_candidate_count: 0,
             cache_allocator: allocator,
             events: List::new(),
@@ -528,7 +517,7 @@ impl Engine {
         self.clear_events();
         self.clear_cache();
         self.clear_bandwidth();
-        self.log(3, "HyperVXNdisFilter: shared NDIS/IPFORWARD verdicts and traffic data; full IP packets, interface index, no PID, redirects, UpdateV4/V6 or synthetic END");
+        self.log(3, "HyperVXNdisFilter: NDIS verdicts and traffic data; full IP packets, interface index, no PID, redirects, UpdateV4/V6 or synthetic END");
     }
     // Complete actions using take_due() after dropping the lock.
     pub fn disconnect(&mut self) {
@@ -538,10 +527,6 @@ impl Engine {
         self.clear_events();
         self.clear_cache();
         self.clear_bandwidth();
-        let idle = core::mem::take(&mut self.idle_forward);
-        if idle != 0 {
-            self.reap_idle_forward(idle);
-        }
     }
     pub fn attach(&mut self, interface_index: u32) -> bool {
         if interface_index == 0 {
@@ -564,107 +549,12 @@ impl Engine {
                 interface_index,
                 running: false,
                 ndis_attached: true,
-                forwarding: false,
                 dirty: false,
                 candidate: false,
                 pending: 0,
                 caches: Caches::new(self.cache_allocator),
             })
             .is_ok()
-    }
-    // WFP observes any source interface. Reuse the same policy/cache row; no
-    // NETIO inventory, network-lifecycle callback or parallel flow store exists.
-    pub fn ensure_forward(&mut self, interface_index: u32) -> bool {
-        if interface_index == 0 {
-            return false;
-        }
-        if let Some(interface) = self
-            .interfaces
-            .iter_mut()
-            .find(|s| s.interface_index == interface_index)
-        {
-            interface.forwarding = true;
-            return true;
-        }
-        if self.idle_forward != 0
-            && let Some(interface) = self
-                .interfaces
-                .iter_mut()
-                .find(|s| s.interface_index == self.idle_forward && s.idle_forward())
-        {
-            interface.interface_index = interface_index;
-            self.idle_forward = interface_index;
-            return true;
-        }
-        self.interfaces
-            .try_push_back(Interface {
-                interface_index,
-                running: false,
-                ndis_attached: false,
-                forwarding: true,
-                dirty: false,
-                candidate: false,
-                pending: 0,
-                caches: Caches::new(self.cache_allocator),
-            })
-            .is_ok()
-    }
-    // Keep at most one idle forward-only row for the next packet. It holds no
-    // cache or pending decision and is released on disconnect or replacement.
-    pub fn reap_idle_forward(&mut self, interface_index: u32) -> bool {
-        let Some(handle) = self
-            .interfaces
-            .find(|interface| interface.interface_index == interface_index)
-        else {
-            return false;
-        };
-        self.reap_idle_forward_handle(handle)
-    }
-    fn reap_idle_forward_handle(&mut self, handle: Handle<Interface>) -> bool {
-        // SAFETY: callers obtained this live handle under exclusive access.
-        let interface = unsafe { self.interfaces.get(handle) };
-        if !interface.idle_forward() {
-            return false;
-        }
-        let index = interface.interface_index;
-        if self.online {
-            if self.idle_forward == index {
-                return true;
-            }
-            let previous = core::mem::replace(&mut self.idle_forward, index);
-            if previous != 0
-                && let Some(old) = self.interfaces.find(|interface| {
-                    interface.interface_index == previous && interface.idle_forward()
-                })
-            {
-                // SAFETY: this old row was just found and owns no cache storage.
-                unsafe { self.interfaces.remove(old) };
-            }
-        } else {
-            if self.idle_forward == index {
-                self.idle_forward = 0;
-            }
-            // SAFETY: this row owns no cache storage or valid pending decision.
-            unsafe { self.interfaces.remove(handle) };
-        }
-        true
-    }
-    // Driver shutdown only, never an interface-change notification. Release
-    // forward-only rows using the same unlocked cache reclamation as NDIS.
-    pub fn stop_forward(&mut self) {
-        self.idle_forward = 0;
-        while let Some(handle) = self.interfaces.find(|s| s.forwarding) {
-            let index = unsafe { self.interfaces.get(handle) }.interface_index;
-            self.invalidate(index, false);
-            let interface = unsafe { self.interfaces.get_mut(handle) };
-            interface.forwarding = false;
-            if !interface.ndis_attached {
-                interface.interface_index = 0;
-                if !interface.dirty {
-                    unsafe { self.interfaces.remove(handle) };
-                }
-            }
-        }
     }
     pub fn restart(&mut self, interface_index: u32) -> bool {
         if let Some(interface) = self.interfaces.iter_mut().find(|s| {
@@ -699,8 +589,7 @@ impl Engine {
             }
         }
     }
-    // Roll back only an attachment that never reached NDIS restart. Forwarding
-    // may already share this index, so its pending requests and caches stay live.
+    // Roll back only an attachment that never reached NDIS restart.
     pub fn rollback_attach(&mut self, interface_index: u32) {
         if interface_index != 0
             && self
@@ -723,19 +612,16 @@ impl Engine {
             // SAFETY: handle was found in this list, with exclusive engine access.
             let interface = unsafe { self.interfaces.get_mut(handle) };
             interface.ndis_attached = false;
-            if !interface.forwarding {
-                interface.interface_index = 0;
-                if !interface.dirty {
-                    unsafe { self.interfaces.remove(handle) };
-                }
+            interface.interface_index = 0;
+            if !interface.dirty {
+                unsafe { self.interfaces.remove(handle) };
             }
         }
-        self.reap_idle_forward(interface_index);
     }
     fn running(&self, interface_index: u32) -> bool {
         self.interfaces
             .iter()
-            .any(|s| s.interface_index == interface_index && (s.running || s.forwarding))
+            .any(|s| s.interface_index == interface_index && s.running)
     }
     // Immediately disable all old tables; retire one bank at a time outside the
     // driver lock rather than returning a large per-interface array on its stack.
@@ -756,8 +642,6 @@ impl Engine {
         let retired = interface.caches.clear();
         if index == 0 {
             unsafe { self.interfaces.remove(handle) };
-        } else {
-            self.reap_idle_forward(index);
         }
         Some(retired)
     }
@@ -803,11 +687,7 @@ impl Engine {
             .caches
             .maintain_range(start, now, work);
         self.update_cache_candidates(handle);
-        let active = unsafe { self.interfaces.get(handle) }.candidate;
-        if !active {
-            self.reap_idle_forward(interface_index);
-        }
-        active
+        unsafe { self.interfaces.get(handle) }.candidate
     }
     // Host helper. The kernel worker uses ranges to release PolicyLock between
     // batches while completing every candidate bank in the same cleanup run.
@@ -829,7 +709,6 @@ impl Engine {
                 .caches
                 .maintain(now, &mut work);
             self.update_cache_candidates(handle);
-            self.reap_idle_forward(index);
         }
     }
     fn cache_eligible(packet: &Packet) -> bool {
@@ -843,9 +722,7 @@ impl Engine {
             return None;
         }
         self.interfaces.find(|interface| {
-            interface.interface_index == interface_index
-                && (interface.running || interface.forwarding)
-                && !interface.dirty
+            interface.interface_index == interface_index && interface.running && !interface.dirty
         })
     }
     pub fn cache_plan(&self, id: u64, verdict: Verdict, now: u64) -> Option<CachePlan> {
@@ -898,26 +775,55 @@ impl Engine {
             self.stats.allowed = self.stats.allowed.saturating_add(1);
         }
     }
-    pub fn malformed(&mut self) {
+    pub fn packet_warning(&mut self, interface_index: u32, reason: &str) {
+        self.log_args(
+            LOG_WARNING,
+            format_args!("Packet/NBL problem on interface_index={interface_index}: {reason}"),
+        );
+    }
+    pub fn send_failure(&mut self, interface_index: u32, status: i32) {
+        self.log_args(
+            LOG_WARNING,
+            format_args!(
+                "Packet send failed on interface_index={interface_index}: NDIS status=0x{:08X}",
+                status as u32
+            ),
+        );
+    }
+    pub fn mixed_packet_bypass(&mut self, interface_index: u32) {
+        self.log_args(
+            LOG_WARNING,
+            format_args!(
+                "Mixed local/transit NBL allowed without policy or cache on interface_index={interface_index}"
+            ),
+        );
+    }
+    pub fn malformed(&mut self, interface_index: u32, reason: &str) {
         if self.online {
             self.stats.received = self.stats.received.saturating_add(1);
             self.stats.malformed = self.stats.malformed.saturating_add(1);
             self.stats.dropped = self.stats.dropped.saturating_add(1);
+            self.packet_warning(interface_index, reason);
         }
     }
     fn count_unclassified_drop(&mut self) {
         self.stats.received = self.stats.received.saturating_add(1);
         self.stats.dropped = self.stats.dropped.saturating_add(1);
     }
-    pub fn paused_drop(&mut self) {
+    pub fn paused_drop(&mut self, interface_index: u32) {
         if self.online {
             self.count_unclassified_drop();
+            self.packet_warning(
+                interface_index,
+                "packet dropped because the interface is paused",
+            );
         }
     }
-    pub fn resource_drop(&mut self) {
+    pub fn resource_drop(&mut self, interface_index: u32, reason: &str) {
         if self.online {
             self.count_unclassified_drop();
             self.stats.overflow = self.stats.overflow.saturating_add(1);
+            self.packet_warning(interface_index, reason);
         }
     }
     fn event_room(&self, packet: &Packet) -> bool {
@@ -951,7 +857,7 @@ impl Engine {
         let active = interface.is_some_and(|handle| {
             // SAFETY: the handle was just found in this live list.
             let interface = unsafe { self.interfaces.get(handle) };
-            interface.running || interface.forwarding
+            interface.running
         });
         if !self.online {
             return (
@@ -967,6 +873,10 @@ impl Engine {
             );
         }
         let allow = if !active {
+            self.packet_warning(
+                interface_index,
+                "packet dropped because its interface is not running",
+            );
             false
         } else {
             let handle = interface.expect("active interface has a live handle");
@@ -1025,6 +935,10 @@ impl Engine {
         work: &mut BandwidthWork,
     ) -> Submission {
         self.stats.overflow = self.stats.overflow.saturating_add(1);
+        self.packet_warning(
+            interface_index,
+            "packet event or pending storage unavailable; applying fallback",
+        );
         let finish = self.fallback();
         self.account(interface_index, packet, finish == Finish::Allow, work);
         Submission::Finish(Action { nbl, finish })
@@ -1040,39 +954,6 @@ impl Engine {
     ) -> Submission {
         let mut work = BandwidthWork::prepare(self.bandwidth_plan());
         self.submit_with_work(interface_index, packet, nbl, cancel, now, record, &mut work)
-    }
-    // Re-establish forward-only membership atomically with publication. The
-    // row can be reaped while a classifier captures bytes outside PolicyLock.
-    pub fn submit_forward_with_work(
-        &mut self,
-        interface_index: u32,
-        packet: Packet,
-        nbl: usize,
-        now: u64,
-        record: Option<Vec<u8>>,
-        work: &mut BandwidthWork,
-    ) -> Submission {
-        if !self.online {
-            // The controller may disconnect while this classifier captures the
-            // packet. Retire its now-idle row without collecting traffic stats.
-            self.reap_idle_forward(interface_index);
-            return Submission::Finish(Action {
-                nbl,
-                finish: self.fallback(),
-            });
-        }
-        if !self.ensure_forward(interface_index) {
-            self.resource_drop();
-            return Submission::Finish(Action {
-                nbl,
-                finish: Finish::Drop,
-            });
-        }
-        let result = self.submit_with_work(interface_index, packet, nbl, None, now, record, work);
-        if matches!(result, Submission::Finish(_)) {
-            self.reap_idle_forward(interface_index);
-        }
-        result
     }
     #[allow(clippy::too_many_arguments)]
     pub fn submit_with_work(
@@ -1096,6 +977,7 @@ impl Engine {
             payload_len > MAX_PAYLOAD || record.as_ref().is_some_and(|data| data.len() != expected),
         ) {
             self.stats.malformed = self.stats.malformed.saturating_add(1);
+            self.packet_warning(interface_index, "invalid connection event size");
             self.account(interface_index, &packet, false, work);
             return Submission::Finish(Action {
                 nbl,
@@ -1118,6 +1000,7 @@ impl Engine {
             .is_err(),
         ) {
             self.stats.malformed = self.stats.malformed.saturating_add(1);
+            self.packet_warning(interface_index, "failed to encode a packet event");
             self.account(interface_index, &packet, false, work);
             return Submission::Finish(Action {
                 nbl,
@@ -1208,9 +1091,6 @@ impl Engine {
                 bandwidth,
             );
         }
-        if let Some(interface) = interface {
-            self.reap_idle_forward_handle(interface);
-        }
         Action { nbl: p.nbl, finish }
     }
     pub fn verdict(&mut self, id: u64, verdict: Verdict, now: u64) -> Result<Action, VerdictError> {
@@ -1246,8 +1126,7 @@ impl Engine {
         if verdict.permanent()
             && Self::cache_eligible(&p.packet)
             && let Some(bank) = self.interfaces.find(|interface| {
-                interface.interface_index == p.interface_index
-                    && (interface.running || interface.forwarding)
+                interface.interface_index == p.interface_index && interface.running
             })
         {
             // SAFETY: the handle was just found and remains live under PolicyLock.
@@ -1278,6 +1157,10 @@ impl Engine {
             if unlikely(!inserted) {
                 self.stats.cache_allocation_failures =
                     self.stats.cache_allocation_failures.saturating_add(1);
+                self.packet_warning(
+                    p.interface_index,
+                    "permanent packet verdict could not be cached",
+                );
             }
         }
         Ok(self.claim(
@@ -1307,12 +1190,23 @@ impl Engine {
         let finish = if p.invalidated {
             if self.online {
                 self.stats.invalidated = self.stats.invalidated.saturating_add(1);
+                self.packet_warning(
+                    p.interface_index,
+                    "pending packet invalidated by interface pause or detach",
+                );
             }
             Finish::Drop
         } else if !self.online {
             self.fallback()
         } else {
             self.stats.timeouts = self.stats.timeouts.saturating_add(1);
+            self.log_args(
+                LOG_WARNING,
+                format_args!(
+                    "Packet verdict timed out: interface_index={} id={}",
+                    p.interface_index, p.id
+                ),
+            );
             self.fallback()
         };
         Some(self.claim(handle, finish, work))
@@ -1408,7 +1302,13 @@ impl Engine {
             work,
         ) {
             Ok(Some(added)) => self.bandwidth_count += usize::from(added),
-            Ok(None) => self.stats.overflow = self.stats.overflow.saturating_add(1),
+            Ok(None) => {
+                self.stats.overflow = self.stats.overflow.saturating_add(1);
+                self.packet_warning(
+                    deferred.interface_index,
+                    "packet bandwidth accounting failed",
+                );
+            }
             Err(plan) => return Some(plan),
         }
         None
@@ -1439,7 +1339,10 @@ impl Engine {
                     plan,
                 });
             }
-            Ok(None) | Err(_) => self.stats.overflow = self.stats.overflow.saturating_add(1),
+            Ok(None) | Err(_) => {
+                self.stats.overflow = self.stats.overflow.saturating_add(1);
+                self.packet_warning(interface_index, "packet bandwidth accounting failed");
+            }
         }
     }
     pub fn begin_bandwidth(&mut self, table: &mut BandwidthTable) -> bool {
@@ -1625,128 +1528,95 @@ mod tests {
             _ => panic!("expected pending"),
         }
     }
-    #[test]
-    fn forward_only_rows_remain_bounded_and_reuse_the_idle_row() {
-        let mut e = Engine::new();
-        e.connect();
-        e.read(&mut [0; MAX_LOG_RECORD]);
-        let p = packet();
-        let mut first_row = core::ptr::null();
-        for index in 1..=1000 {
-            let mut work = BandwidthWork::prepare(e.bandwidth_plan());
-            let Submission::Pending(id) =
-                e.submit_forward_with_work(index, p, index as usize, 100, record(&p), &mut work)
-            else {
-                panic!("expected pending forward packet");
-            };
-            drop(work);
-            assert_eq!(
-                e.verdict(id, Verdict::Drop, 101).unwrap().nbl,
-                index as usize
-            );
-            assert_eq!(e.interfaces.len(), 1);
-            let row = e.interfaces.front().unwrap() as *const Interface;
-            if index == 1 {
-                first_row = row;
-            } else {
-                assert_eq!(row, first_row);
+    fn drain_warning_logs(e: &mut Engine) -> usize {
+        let mut count = 0;
+        loop {
+            let mut header = [0; 5];
+            let n = e.read(&mut header);
+            if n == 0 {
+                break;
             }
+            assert_eq!(n, header.len());
+            assert_eq!(header[0], 0, "expected a log, not a packet event");
+            let length = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+            assert!((1..=MAX_LOG_RECORD - 5).contains(&length));
+            let mut body = [0; MAX_LOG_RECORD];
+            assert_eq!(e.read(&mut body[..length]), length);
+            assert_eq!(body[0], LOG_WARNING);
+            count += 1;
         }
-        let address = e.interfaces.front().unwrap() as *const Interface;
-        let mut work = BandwidthWork::prepare(e.bandwidth_plan());
-        let Submission::Pending(id) =
-            e.submit_forward_with_work(1000, p, 1001, 102, record(&p), &mut work)
-        else {
-            panic!("expected pending forward packet");
-        };
-        e.verdict(id, Verdict::Drop, 103).unwrap();
-        assert_eq!(e.interfaces.front().unwrap() as *const Interface, address);
+        count
+    }
+    #[test]
+    fn packet_problem_and_mixed_bypass_warnings_include_interface() {
+        let mut e = default_engine();
+        e.read(&mut [0; MAX_LOG_RECORD]); // Startup message.
+        e.mixed_packet_bypass(101);
+        e.malformed(101, "truncated IP packet");
+        e.resource_drop(101, "packet copy failed");
+        e.paused_drop(101);
+        e.send_failure(101, 0xc0010009u32 as i32);
+        let mut bytes = [0; 2048];
+        let n = e.read(&mut bytes);
+        let mut offset = 0;
+        let mut messages = Vec::new();
+        while offset < n {
+            assert_eq!(bytes[offset], 0);
+            let length =
+                u32::from_le_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+            assert!(length > 1 && offset + 5 + length <= n);
+            assert_eq!(bytes[offset + 5], LOG_WARNING);
+            messages.push(core::str::from_utf8(&bytes[offset + 6..offset + 5 + length]).unwrap());
+            offset += 5 + length;
+        }
+        assert_eq!(messages.len(), 5);
+        for message in &messages {
+            assert!(message.contains("interface_index=101"));
+        }
+        assert!(messages[0].contains("Mixed local/transit NBL allowed without policy or cache"));
+        assert!(messages[1].contains("truncated IP packet"));
+        assert!(messages[2].contains("packet copy failed"));
+        assert!(messages[3].contains("interface is paused"));
+        assert!(messages[4].contains("NDIS status=0xC0010009"));
+        assert_eq!(
+            (
+                e.stats().received,
+                e.stats().dropped,
+                e.stats().malformed,
+                e.stats().overflow
+            ),
+            (3, 3, 1, 1)
+        );
+
         e.disconnect();
-        assert!(e.interfaces.is_empty());
+        e.malformed(101, "offline malformed packet");
+        e.mixed_packet_bypass(101);
+        assert_eq!(e.read(&mut bytes), 0); // There is no active log consumer.
     }
 
     #[test]
-    fn forward_rows_survive_pending_and_live_cache_until_expiry() {
-        let mut e = Engine::new();
-        e.connect();
-        let p = packet();
-        let mut work = BandwidthWork::prepare(e.bandwidth_plan());
-        let Submission::Pending(first) =
-            e.submit_forward_with_work(7, p, 1, 100, record(&p), &mut work)
-        else {
-            panic!("expected first pending packet");
-        };
-        let Submission::Pending(second) =
-            e.submit_forward_with_work(7, p, 2, 100, record(&p), &mut work)
-        else {
-            panic!("expected second pending packet");
-        };
-        drop(work);
-        assert!(!e.reap_idle_forward(7));
-        e.verdict(first, Verdict::Drop, 101).unwrap();
-        assert_eq!(e.interfaces.len(), 1);
-        e.verdict(second, Verdict::PermanentAccept, 101).unwrap();
-        assert_eq!(e.interfaces.len(), 1);
-        assert!(!e.reap_idle_forward(7));
-        e.clean(60101);
-        assert_eq!(e.interfaces.len(), 1);
-        e.disconnect();
-        assert!(e.interfaces.is_empty());
-    }
+    fn verdict_timeout_warns_but_explicit_block_does_not() {
+        let mut e = engine();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        let timed_out = submit(&mut e, 101, 21);
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        assert_eq!(e.take_due(2100).unwrap().finish, Finish::Allow);
+        let mut bytes = [0; MAX_LOG_RECORD];
+        let n = e.read(&mut bytes);
+        assert_eq!(bytes[0], 0);
+        assert_eq!(bytes[5], LOG_WARNING);
+        let text = core::str::from_utf8(&bytes[6..n]).unwrap();
+        assert!(text.contains("Packet verdict timed out"));
+        assert!(text.contains("interface_index=101"));
+        assert!(text.contains(&std::format!("id={timed_out}")));
 
-    #[test]
-    fn failed_attach_rollback_preserves_forward_cache_and_pending() {
-        let mut e = Engine::new();
-        e.connect();
-        let keys = [
-            cache_packet(false, 6, 1000),
-            cache_packet(false, 17, 1001),
-            cache_packet(true, 6, 1002),
-            cache_packet(true, 17, 1003),
-        ];
-        let mut work = BandwidthWork::prepare(e.bandwidth_plan());
-        for (i, &p) in keys.iter().enumerate() {
-            let Submission::Pending(id) =
-                e.submit_forward_with_work(7, p, i + 1, 100, record(&p), &mut work)
-            else {
-                panic!("expected cache-seeding request");
-            };
-            e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
-        }
-        let before = cache_packet(false, 17, 2000);
-        let Submission::Pending(before_id) =
-            e.submit_forward_with_work(7, before, 10, 102, record(&before), &mut work)
-        else {
-            panic!("expected existing WFP request");
-        };
-        assert!(e.attach(7));
-        let during = cache_packet(false, 17, 2001);
-        let Submission::Pending(during_id) =
-            e.submit_forward_with_work(7, during, 11, 102, record(&during), &mut work)
-        else {
-            panic!("expected WFP request during NDIS attachment");
-        };
-
-        // NdisFSetAttributes failed before the NDIS module could restart.
-        e.rollback_attach(7);
-        while let Some(retired) = e.take_retired_caches() {
-            drop(retired);
-        }
-        assert_eq!(e.cache_candidates(), 1);
-        assert_eq!(e.pending_count(), 2);
-        assert_eq!(e.take_due(103), None);
-        assert_eq!(e.verdict(before_id, Verdict::Accept, 104).unwrap().nbl, 10);
-        assert_eq!(e.verdict(during_id, Verdict::Accept, 104).unwrap().nbl, 11);
-        for (i, p) in keys.iter().enumerate() {
-            assert_eq!(
-                e.preflight(7, p, 100 + i, 105),
-                Err(Action {
-                    nbl: 100 + i,
-                    finish: Finish::Allow,
-                })
-            );
-        }
-        assert!(e.attach(7));
+        let blocked = submit(&mut e, 101, 22);
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        assert_eq!(
+            e.verdict(blocked, Verdict::Block, 101).unwrap().finish,
+            Finish::Drop
+        );
+        assert_eq!(e.read(&mut bytes), 0);
     }
 
     #[test]
@@ -1762,111 +1632,29 @@ mod tests {
         assert!(!e.attach(7));
         e.detach(7);
         assert!(e.interfaces.is_empty());
-
-        // WFP may first observe an index while NDIS setup is still in progress.
-        assert!(e.attach(8));
-        let packet = cache_packet(false, 6, 2000);
-        let mut work = BandwidthWork::prepare(e.bandwidth_plan());
-        let Submission::Pending(id) =
-            e.submit_forward_with_work(8, packet, 10, 100, record(&packet), &mut work)
-        else {
-            panic!("expected WFP request during NDIS attachment");
-        };
-        e.rollback_attach(8);
-        e.rollback_attach(8);
-        assert_eq!(e.verdict(id, Verdict::Accept, 101).unwrap().nbl, 10);
-        assert!(e.attach(8));
-    }
-
-    #[test]
-    fn forwarding_rechecks_membership_after_unlocked_packet_capture() {
-        let mut e = Engine::new();
-        e.connect();
-        let p = packet();
-        let mut work = BandwidthWork::prepare(e.bandwidth_plan());
-        let Submission::Pending(first) =
-            e.submit_forward_with_work(7, p, 1, 100, record(&p), &mut work)
-        else {
-            panic!("expected first pending packet");
-        };
-        assert!(e.preflight_with_work(7, &p, 2, 100, &mut work).unwrap());
-        e.verdict(first, Verdict::Drop, 101).unwrap();
-        assert!(e.ensure_forward(8));
-        assert!(e.reap_idle_forward(8));
-        assert!(
-            e.interfaces
-                .iter()
-                .all(|interface| interface.interface_index != 7)
-        );
-        let Submission::Pending(second) =
-            e.submit_forward_with_work(7, p, 2, 102, record(&p), &mut work)
-        else {
-            panic!("forward membership must be restored before publication");
-        };
-        assert_eq!(e.verdict(second, Verdict::Accept, 103).unwrap().nbl, 2);
-        assert_eq!(e.interfaces.len(), 1);
-        e.configure(8000, 60000, false);
-        assert!(e.ensure_forward(7));
-        assert!(e.preflight_with_work(7, &p, 3, 104, &mut work).unwrap());
-        e.disconnect();
-        assert_eq!(
-            e.submit_forward_with_work(7, p, 3, 104, record(&p), &mut work),
-            Submission::Finish(Action {
-                nbl: 3,
-                finish: Finish::Allow,
-            })
-        );
-        assert!(e.interfaces.is_empty());
-    }
-
-    #[test]
-    fn disconnected_forward_after_capture_does_not_account_for_fallback() {
-        for fail_closed in [false, true] {
-            let mut e = Engine::new();
-            e.configure(8000, 60000, fail_closed);
-            e.connect();
-            let p = packet();
-            let mut work = BandwidthWork::defer_missing();
-            assert!(e.ensure_forward(7));
-            assert!(e.preflight_with_work(7, &p, 1, 100, &mut work).unwrap());
-            e.disconnect();
-            let finish = if fail_closed {
-                Finish::Drop
-            } else {
-                Finish::Allow
-            };
-            assert_eq!(
-                e.submit_forward_with_work(7, p, 1, 101, record(&p), &mut work),
-                Submission::Finish(Action { nbl: 1, finish })
-            );
-            assert_eq!(e.stats, Stats::EMPTY);
-            assert_eq!(e.bandwidth_count, 0);
-            assert!(work.take_deferred().is_none());
-            assert!(e.interfaces.is_empty());
-        }
     }
 
     #[test]
     fn paused_drops_preserve_totals_without_reporting_resource_overflow() {
         let mut e = Engine::new();
-        e.paused_drop();
-        e.resource_drop();
+        e.paused_drop(101);
+        e.resource_drop(101, "test resource failure");
         assert_eq!(e.stats(), Stats::EMPTY);
 
         e.connect();
-        e.paused_drop();
+        e.paused_drop(101);
         assert_eq!(
             (e.stats().received, e.stats().dropped, e.stats().overflow),
             (1, 1, 0)
         );
-        e.resource_drop();
+        e.resource_drop(101, "test resource failure");
         assert_eq!(
             (e.stats().received, e.stats().dropped, e.stats().overflow),
             (2, 2, 1)
         );
 
         e.disconnect();
-        e.paused_drop();
+        e.paused_drop(101);
         assert_eq!(e.stats(), Stats::EMPTY);
     }
 
@@ -1891,8 +1679,8 @@ mod tests {
                 })
             );
             e.non_ip();
-            e.malformed();
-            e.resource_drop();
+            e.malformed(101, "test malformed packet");
+            e.resource_drop(101, "test resource failure");
             assert_eq!(e.stats(), Stats::EMPTY);
             assert!(!e.bandwidth.has_storage());
 
@@ -1904,8 +1692,8 @@ mod tests {
             assert_eq!(e.stats().allowed, 1);
             assert_eq!(e.bandwidth_count, 1);
             e.non_ip();
-            e.malformed();
-            e.resource_drop();
+            e.malformed(101, "test malformed packet");
+            e.resource_drop(101, "test resource failure");
             assert_eq!(e.stats().received, 4);
             assert_eq!(e.stats().allowed, 2);
             assert_eq!(e.stats().dropped, 2);
@@ -1925,8 +1713,8 @@ mod tests {
             assert_eq!(e.cancel(101, 7).unwrap().finish, Finish::Cancel);
             assert_eq!(e.take_due(103).unwrap().finish, Finish::Drop);
             e.non_ip();
-            e.malformed();
-            e.resource_drop();
+            e.malformed(101, "test malformed packet");
+            e.resource_drop(101, "test resource failure");
             assert_eq!(e.stats(), Stats::EMPTY);
             while let Some(retired) = e.take_retired_storage() {
                 drop(retired);
@@ -1942,79 +1730,6 @@ mod tests {
             e.bandwidth();
             assert_eq!(bandwidth_rows(&mut e), [(101, 17, false, 0, 100, 0)]);
         }
-    }
-
-    #[test]
-    fn invalidated_forward_claim_does_not_change_new_pending_count() {
-        let mut e = Engine::new();
-        e.connect();
-        let p = packet();
-        let mut work = BandwidthWork::prepare(e.bandwidth_plan());
-        let Submission::Pending(old) =
-            e.submit_forward_with_work(7, p, 1, 100, record(&p), &mut work)
-        else {
-            panic!("expected old packet");
-        };
-        e.invalidate(7, false);
-        let Submission::Pending(new) =
-            e.submit_forward_with_work(7, p, 2, 101, record(&p), &mut work)
-        else {
-            panic!("expected new packet");
-        };
-        assert!(e.verdict(old, Verdict::Accept, 102).is_err());
-        assert_eq!(e.take_due_with_work(102, &mut work).unwrap().nbl, 1);
-        assert!(!e.reap_idle_forward(7));
-        assert_eq!(e.verdict(new, Verdict::Accept, 103).unwrap().nbl, 2);
-        assert_eq!(e.interfaces.len(), 1);
-        e.disconnect();
-        assert!(e.interfaces.is_empty());
-    }
-
-    #[test]
-    fn replacing_idle_forward_row_preserves_pending_and_attached_rows() {
-        let mut e = Engine::new();
-        e.connect();
-        let p = packet();
-        let mut work = BandwidthWork::prepare(e.bandwidth_plan());
-        let Submission::Pending(first) =
-            e.submit_forward_with_work(1, p, 1, 100, record(&p), &mut work)
-        else {
-            panic!("expected pending packet");
-        };
-        e.verdict(first, Verdict::Drop, 101).unwrap();
-        let Submission::Pending(still_pending) =
-            e.submit_forward_with_work(1, p, 2, 102, record(&p), &mut work)
-        else {
-            panic!("expected pending packet");
-        };
-        let Submission::Pending(other) =
-            e.submit_forward_with_work(2, p, 3, 102, record(&p), &mut work)
-        else {
-            panic!("expected pending packet");
-        };
-        e.verdict(other, Verdict::Drop, 103).unwrap();
-        assert_eq!(e.interfaces.len(), 2);
-        e.verdict(still_pending, Verdict::Drop, 103).unwrap();
-        assert_eq!(e.interfaces.len(), 1);
-        assert!(e.attach(1));
-        assert!(e.ensure_forward(2));
-        assert!(e.reap_idle_forward(2));
-        assert_eq!(e.interfaces.len(), 2);
-        assert!(
-            e.interfaces
-                .iter()
-                .any(|interface| interface.interface_index == 1 && interface.ndis_attached)
-        );
-        e.disconnect();
-        assert_eq!(e.interfaces.len(), 1);
-    }
-
-    #[test]
-    fn forwarding_reap_never_removes_an_attached_ndis_row() {
-        let mut e = default_engine();
-        assert!(e.ensure_forward(101));
-        assert!(!e.reap_idle_forward(101));
-        assert!(e.preflight(101, &packet(), 1, 100).unwrap());
     }
 
     #[test]
@@ -2069,6 +1784,7 @@ mod tests {
         assert_eq!(expired, COUNT - 3);
         assert_eq!(e.pending_count(), 0);
         assert!(e.pending.is_empty());
+        assert_eq!(drain_warning_logs(&mut e), COUNT - 3);
         assert!(e.events.is_empty());
         assert_eq!(e.stats().dropped, COUNT as u64);
     }
@@ -2118,12 +1834,14 @@ mod tests {
             }
             assert!(seen.into_iter().all(|seen| seen));
             assert_eq!(e.pending_count(), 0);
-            assert_eq!(e.events.len(), usize::from(mode != 2));
+            let warnings = if mode == 0 || mode == 3 { COUNT } else { 0 };
+            assert_eq!(e.events.len(), usize::from(mode != 2) + warnings);
             assert_eq!(e.pending.len(), usize::from(mode != 2));
-            let mut tail = [0; 256];
+            let mut tail = [0; 133];
             let n = e.read(&mut tail);
             assert_eq!(n, if mode == 2 { 0 } else { 133 });
             assert_eq!(prefix[0], 1);
+            assert_eq!(drain_warning_logs(&mut e), warnings);
             assert!(e.events.is_empty());
             assert!(e.pending.is_empty());
             assert_eq!(e.queued_bytes, 0);
@@ -2753,6 +2471,8 @@ mod tests {
                 );
                 assert_eq!(e.pending_count(), 0);
                 assert!(e.pending.is_empty());
+                // A failed event-node allocation also prevents publishing its warning.
+                assert_eq!(drain_warning_logs(&mut e), usize::from(fail_pending));
                 assert!(!e.has_events());
                 assert_eq!(e.queued_bytes, 0);
                 assert_eq!(e.stats().overflow, 1);
@@ -2903,6 +2623,7 @@ mod tests {
         assert_eq!(e.stats().overflow, 2);
         assert_eq!(e.stats().timeouts, 2);
         assert_eq!(e.bandwidth_count, 2);
+        assert_eq!(drain_warning_logs(&mut e), 4);
         e.bandwidth();
         let mut out = [0; 128];
         assert_eq!(e.read(&mut out), 84);
@@ -3147,6 +2868,7 @@ mod tests {
         }
         assert_eq!(count, COUNT);
         assert_eq!(e.pending_count(), 0);
+        assert_eq!(drain_warning_logs(&mut e), COUNT);
         assert_eq!(e.queued_bytes, 0);
         assert_eq!(e.stats().overflow, 1);
         assert_eq!(e.stats().allowed, 0);
@@ -3397,7 +3119,7 @@ mod tests {
     }
 
     #[test]
-    fn new_forward_verdict_waits_for_paused_interface_cache_retirement() {
+    fn new_verdict_waits_for_paused_interface_cache_retirement() {
         for ipv6 in [false, true] {
             for protocol in [6, 17] {
                 for verdict in [
@@ -3406,7 +3128,6 @@ mod tests {
                     Verdict::PermanentDrop,
                 ] {
                     let mut e = engine();
-                    assert!(e.ensure_forward(101));
                     let old = cache_packet(ipv6, protocol, 1000);
                     let Submission::Pending(id) = e.submit(101, old, 1, None, 100, record(&old))
                     else {
@@ -3414,13 +3135,14 @@ mod tests {
                     };
                     e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
                     e.invalidate(101, true);
+                    assert!(e.restart(101));
 
                     let new = cache_packet(ipv6, protocol, 2000);
                     let mut bandwidth = BandwidthWork::prepare(e.bandwidth_plan());
                     let Submission::Pending(id) =
-                        e.submit_forward_with_work(101, new, 2, 102, record(&new), &mut bandwidth)
+                        e.submit_with_work(101, new, 2, None, 102, record(&new), &mut bandwidth)
                     else {
-                        panic!("new forward packet must be pending");
+                        panic!("new packet must be pending");
                     };
                     let mut work = CacheWork::prepare(e.cache_plan(id, verdict, 103));
                     assert_eq!(
@@ -3817,10 +3539,11 @@ mod tests {
         let mut prefix = [0; 3];
         assert_eq!(e.read(&mut prefix), 3);
         e.take_due(2100);
-        let n = e.read(&mut b);
+        let n = e.read(&mut b[..133]);
         assert_eq!(prefix[0], 1);
         assert_eq!(n, 133);
         assert_eq!(u64::from_le_bytes(b[2..10].try_into().unwrap()), id);
+        assert_eq!(drain_warning_logs(&mut e), 1);
     }
     #[test]
     fn queue_accounting_overflow_falls_back_without_losing_owned_token() {
@@ -3871,13 +3594,13 @@ mod tests {
             assert_eq!(e.read(&mut chunk), chunk.len());
             received.extend_from_slice(&chunk);
             assert_eq!(e.take_due(2100).unwrap().nbl, 7);
-            loop {
-                let n = e.read(&mut chunk);
-                if n == 0 {
-                    break;
-                }
+            while received.len() < prefix + MAX_PAYLOAD {
+                let limit = chunk.len().min(prefix + MAX_PAYLOAD - received.len());
+                let n = e.read(&mut chunk[..limit]);
+                assert!(n > 0);
                 received.extend_from_slice(&chunk[..n]);
             }
+            assert_eq!(drain_warning_logs(&mut e), 1);
             assert_eq!(received.len(), prefix + MAX_PAYLOAD);
             assert_eq!(u64::from_le_bytes(received[5..13].try_into().unwrap()), id);
             assert_eq!(
@@ -3910,6 +3633,7 @@ mod tests {
         let _ = e.submit(k, p, 9, None, 100, record(&p));
         assert!(e.queued_bytes > 65536);
         assert_eq!(e.take_due(2100).unwrap().nbl, 9);
+        assert_eq!(drain_warning_logs(&mut e), 1);
         assert_eq!(e.read(&mut [0; 16]), 0);
         assert_eq!(e.queued_bytes, 0);
         assert!(e.events.is_empty());
@@ -4013,6 +3737,7 @@ mod tests {
                 })
             );
             assert_eq!(e.pending_count(), 0);
+            assert_eq!(drain_warning_logs(&mut e), 1);
             assert_eq!(e.queued_bytes, 0);
             assert_eq!(e.stats().overflow, 1);
             assert_eq!(e.stats().malformed, 0);
@@ -4034,6 +3759,7 @@ mod tests {
             })
         );
         assert_eq!(e.pending_count(), 0);
+        assert_eq!(drain_warning_logs(&mut e), 1);
         assert_eq!(e.queued_bytes, 0);
         assert_eq!(e.stats().malformed, 1);
     }
@@ -4065,6 +3791,7 @@ mod tests {
                 finish: Finish::Drop
             })
         );
+        assert_eq!(drain_warning_logs(&mut e), 1);
         assert_eq!(e.queued_bytes, 0);
         assert_eq!(e.pending_count(), 0);
     }

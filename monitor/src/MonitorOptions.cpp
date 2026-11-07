@@ -123,13 +123,6 @@ bool ParseOptions(int argc, const wchar_t* const* argv, Options& opt, std::strin
             opt.show_connections = opt.show_ends = false;
         } else if (arg == L"--no-verdicts") {
             opt.send_verdicts = false;
-        } else if (arg == L"--sys") {
-            std::wstring_view path;
-            if (!opt.sys_path.empty() || !next(path) || path.empty() || path.starts_with(L"--")) {
-                error = "--sys needs one nonempty SYS path and may be specified only once";
-                return false;
-            }
-            opt.sys_path = path;
         } else if (arg == L"--suspend-pid-on-verdict-delay") {
             error = "PID suspension is not supported: NDIS LWF events have no process owner";
             return false;
@@ -177,7 +170,7 @@ bool ParseOptions(int argc, const wchar_t* const* argv, Options& opt, std::strin
             opt.has_filter_protocol = true;
             opt.filter_protocol = static_cast<uint8_t>(protocol);
         } else {
-            error = "unknown option or positional driver path; use --sys PATH or --help";
+            error = "unknown option or positional driver path; use --help";
             return false;
         }
     }
@@ -202,26 +195,21 @@ bool ShowConnection(const Options& opt, const Connection& c) {
            MatchesEndpoint(opt.filter, c.RemoteIpString(), c.remote_port);
 }
 
-bool AlternateMatches(const Options& opt, const Connection& c, bool reverse) {
-    return opt.has_alt && MatchesEndpoint(opt.match,
-        reverse ? c.LocalIpString() : c.RemoteIpString(), reverse ? c.local_port : c.remote_port);
+bool AlternateMatches(const Options& opt, const Connection& c) {
+    return opt.has_alt && MatchesEndpoint(opt.match, c.RemoteIpString(), c.remote_port);
 }
 
 void PrintUsage(FILE* out) {
     std::fprintf(out,
         "Usage: hyperv_monitor.exe [--duration SECONDS] [options]\n"
         "       hyperv_monitor.exe --help\n\n"
-        "Opens \\\\.\\HyperVXNdisFilter; if absent, loads a driver through SCM.\n"
-        "Default SYS: HyperVXNdisFilter.sys beside this EXE (not the working directory).\n"
-        "Requires elevated admin/SYSTEM. Temporary loads run WFP only, without NDIS bindings.\n"
-        "Drivers started here are stopped on exit; only services created here are deleted.\n"
-        "An already running driver/service is left untouched. No NetCfg installation.\n\n"
+        "Opens \\\\.\\HyperVXNdisFilter; fails if the device is absent.\n"
+        "Requires elevated admin/SYSTEM; no driver loading or installation.\n\n"
         "Collection:\n"
-        "  --sys PATH       optional SYS path, used only if the device is absent.\n"
         "  --duration N     optional positive seconds; otherwise run until Ctrl+C.\n"
-        "                   Startup/load failures exit without an indefinite wait.\n"
+        "                   Startup failures exit without an indefinite wait.\n"
         "  --out FILE       write records to FILE, flushed per record.\n"
-        "  --poll N         refresh ICS roles and query device count/logs/bandwidth every N ms (default 1000).\n"
+        "  --poll N         query device count/logs/bandwidth every N ms (default 1000).\n"
         "  --timestamps     prefix records with local HH:MM:SS.mmm.\n"
         "  --payload        dump the complete IP packet as one hex string.\n"
         "  --memory-stats   request compatible memory-stat LogLine records each poll.\n\n"
@@ -250,24 +238,18 @@ void PrintUsage(FILE* out) {
         "                   Delays >= 8000 ms can expire before a decision is sent.\n\n"
         "Semantics:\n"
         "  CONN is one event/verdict per NBL, not a process-owned socket.\n"
-        "  NDIS direction=0 outbound, 1 inbound relative to the guest side;\n"
-        "  local=guest endpoint, remote=peer. Host receive=outbound, send=inbound.\n"
-        "  Raw IPFORWARD covers all forwarding: interface_index=source, direction=0, local=IP source.\n"
-        "  This console reverses CONN direction/endpoints and bandwidth endpoints/TX/RX\n"
-        "  for enabled ICS public/upstream interfaces, discovered read-only by GUID and NETIO.\n"
-        "  Roles refresh at startup and --poll; --match uses the presented remote peer.\n"
-        "  The rule selects interface_index for any record: NDIS/WFP have no event source tag.\n"
-        "  Packet bytes and the raw device/client APIs are unchanged; ICS is never reconfigured.\n"
-        "  WFP requires BFE; registration availability is reported through driver logs.\n"
+        "  NDIS direction=0 host receive, 1 host send; local=source on receive\n"
+        "  or destination on send, and remote is the other endpoint.\n"
+        "  These values and bandwidth TX/RX are presented unchanged for every interface.\n"
         "  Connection events carry no process/thread identity.\n"
         "  payload_layer=3 is the complete logical IP packet (up to 1 MiB, no truncation).\n"
-        "  Mixed/unsupported batches are dropped rather than misreported.\n"
-        "  Bandwidth records group one host interface/protocol/address family; index is NDIS base or IPFORWARD source.\n"
-        "  NDIS tx/rx are guest out/in; IPFORWARD counts source-relative TX bytes; no PID.\n"
-        "  Without a controller or after it disconnects, IP traffic is dropped by default.\n"
+        "  Mixed local/transit IP batches bypass policy with a warning; invalid/unsupported batches drop.\n"
+        "  Bandwidth records group one host interface/protocol/address family; index is the NDIS base.\n"
+        "  Raw NDIS tx/rx correspond to host receive/send; no PID.\n"
+        "  Without a controller, eligible transit IP traffic is dropped by default.\n"
         "  The driver cleans expired cache entries automatically; no END events are fabricated.\n"
         "  UpdateV4/UpdateV6 commands and redirect verdicts are unsupported.\n"
-        "  Block/drop for all events can cut host-vNIC traffic and remote access.\n"
+        "  Block/drop for all events can interrupt transit traffic and connectivity.\n"
         "  Positional .sys paths and PID-suspension options are rejected.\n\n"
         "Examples:\n"
         "  hyperv_monitor.exe\n"

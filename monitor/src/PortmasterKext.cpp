@@ -199,7 +199,7 @@ Driver::~Driver() {
 
 bool Driver::Install(const std::wstring&, std::string& error, bool) {
     error = "automatic installation is not supported for an NDIS LWF; "
-            "install explicitly with dist/Install.exe for Hyper-V host adapters associated with HNS ICS networks";
+            "install explicitly with dist/Install.exe";
     return false;
 }
 

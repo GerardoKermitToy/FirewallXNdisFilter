@@ -98,8 +98,8 @@ public:
 #pragma pack(push, 1)
     template <size_t AddressSize> struct ConnectionFixed {
         uint64_t id;
-        uint32_t interface_index; // Observed host interface: NDIS base or IPFORWARD source.
-        uint8_t direction, protocol; // NDIS guest out=0/in=1; IPFORWARD source-relative=0.
+        uint32_t interface_index; // Observed host interface: NDIS base.
+        uint8_t direction, protocol; // NDIS host receive=0, host send=1.
         uint8_t local_ip[AddressSize], remote_ip[AddressSize];
         uint16_t local_port, remote_port;
         uint8_t payload_layer; // Always 3. The following u32 is the payload size.

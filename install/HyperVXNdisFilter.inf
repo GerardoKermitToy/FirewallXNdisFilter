@@ -1,4 +1,4 @@
-; Optional modifying Ethernet LWF. Notify object and kernel gate restrict the target.
+; Optional modifying Ethernet LWF. Notify and kernel gates require armed configuration.
 [Version]
 Signature="$Windows NT$"
 Class=NetService
@@ -69,4 +69,4 @@ NotifyFiles=13
 [Strings]
 Provider="HyperVXNdisFilter Project"
 Description="HyperVXNdisFilter Rust Host Adapter LWF"
-Help="Rust packet verdicts for Hyper-V host vEthernet adapters associated with HNS ICS networks."
+Help="Rust packet verdicts for compatible Ethernet adapter bindings."

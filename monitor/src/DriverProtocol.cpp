@@ -1,4 +1,4 @@
-// NDIS and global source-relative IPFORWARD share the explicit 0.3.3.0 layout.
+// NDIS records use the explicit 0.3.3.0 layout.
 #include "DriverProtocol.h"
 
 #include <algorithm>

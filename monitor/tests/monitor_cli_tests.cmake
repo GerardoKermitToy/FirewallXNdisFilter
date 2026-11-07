@@ -36,8 +36,7 @@ expect_invalid(bad_port "1 to 65535" --duration 1 --verdict block --match 192.0.
 expect_invalid(bad_ipv6_port "1 to 65535" --duration 1 --filter-ip "[::1]:53x")
 expect_invalid(bad_delay "0 to 4294967295" --duration 1 --verdict-delay-ms 4294967296)
 expect_invalid(suspend_rejected "PID suspension is not supported" --duration 1 --suspend-pid-on-verdict-delay)
-expect_invalid(sys_missing "nonempty SYS path" --sys)
-expect_invalid(sys_duplicate "only once" --sys a.sys --sys b.sys)
+expect_invalid(sys_rejected "unknown option" --sys a.sys)
 expect_invalid(positional_rejected "positional driver path" --duration 1 ignored.sys)
 expect_invalid(update_v4_rejected "unknown option" --duration 1 --update-v4)
 expect_invalid(update_v6_rejected "unknown option" --duration 1 --update-v6)
@@ -61,13 +60,13 @@ endif()
 execute_process(COMMAND "${MONITOR}" --help
     RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE errors TIMEOUT 5
     WORKING_DIRECTORY "${TEST_DIR}")
-if(NOT result STREQUAL "0" OR NOT output MATCHES "direction=0 outbound, 1 inbound" OR
-   NOT output MATCHES "relative to the guest side" OR NOT output MATCHES "local=guest endpoint" OR
-   NOT output MATCHES "Host receive=outbound, send=inbound" OR
+if(NOT result STREQUAL "0" OR NOT output MATCHES "direction=0 host receive, 1 host send" OR
+   NOT output MATCHES "local=source on receive" OR
+   NOT output MATCHES "destination on send" OR
    NOT output MATCHES "Redirects are NOT supported" OR
-   NOT output MATCHES "loads a driver through SCM" OR
-   NOT output MATCHES "Temporary loads run WFP only" OR
-   NOT output MATCHES "only services created here are deleted" OR
+   NOT output MATCHES "fails if the device is absent" OR
+   NOT output MATCHES "no driver loading or installation" OR
+   output MATCHES "loads a driver through SCM|--sys|WFP|IPFORWARD|ICS" OR
    NOT output MATCHES "complete logical IP packet" OR
    NOT output MATCHES "up to 1 MiB, no truncation" OR
    NOT output MATCHES "pending timeout defaults to 8 s" OR
@@ -79,6 +78,7 @@ if(NOT result STREQUAL "0" OR NOT output MATCHES "direction=0 outbound, 1 inboun
    NOT output MATCHES "TCP and UDP use separate caches" OR
    output MATCHES "TCP/UDP and both directions share" OR
    NOT output MATCHES "Connection events carry no process/thread identity" OR
+   NOT output MATCHES "Mixed local/transit IP batches bypass policy with a warning" OR
    output MATCHES "--filter-pid|PID=0|possibly shortened" OR
    output MATCHES "HyperVXNdisFilterPipe|Bridge:|winrpc|named-pipe" OR
    output MATCHES "Device name :|Driver version")

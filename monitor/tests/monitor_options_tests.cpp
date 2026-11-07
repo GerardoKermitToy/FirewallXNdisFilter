@@ -37,16 +37,9 @@ bool TestValidOptions() {
     }
     pmkext::monitor::Options interactive;
     CHECK(Parse({}, interactive, error));
-    CHECK(interactive.duration_s == 0 && !interactive.help && interactive.sys_path.empty() && error.empty());
+    CHECK(interactive.duration_s == 0 && !interactive.help && error.empty());
     pmkext::monitor::Options explicit_sys;
-    CHECK(Parse({L"--sys", L"C:/path with spaces/filter.sys", L"--duration", L"1"}, explicit_sys, error));
-    CHECK(explicit_sys.sys_path == L"C:/path with spaces/filter.sys");
-    for (const wchar_t* path : {L"", L"--help"}) {
-        pmkext::monitor::Options invalid;
-        CHECK(!Parse({L"--sys", path}, invalid, error));
-    }
-    pmkext::monitor::Options duplicate_sys;
-    CHECK(!Parse({L"--sys", L"a.sys", L"--sys", L"b.sys"}, duplicate_sys, error));
+    CHECK(!Parse({L"--sys", L"C:/path with spaces/filter.sys"}, explicit_sys, error));
     CHECK(interactive.send_verdicts && interactive.alt_verdict == pmkext::Verdict::PermanentAccept);
     pmkext::monitor::Options interactive_options;
     CHECK(Parse({L"--timestamps", L"--only-logs"}, interactive_options, error));
@@ -144,7 +137,7 @@ bool TestFilterAndVerdictSeparation() {
     return true;
 }
 
-bool TestIcsPresentedRemoteMatches() {
+bool TestRemoteMatchesAcrossInterfacesAndDirections() {
     for (bool ipv6 : {false, true}) {
         pmkext::Connection c;
         c.ipv6 = ipv6;
@@ -158,21 +151,26 @@ bool TestIcsPresentedRemoteMatches() {
         pmkext::monitor::Options opt;
         opt.has_alt = true;
         opt.alt_verdict = pmkext::Verdict::Block;
-        opt.match = {true, true, c.LocalIpString(), c.local_port};
-        CHECK(!pmkext::monitor::AlternateMatches(opt, c));
-        CHECK(pmkext::monitor::AlternateMatches(opt, c, true));
-        opt.match.port = c.remote_port;
-        CHECK(!pmkext::monitor::AlternateMatches(opt, c, true));
-        opt.match = {true, true, c.RemoteIpString(), c.remote_port};
-        CHECK(pmkext::monitor::AlternateMatches(opt, c));
-        CHECK(!pmkext::monitor::AlternateMatches(opt, c, true));
-        opt.filter = opt.match;
-        CHECK(pmkext::monitor::ShowConnection(opt, c)); // Display matches either endpoint.
-        opt.match = {};
-        CHECK(pmkext::monitor::AlternateMatches(opt, c, true));
-        opt.has_alt = false;
-        CHECK(!pmkext::monitor::AlternateMatches(opt, c, true));
-        CHECK(c.local_port == 80 && c.remote_port == 28436 && c.direction == 0);
+        for (uint32_t index : {0u, 42u, 0xffffffffu}) {
+            c.interface_index = index;
+            for (uint8_t direction : {uint8_t{0}, uint8_t{1}}) {
+                c.direction = direction;
+                opt.match = {true, true, c.LocalIpString(), c.local_port};
+                CHECK(!pmkext::monitor::AlternateMatches(opt, c));
+                opt.match = {true, true, c.RemoteIpString(), c.remote_port};
+                CHECK(pmkext::monitor::AlternateMatches(opt, c));
+                opt.match.port = c.local_port;
+                CHECK(!pmkext::monitor::AlternateMatches(opt, c));
+                opt.filter = {true, true, c.LocalIpString(), c.local_port};
+                CHECK(pmkext::monitor::ShowConnection(opt, c));
+                opt.match = {};
+                CHECK(pmkext::monitor::AlternateMatches(opt, c));
+                opt.has_alt = false;
+                CHECK(!pmkext::monitor::AlternateMatches(opt, c));
+                opt.has_alt = true;
+                CHECK(c.local_port == 80 && c.remote_port == 28436 && c.direction == direction);
+            }
+        }
     }
     return true;
 }
@@ -185,7 +183,7 @@ int main() {
         {"strict numeric/endpoint validation", TestInvalidNumbersAndEndpoints},
         {"redirects/suspension/PID filters/updates rejected", TestRejectedCapabilities},
         {"source/destination filters do not alter verdicts", TestFilterAndVerdictSeparation},
-        {"ICS --match selects the presented remote endpoint without packet mutation", TestIcsPresentedRemoteMatches},
+        {"--match uses the remote endpoint on every interface and direction", TestRemoteMatchesAcrossInterfacesAndDirections},
     };
     for (const auto& test : tests) {
         if (!test.run()) return 1;

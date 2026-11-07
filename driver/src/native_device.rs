@@ -324,20 +324,8 @@ pub(super) unsafe fn initialize_io() -> i32 {
     }
 }
 
-const DEVICE_CLASS: GUID = GUID {
-    Data1: 0x874bec2c,
-    Data2: 0x0e77,
-    Data3: 0x4ed4,
-    Data4: [0xa3, 0x76, 0x14, 0x60, 0x6b, 0xe3, 0xc8, 0x64],
-};
 static mut DEVICE_NAME: UNICODE_STRING = wide!("\\Device\\HyperVXNdisFilter");
 static mut LINK_NAME: UNICODE_STRING = wide!("\\DosDevices\\HyperVXNdisFilter");
-unsafe extern "C" {
-    fn HvWfpInitialize(driver: *mut core::ffi::c_void) -> i32;
-    fn HvWfpStop();
-    fn HvWfpUninitialize();
-}
-
 #[unsafe(no_mangle)]
 #[cfg(not(test))]
 unsafe extern "C" fn hv_initialize(driver: PDRIVER_OBJECT, registry: PUNICODE_STRING) -> i32 {
@@ -346,8 +334,11 @@ unsafe extern "C" fn hv_initialize(driver: PDRIVER_OBJECT, registry: PUNICODE_ST
         if !nt_success(status) {
             return status;
         }
-        STANDALONE_WFP = registry::read_configuration(registry);
-        status = HvWfpInitialize(driver.cast());
+        registry::read_configuration(registry);
+        // Start the machine-wide address inventory before NDIS can admit any
+        // packet callbacks. A failed worker start cannot provide the required
+        // local-address exemption, so fail driver initialization instead.
+        status = crate::native_local_address::start();
         if !nt_success(status) {
             return status;
         }
@@ -365,54 +356,35 @@ unsafe extern "C" fn hv_initialize(driver: PDRIVER_OBJECT, registry: PUNICODE_ST
             dispatch_table[major as usize] = Some(dispatch);
         }
         let mut sddl = wide!("D:P(A;;GA;;;SY)(A;;GA;;;BA)");
-        if STANDALONE_WFP {
-            for (major, callback) in dispatch_table.iter().enumerate() {
-                if callback.is_some() {
-                    (*driver).MajorFunction[major] = *callback;
-                }
-            }
-            status = WdmlibIoCreateDeviceSecure(
-                driver,
-                0,
-                addr_of_mut!(DEVICE_NAME),
-                FILE_DEVICE_UNKNOWN,
-                FILE_DEVICE_SECURE_OPEN,
-                0,
-                &sddl,
-                &DEVICE_CLASS,
-                addr_of_mut!(CONTROL_DEVICE),
-            );
+        FILTER_NDIS_VERSION = ndis::ndis_version(NdisGetVersion());
+        let mut characteristics: NDIS_FILTER_DRIVER_CHARACTERISTICS = zeroed();
+        if !ndis::configure_characteristics(&mut characteristics, FILTER_NDIS_VERSION) {
+            status = HV_WDK_NDIS_BAD_VERSION;
         } else {
-            FILTER_NDIS_VERSION = ndis::ndis_version(NdisGetVersion());
-            let mut characteristics: NDIS_FILTER_DRIVER_CHARACTERISTICS = zeroed();
-            if !ndis::configure_characteristics(&mut characteristics, FILTER_NDIS_VERSION) {
-                status = HV_WDK_NDIS_BAD_VERSION;
-            } else {
-                status = NdisFRegisterFilterDriver(
-                    driver,
-                    driver.cast(),
-                    &mut characteristics,
-                    addr_of_mut!(DRIVER_HANDLE),
+            status = NdisFRegisterFilterDriver(
+                driver,
+                driver.cast(),
+                &mut characteristics,
+                addr_of_mut!(DRIVER_HANDLE),
+            );
+            if status == HV_WDK_NDIS_SUCCESS {
+                let mut attributes: NDIS_DEVICE_OBJECT_ATTRIBUTES = zeroed();
+                attributes.Header.Type = NDIS_OBJECT_TYPE_DEVICE_OBJECT_ATTRIBUTES as u8;
+                attributes.Header.Revision = NDIS_DEVICE_OBJECT_ATTRIBUTES_REVISION_1 as u8;
+                attributes.Header.Size = HV_WDK_DEVICE_ATTRIBUTES_SIZE as u16;
+                attributes.DeviceName = addr_of_mut!(DEVICE_NAME);
+                attributes.SymbolicName = addr_of_mut!(LINK_NAME);
+                attributes.MajorFunctions = dispatch_table.as_mut_ptr();
+                attributes.DefaultSDDLString = &mut sddl;
+                status = NdisRegisterDeviceEx(
+                    DRIVER_HANDLE,
+                    &mut attributes,
+                    addr_of_mut!(CONTROL_DEVICE),
+                    addr_of_mut!(DEVICE_HANDLE),
                 );
-                if status == HV_WDK_NDIS_SUCCESS {
-                    let mut attributes: NDIS_DEVICE_OBJECT_ATTRIBUTES = zeroed();
-                    attributes.Header.Type = NDIS_OBJECT_TYPE_DEVICE_OBJECT_ATTRIBUTES as u8;
-                    attributes.Header.Revision = NDIS_DEVICE_OBJECT_ATTRIBUTES_REVISION_1 as u8;
-                    attributes.Header.Size = HV_WDK_DEVICE_ATTRIBUTES_SIZE as u16;
-                    attributes.DeviceName = addr_of_mut!(DEVICE_NAME);
-                    attributes.SymbolicName = addr_of_mut!(LINK_NAME);
-                    attributes.MajorFunctions = dispatch_table.as_mut_ptr();
-                    attributes.DefaultSDDLString = &mut sddl;
-                    status = NdisRegisterDeviceEx(
-                        DRIVER_HANDLE,
-                        &mut attributes,
-                        addr_of_mut!(CONTROL_DEVICE),
-                        addr_of_mut!(DEVICE_HANDLE),
-                    );
-                }
             }
         }
-        if !nt_success(status) || (!STANDALONE_WFP && status != HV_WDK_NDIS_SUCCESS) {
+        if status != HV_WDK_NDIS_SUCCESS {
             unload(driver);
             return status;
         }
@@ -420,20 +392,10 @@ unsafe extern "C" fn hv_initialize(driver: PDRIVER_OBJECT, registry: PUNICODE_ST
         READ_WORK_ITEM.store(read_work_item, Ordering::Release);
         CACHE_WORK_ITEM = IoAllocateWorkItem(CONTROL_DEVICE);
         (*CONTROL_DEVICE).Flags |= DO_BUFFERED_IO;
-        if STANDALONE_WFP {
-            status = IoCreateSymbolicLink(addr_of_mut!(LINK_NAME), addr_of_mut!(DEVICE_NAME));
-            if nt_success(status) {
-                STANDALONE_LINK_CREATED = true;
-            }
-        }
-        if nt_success(status) {
-            schedule_read();
-            (*CONTROL_DEVICE).Flags &= !DO_DEVICE_INITIALIZING;
-            registry::signal_driver_ready();
-            return HV_WDK_STATUS_SUCCESS;
-        }
-        unload(driver);
-        status
+        schedule_read();
+        (*CONTROL_DEVICE).Flags &= !DO_DEVICE_INITIALIZING;
+        registry::signal_driver_ready();
+        HV_WDK_STATUS_SUCCESS
     }
 }
 #[cfg(not(test))]
@@ -462,21 +424,14 @@ unsafe extern "C" fn unload(_: PDRIVER_OBJECT) {
             IoFreeWorkItem(CACHE_WORK_ITEM);
             CACHE_WORK_ITEM = null_mut();
         }
-        HvWfpStop();
         if !DRIVER_HANDLE.is_null() {
             NdisFDeregisterFilterDriver(DRIVER_HANDLE);
             DRIVER_HANDLE = null_mut();
         }
-        HvWfpUninitialize();
-        if STANDALONE_WFP {
-            if STANDALONE_LINK_CREATED {
-                let _ = IoDeleteSymbolicLink(addr_of_mut!(LINK_NAME));
-                STANDALONE_LINK_CREATED = false;
-            }
-            if !CONTROL_DEVICE.is_null() {
-                IoDeleteDevice(CONTROL_DEVICE);
-            }
-        } else if !DEVICE_HANDLE.is_null() {
+        // NDIS admission is closed and its callbacks have drained. Cancel
+        // NETIO notifications and join the inventory worker before unload.
+        crate::native_local_address::stop();
+        if !DEVICE_HANDLE.is_null() {
             NdisDeregisterDeviceEx(DEVICE_HANDLE);
             DEVICE_HANDLE = null_mut();
         }

@@ -1,11 +1,9 @@
 // HyperVXNdisFilter console monitor, adapted from kext_client on 2026-10-25 (see README.md/LICENSE).
-// Missing devices can be loaded temporarily; existing driver ownership is preserved.
+// Opens an existing driver device without changing driver service state.
 #include "PortmasterKext.h"
 #include "DriverProtocol.h"
-#include "DriverLoader.h"
 #include "DelayedVerdicts.h"
 #include "MonitorOptions.h"
-#include "IcsInterfaces.h"
 #include "RecordOutput.h"
 
 #include <windows.h>
@@ -44,8 +42,7 @@ std::string TimePrefix(bool enabled) {
     return buffer;
 }
 
-// Independent name: the WFP monitor and this host-vNIC monitor may coexist. The
-// protected object ACL prevents an unprivileged peer from joining the mutex.
+// The protected object ACL prevents an unprivileged peer from joining the mutex.
 class SingleInstanceGuard {
 public:
     ~SingleInstanceGuard() {
@@ -135,51 +132,13 @@ public:
     }
 };
 
-int RunMonitor(const pmkext::monitor::Options& opt, pmkext::monitor::DriverLoader& loader) {
+int RunMonitor(const pmkext::monitor::Options& opt) {
     std::string error;
-    pmkext::monitor::IcsInterfaces ics;
-    bool ics_reported = false, ics_unavailable = false;
-    auto refresh_ics = [&]() {
-        bool changed = false;
-        std::string query_error;
-        if (!ics.Refresh(query_error, changed)) {
-            if (!ics_unavailable)
-                Emit("%s[WARN] ICS public-interface discovery unavailable: %s; using raw driver orientation\n",
-                     TimePrefix(opt.timestamps).c_str(), query_error.c_str());
-            ics_unavailable = true;
-            return;
-        }
-        if (!ics_reported || ics_unavailable || changed) {
-            const auto indices = ics.Snapshot();
-            pmkext::RecordOutput record(g_out, g_print_mutex);
-            record.Write("%sICS public interfaces:", TimePrefix(opt.timestamps).c_str());
-            if (indices.empty()) record.Write(" (none)");
-            for (uint32_t index : indices) record.Write(" %u", index);
-            record.Write(" (console CONN direction/endpoints and bandwidth endpoints/TX/RX reversed)\n");
-        }
-        ics_reported = true;
-        ics_unavailable = false;
-    };
-    refresh_ics();
     std::printf("Device name : HyperVXNdisFilter\n");
     pmkext::Driver driver;
     if (!driver.Open(error)) {
-        const DWORD status = GetLastError();
-        if (status != ERROR_FILE_NOT_FOUND && status != ERROR_PATH_NOT_FOUND && status != ERROR_DEV_NOT_EXIST) {
-            std::fprintf(stderr, "ERROR: open device: %s\n", error.c_str());
-            return 1;
-        }
-        if (g_shutdown_requested.load()) return 0;
-        std::printf("Device unavailable; loading driver through SCM.\n");
-        if (!loader.Load(opt.sys_path, error)) {
-            std::fprintf(stderr, "ERROR: load driver: %s\n", error.c_str());
-            return 1;
-        }
-        if (g_shutdown_requested.load()) return 0;
-        if (!driver.Open(error)) {
-            std::fprintf(stderr, "ERROR: open loaded driver: %s\n", error.c_str());
-            return 1;
-        }
+        std::fprintf(stderr, "ERROR: open device: %s\n", error.c_str());
+        return 1;
     }
 
     uint32_t filtered_devices = 0;
@@ -223,11 +182,8 @@ int RunMonitor(const pmkext::monitor::Options& opt, pmkext::monitor::DriverLoade
         Emit("%s[WARN] Adapter information unavailable: %s\n",
              TimePrefix(opt.timestamps).c_str(), error.c_str());
     }
-    std::printf("CONN: one shared NBL decision; NDIS direction=0 outbound/1 inbound from the guest side.\n"
-                "Local=guest endpoint, remote=peer; host receive=outbound, host send=inbound; no process/thread identity.\n"
-                "Raw global IPFORWARD: source interface index, direction=0, local=IP source; shared verdict API; requires BFE.\n"
-                "Console ICS public interfaces: reverse CONN direction/endpoints and bandwidth endpoints/TX/RX.\n"
-                "Roles refresh read-only at --poll; --match uses the presented peer; packet bytes/raw client API stay unchanged.\n"
+    std::printf("CONN: one NBL decision; NDIS direction=0 host receive/1 host send.\n"
+                "Local=source on receive/destination on send, remote=the other endpoint; no process/guest identity.\n"
                 "Payload is the complete layer-3 logical IP packet, up to 1 MiB without truncation.\n"
                 "TCP/UDP cache only: four tables per host interface, TCP/UDP x IPv4/IPv6; key=IP+port.\n"
                 "TCP and UDP use separate caches; both directions share tuples within each.\n"
@@ -235,7 +191,7 @@ int RunMonitor(const pmkext::monitor::Options& opt, pmkext::monitor::DriverLoade
                 "Pending timeout: 8 s by default, checked every 1 s while pending; fail-closed by default.\n"
                 "Driver cache cleanup: full pass every 10 s while entries exist; no monitor cleanup polling.\n"
                 "Bandwidth: each record is one host-interface/protocol/address-family group; interface_index is BaseMiniportIfIndex.\n"
-                "           raw NDIS tx/rx=guest outbound/inbound; raw IPFORWARD=source-relative TX; console ICS public swaps TX/RX.\n"
+                "           NDIS tx/rx=host receive/send.\n"
                 "No synthetic END events; UpdateV4/UpdateV6 and redirects are unsupported.\n");
     if (!opt.send_verdicts) {
         std::printf("NOT answering events (--no-verdicts); pending packets are dropped on timeout by default.\n");
@@ -248,7 +204,7 @@ int RunMonitor(const pmkext::monitor::Options& opt, pmkext::monitor::DriverLoade
         std::printf("Answering EVERY event with %s.\n", pmkext::ToString(opt.alt_verdict));
         if (opt.has_alt && opt.alt_verdict != pmkext::Verdict::Accept &&
             opt.alt_verdict != pmkext::Verdict::PermanentAccept) {
-            std::printf("WARNING: block/drop applies to all observed host-vNIC traffic and can cut remote access.\n");
+            std::printf("WARNING: block/drop applies to all observed transit traffic and can cut connectivity.\n");
         }
     }
     if (opt.send_verdicts && opt.verdict_delay_ms > 0) {
@@ -298,8 +254,7 @@ int RunMonitor(const pmkext::monitor::Options& opt, pmkext::monitor::DriverLoade
 
     auto handle_connection = [&](const pmkext::Connection& c) {
         ++connections;
-        const bool reverse = ics.IsPublic(c.interface_index);
-        const bool matched = pmkext::monitor::AlternateMatches(opt, c, reverse);
+        const bool matched = pmkext::monitor::AlternateMatches(opt, c);
         const auto verdict = matched ? opt.alt_verdict : pmkext::Verdict::PermanentAccept;
         const bool show = pmkext::monitor::ShowConnection(opt, c);
         bool sent = false;
@@ -334,7 +289,7 @@ int RunMonitor(const pmkext::monitor::Options& opt, pmkext::monitor::DriverLoade
         // Output filtering must never withhold or change a verdict.
         if (!show) return;
         pmkext::RecordOutput record(g_out, g_print_mutex);
-        record.WriteConnection(c, TimePrefix(opt.timestamps).c_str(), reverse);
+        record.WriteConnection(c, TimePrefix(opt.timestamps).c_str());
         if (opt.show_payload) {
             record.Write("          payload: %s\n", c.payload.empty() ? "(none)" : c.PayloadHexString().c_str());
         }
@@ -375,7 +330,6 @@ int RunMonitor(const pmkext::monitor::Options& opt, pmkext::monitor::DriverLoade
         ++bandwidth_records;
         if (!opt.show_bandwidth ||
             (opt.has_filter_protocol && opt.filter_protocol != stats.protocol)) return;
-        const bool reverse = ics.IsPublic(stats.interface_index);
         auto keep = [&](const pmkext::BandwidthEntry& entry) {
             return !opt.filter.present ||
                 pmkext::monitor::MatchesEndpoint(opt.filter, entry.LocalIpString(), entry.local_port) ||
@@ -389,7 +343,7 @@ int RunMonitor(const pmkext::monitor::Options& opt, pmkext::monitor::DriverLoade
                      static_cast<unsigned>(stats.protocol), pmkext::ProtocolToString(stats.protocol), shown);
         for (const auto& entry : stats.entries) {
             if (!keep(entry)) continue;
-            record.WriteBandwidthEntry(entry, reverse);
+            record.WriteBandwidthEntry(entry);
         }
     };
     handlers.on_warning = [&](const std::string& warning) {
@@ -411,7 +365,6 @@ int RunMonitor(const pmkext::monitor::Options& opt, pmkext::monitor::DriverLoade
         }
         if (now < next_poll) return;
         next_poll = now + opt.poll_ms;
-        refresh_ics();
         report_filtered_devices();
         std::string command_error;
         if (opt.memory_stats && !driver.RequestMemoryStats(command_error))
@@ -459,18 +412,7 @@ int MonitorMain(int argc, wchar_t** argv) {
     OutputFile output;
     if (!output.Open(opt.out_path)) return 1;
 
-    pmkext::monitor::DriverLoader loader;
-    const int result = RunMonitor(opt, loader);
-    const bool started_here = loader.Started();
-    const bool created_here = loader.Created();
-    if (!loader.Cleanup(error)) {
-        std::fprintf(stderr, "ERROR: driver cleanup: %s\n", error.c_str());
-        return 1;
-    }
-    if (created_here) std::printf("Created service removed%s.\n", started_here ? "; temporary driver unloaded" : "");
-    else if (started_here) std::printf("Monitor-started driver unloaded; existing service retained.\n");
-    else if (result == 0) std::printf("Existing driver left running.\n");
-    return result;
+    return RunMonitor(opt);
 }
 
 } // namespace

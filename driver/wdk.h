@@ -2,9 +2,6 @@
 #include <ntifs.h>
 #include <ndis.h>
 #include <netioapi.h>
-#include <wdmsec.h>
-#include <fwpsk.h>
-#include <fwpmk.h>
 
 // Evaluate function-like WDK size macros with Clang instead of guessing ABI sizes.
 enum {
@@ -17,6 +14,7 @@ enum {
     HV_WDK_STATUS_SUCCESS = STATUS_SUCCESS,
     HV_WDK_STATUS_INSUFFICIENT_RESOURCES = STATUS_INSUFFICIENT_RESOURCES,
     HV_WDK_STATUS_INVALID_PARAMETER = STATUS_INVALID_PARAMETER,
+    HV_WDK_STATUS_NOT_FOUND = STATUS_NOT_FOUND,
     HV_WDK_STATUS_PENDING = STATUS_PENDING,
     HV_WDK_STATUS_CANCELLED = STATUS_CANCELLED,
     HV_WDK_STATUS_DEVICE_NOT_CONNECTED = STATUS_DEVICE_NOT_CONNECTED,

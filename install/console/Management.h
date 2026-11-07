@@ -35,21 +35,6 @@ struct Adapter {
     GUID guid{};
     uint64_t luid = 0;
     std::wstring name;
-    bool is_virtual = false;
-    bool hardware = true;
-    uint32_t interface_type = 0;
-};
-
-// Only Msvm_InternalEthernetPort instances may enter this list. Switch identity
-// comes from connected LAN endpoints, never from a display name or port name.
-struct HostPort {
-    std::wstring device_id;
-    std::vector<GUID> switches;
-};
-
-struct HnsNetwork {
-    std::wstring type;
-    GUID id{}, switch_id{};
 };
 
 struct Binding {
@@ -62,11 +47,6 @@ using Targets = std::vector<Adapter>;
 bool ParseOptions(Action executable, int argc, const wchar_t* const* argv,
                   Options& options, std::wstring& error);
 std::wstring Usage(Action executable);
-bool ParseGuid(const std::wstring& text, GUID& guid);
-GUID InternalPortGuid(const std::wstring& device_id);
-std::vector<GUID> SelectIcsSwitches(const std::vector<HnsNetwork>& networks);
-Targets SelectTargets(const std::vector<GUID>& switches, const std::vector<HostPort>& ports,
-                      const std::vector<Adapter>& adapters, const std::vector<HnsNetwork>& networks);
 void ValidateTargets(const Targets& targets);
 bool SameTarget(const Adapter& first, const Adapter& second);
 bool SameTargets(const Targets& first, const Targets& second);
@@ -74,7 +54,7 @@ void ValidateBindings(const std::vector<Binding>& bindings, const Targets& targe
                       bool all_disabled, bool require_enabled = false);
 
 // The workflow is shared by the EXEs and a fake implementation in offline tests.
-// Only the Windows implementation may touch WMI, NetCfg, files or registry state.
+// Only the Windows implementation may touch NetCfg, files or registry state.
 class System {
 public:
     virtual ~System() = default;

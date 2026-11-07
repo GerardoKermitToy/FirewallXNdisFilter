@@ -296,13 +296,12 @@ unsafe fn complete_local_lso(nbl: PNET_BUFFER_LIST) -> bool {
             }
             let offset = info.__bindgen_anon_1.LsoV1Transmit.TcpHeaderOffset();
             let length = packet::data_length(nb);
-            let mut data_offset = 0u8;
-            if offset > length
-                || length - offset < 20
-                || crate::native_wfp::ForwardRead(nb, offset + 12, &mut data_offset, 1) == 0
-            {
+            if offset > length || length - offset < 20 {
                 return false;
             }
+            let Some(data_offset) = packet::read_byte(nb, offset + 12) else {
+                return false;
+            };
             let header = u32::from(data_offset >> 4) * 4;
             if header < 20 || header > length - offset {
                 return false;
@@ -341,11 +340,7 @@ pub(super) unsafe extern "C" fn hv_finish(nbl_address: usize, finish: u32) {
         let nbl = nbl_address as PNET_BUFFER_LIST;
         let context = packet::packet_context(nbl);
         if (*context).owner != packet::OWNER_NDIS {
-            unsafe extern "C" {
-                fn HvWfpFinish(nbl: *mut core::ffi::c_void, finish: u32);
-            }
-            HvWfpFinish(nbl.cast(), finish);
-            return;
+            hv_bugcheck();
         }
         let a = (*context).adapter.cast::<Adapter>();
         ndis_lock(addr_of_mut!((*a).lock));
@@ -380,6 +375,9 @@ pub(super) unsafe extern "C" fn hv_finish(nbl_address: usize, finish: u32) {
         packet::free_packet_context(nbl);
         if send {
             let lso_complete = complete_local_lso(nbl);
+            if !lso_complete {
+                policy::HvInvalidLso((*a).interface_index);
+            }
             (*nbl).__bindgen_anon_2.Status = if finish == FINISH_CANCEL {
                 HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
             } else if !lso_complete {
@@ -518,12 +516,14 @@ unsafe fn classify_chain(
             match nbl {
                 Err(reason) => {
                     match reason {
-                        PacketCreateError::Paused => policy::HvPausedDrop(),
-                        PacketCreateError::Resource => policy::HvResourceDrop(),
+                        PacketCreateError::Paused => policy::HvPausedDrop((*a).interface_index),
+                        PacketCreateError::Resource => policy::HvResourceDrop((*a).interface_index),
                     }
                     if direction == SEND {
                         // Preserve cancellation/pause status even if LSO metadata is malformed.
-                        let _ = complete_local_lso(original);
+                        if !complete_local_lso(original) {
+                            policy::HvInvalidLso((*a).interface_index);
+                        }
                         (*original).__bindgen_anon_2.Status = if cancelled {
                             HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
                         } else if reason == PacketCreateError::Paused {
@@ -618,6 +618,12 @@ pub(super) unsafe extern "C" fn send_complete(
             {
                 hv_bugcheck();
             }
+            let status = (*nbl).__bindgen_anon_2.Status;
+            if status != HV_WDK_NDIS_SUCCESS as NDIS_STATUS
+                && status != HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+            {
+                policy::HvSendFailure((*a).interface_index, status);
+            }
             packet::free_packet_context(nbl);
             api::NdisFSendNetBufferListsComplete((*a).filter, nbl, flags);
             release_active(a, 1);
@@ -671,7 +677,9 @@ pub(super) unsafe extern "C" fn cancel_send(context: NDIS_HANDLE, cancel: PVOID)
             let nbl = cancelled;
             cancelled = packet::next_nbl(nbl);
             packet::set_next_nbl(nbl, null_mut());
-            let _ = complete_local_lso(nbl);
+            if !complete_local_lso(nbl) {
+                policy::HvInvalidLso((*a).interface_index);
+            }
             (*nbl).__bindgen_anon_2.Status = HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS;
             api::NdisFSendNetBufferListsComplete((*a).filter, nbl, send_complete_flags());
         }
@@ -1135,7 +1143,7 @@ pub(super) unsafe extern "C" fn filter_attach(
 ) -> NDIS_STATUS {
     unsafe {
         let mut guid: GUID = zeroed();
-        // The exact armed GUID/LUID allowlist is mandatory, never a name fallback.
+        // Only armed, identity-valid Ethernet miniports may attach.
         if (*p).MiniportMediaType != NdisMedium802_3 || !registry::target_adapter(p, &mut guid) {
             return HV_WDK_NDIS_NOT_SUPPORTED as NDIS_STATUS;
         }

@@ -51,9 +51,7 @@ fn generate_wdk(output: &std::path::Path) {
             "_DEVICE_RESET_TYPE|_ERROR_SEVERITY_VALUE|_NPEM_CONTROL_STANDARD_CONTROL_BIT",
         )
         .allowlist_type(".*")
-        .allowlist_function(
-            "(Ndis|Ke|Ex|Io|Iof|Mm|Zw|Rtl|Ob|Obf|Fwps|Fwpm|Wdmlib|ConvertInterface|DbgPrintEx).*",
-        )
+        .allowlist_function("(Ndis|Ke|Ex|Io|Iof|Mm|Zw|PsCreateSystemThread|PsTerminateSystemThread|Rtl|Ob|Obf|ConvertInterface|DbgPrintEx|GetUnicastIpAddressTable|GetAnycastIpAddressTable|NotifyUnicastIpAddressChange|CancelMibChangeNotify2|FreeMibTable).*")
         .allowlist_var(".*")
         .blocklist_function(".*Interlocked.*");
     builder

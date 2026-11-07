@@ -80,8 +80,6 @@ pub enum Command {
     GetLogs,
     GetBandwidth,
     MemoryStats,
-    // Requests a full asynchronous cache-expiry sweep, never table migration.
-    CleanEnded,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -104,7 +102,7 @@ pub fn validate_commands(mut bytes: &[u8]) -> Result<(), Error> {
 pub fn next_command(bytes: &[u8]) -> Result<(Command, &[u8]), Error> {
     let kind = *bytes.first().ok_or(Error::Malformed)?;
     let size = match kind {
-        0 | 4..=8 => 1,
+        0 | 4..=7 => 1,
         1 => 10,
         _ => return Err(Error::Unsupported),
     };
@@ -121,7 +119,6 @@ pub fn next_command(bytes: &[u8]) -> Result<(Command, &[u8]), Error> {
         5 => Command::GetLogs,
         6 => Command::GetBandwidth,
         7 => Command::MemoryStats,
-        8 => Command::CleanEnded,
         _ => return Err(Error::Unsupported),
     };
     Ok((command, &bytes[size..]))
@@ -625,7 +622,7 @@ mod tests {
         for v in [0, 1, 8, 9, 10, 11, 255] {
             assert!(Verdict::decode(v).is_none());
         }
-        let b = [1, 1, 0, 0, 0, 0, 0, 0, 0, 3, 4, 5, 6, 7, 8];
+        let b = [1, 1, 0, 0, 0, 0, 0, 0, 0, 3, 4, 5, 6, 7];
         assert_eq!(validate_commands(&b), Ok(()));
         assert_eq!(validate_commands(&b[..9]), Err(Error::Malformed));
     }
@@ -634,7 +631,9 @@ mod tests {
         for size in [65536, 65537, 1024 * 1024 + 1] {
             let mut bytes = vec![4; size];
             assert_eq!(validate_commands(&bytes), Ok(()));
-            bytes.push(99);
+            bytes.push(8);
+            assert_eq!(validate_commands(&bytes), Err(Error::Unsupported));
+            *bytes.last_mut().unwrap() = 99;
             assert_eq!(validate_commands(&bytes), Err(Error::Unsupported));
             bytes.pop();
             bytes.push(1);
@@ -647,6 +646,14 @@ mod tests {
             validate_commands(&bytes[..bytes.len() - 1]),
             Err(Error::Malformed)
         );
+    }
+    #[test]
+    fn removed_cleanup_command_is_unsupported_in_all_batch_positions() {
+        assert_eq!(next_command(&[8]), Err(Error::Unsupported));
+        assert_eq!(validate_commands(&[8]), Err(Error::Unsupported));
+        assert_eq!(validate_commands(&[8, 4]), Err(Error::Unsupported));
+        assert_eq!(validate_commands(&[4, 8]), Err(Error::Unsupported));
+        assert_eq!(validate_commands(&[4, 8, 5]), Err(Error::Unsupported));
     }
     #[test]
     fn validate_complete_batch_before_side_effects() {

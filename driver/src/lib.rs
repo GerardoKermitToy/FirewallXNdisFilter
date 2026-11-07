@@ -56,7 +56,6 @@ unsafe extern "C" {
     fn hv_lock() -> usize;
     fn hv_unlock(irql: usize);
     fn hv_publish_state(ready: u32, online: u32, pending: u32, cached: u32);
-    fn hv_request_cache_cleanup();
     fn hv_now() -> u64;
     fn hv_allocate(size: usize) -> *mut u8;
     fn hv_free(data: *mut u8, size: usize);
@@ -761,13 +760,6 @@ pub unsafe extern "C" fn HvWrite(data: *const u8, len: u32) -> i32 {
             Command::GetLogs => {} // Log records are already queued.
             Command::GetBandwidth => report_bandwidth(),
             Command::MemoryStats => with_state(|e| e.memory_stats()),
-            Command::CleanEnded => {
-                reclaim_retired();
-                if with_state(|e| e.cache_candidates() != 0) {
-                    // The shim coalesces explicit requests with periodic work.
-                    unsafe { hv_request_cache_cleanup() };
-                }
-            }
         }
         rest = next;
     }

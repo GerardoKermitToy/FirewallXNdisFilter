@@ -387,10 +387,6 @@ bool Driver::RequestMemoryStats(std::string& error) {
     const uint8_t command = static_cast<uint8_t>(CommandType::PrintMemoryStats);
     return SendCommand(&command, 1, error);
 }
-bool Driver::RequestCleanEndedConnections(std::string& error) {
-    const uint8_t command = static_cast<uint8_t>(CommandType::CleanEndedConnections);
-    return SendCommand(&command, 1, error);
-}
 bool Driver::RequestClearCache(std::string& error) {
     const uint8_t command = static_cast<uint8_t>(CommandType::ClearCache);
     return SendCommand(&command, 1, error);

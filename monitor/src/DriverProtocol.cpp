@@ -176,7 +176,6 @@ bool ValidateCommands(const uint8_t* bytes, size_t length, std::string& error) {
             case CommandType::GetLogs:
             case CommandType::GetBandwidthStats:
             case CommandType::PrintMemoryStats:
-            case CommandType::CleanEndedConnections:
                 command_size = 1;
                 break;
             case CommandType::Verdict: command_size = kVerdictCommandSize; break;

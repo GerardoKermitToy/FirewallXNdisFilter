@@ -42,7 +42,7 @@ public:
     // PermanentAccept hits refresh idle TTL; PermanentBlock/Drop keep fixed TTL.
     // Driver fallback defaults to drop without a controller or on an unanswered 8 s deadline.
     enum class Verdict : uint8_t { Accept = 2, PermanentAccept, Block, PermanentBlock, Drop, PermanentDrop };
-    enum class Command : uint8_t { ClearCache = 4, GetLogs, GetBandwidthStats, PrintMemoryStats, CleanEndedConnections };
+    enum class Command : uint8_t { ClearCache = 4, GetLogs, GetBandwidthStats, PrintMemoryStats };
 
     // Adapter diagnostics use a separate, unframed IOCTL format, not event records.
     static constexpr uint32_t AdapterInfoVersion = 1;
@@ -255,7 +255,8 @@ public:
     }
     DWORD Send(Command command) {
         const auto value = static_cast<uint8_t>(command);
-        if (value < 4 || value > 8) return ERROR_INVALID_PARAMETER;
+        if (value < static_cast<uint8_t>(Command::ClearCache) ||
+            value > static_cast<uint8_t>(Command::PrintMemoryStats)) return ERROR_INVALID_PARAMETER;
         return Write(&value, 1);
     }
 

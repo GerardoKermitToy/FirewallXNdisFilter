@@ -37,7 +37,6 @@ enum class CommandType : uint8_t {
     GetLogs               = 5,
     GetBandwidthStats     = 6,
     PrintMemoryStats      = 7,
-    CleanEndedConnections = 8,
 };
 
 // Values outside 2..7 are retained for source compatibility only. HyperVXNdisFilter
@@ -105,8 +104,7 @@ struct Connection {
 };
 
 // Retained API/wire types. This LWF does not manufacture connection-end
-// events. CleanEndedConnections only sweeps expired cache entries, never
-// fabricates END. Bandwidth counts admitted guest outbound/inbound IP bytes in
+// events. Bandwidth counts admitted guest outbound/inbound IP bytes in
 // tx/rx, with no PID. Each record is one host-interface/protocol/address-family
 // group; its interface_index is the BaseMiniportIfIndex, not a guest interface.
 struct ConnectionEnd {
@@ -245,8 +243,6 @@ public:
     bool RequestLogs(std::string& error);
     bool RequestBandwidthStats(std::string& error);
     bool RequestMemoryStats(std::string& error);
-    // Requests a full asynchronous expiry sweep; it does not migrate tables.
-    bool RequestCleanEndedConnections(std::string& error);
     bool RequestClearCache(std::string& error);
 
     void Cleanup();

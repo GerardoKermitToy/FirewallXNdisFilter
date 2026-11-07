@@ -59,6 +59,7 @@ bool DecodeAdapterInfo(const uint8_t* bytes, size_t length,
                        AdapterSnapshot& out, std::string& error);
 
 bool IsSupportedVerdict(uint8_t verdict) noexcept;
+// Supported command bytes are 0, 1 and 4..7; the former byte 8 is unsupported.
 bool ValidateCommands(const uint8_t* bytes, size_t length, std::string& error);
 bool EncodeVerdict(uint64_t id, Verdict verdict,
                    std::array<uint8_t, kVerdictCommandSize>& out, std::string& error);

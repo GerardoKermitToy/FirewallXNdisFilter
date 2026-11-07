@@ -658,7 +658,7 @@ bool TestCommands() {
         command[9] = value;
         CHECK(!pmkext::wire::ValidateCommands(command.data(), command.size(), error));
     }
-    Bytes batch{0, 4, 5, 6, 7, 8};
+    Bytes batch{0, 4, 5, 6, 7};
     for (const auto kind : {uint8_t{2}, uint8_t{3}}) {
         const size_t size = kind == 2 ? 15 : 39;
         Bytes update(size, 0); update[0] = kind; update.back() = 3;
@@ -669,7 +669,11 @@ bool TestCommands() {
         CHECK(!pmkext::wire::ValidateCommands(update.data(), update.size() - 1, error));
     }
     CHECK(pmkext::wire::ValidateCommands(batch.data(), batch.size(), error));
-    batch.push_back(255); // A valid prefix does not make a malformed batch valid.
+    const uint8_t removed_cleanup = 8;
+    CHECK(!pmkext::wire::ValidateCommands(&removed_cleanup, 1, error));
+    batch.push_back(removed_cleanup); // A valid prefix cannot hide an unsupported command.
+    CHECK(!pmkext::wire::ValidateCommands(batch.data(), batch.size(), error));
+    batch.back() = 255;
     CHECK(!pmkext::wire::ValidateCommands(batch.data(), batch.size(), error));
     CHECK(!pmkext::wire::ValidateCommands(nullptr, 0, error));
     CHECK(!pmkext::wire::ValidateCommands(command.data(), 9, error));

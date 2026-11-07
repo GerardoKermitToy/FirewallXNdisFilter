@@ -2,7 +2,7 @@
 
 HyperVXNdisFilter is an experimental Windows network filter written in Rust, with a C++ monitor and client APIs. It combines an **NDIS Lightweight Filter (LWF)** for Hyper-V management-OS Ethernet adapters associated with HNS **ICS** networks with **WFP IPFORWARD** filtering for routed IPv4 and IPv6 traffic. Default Switch and WSL can use ICS networks; selection is by network type, not name. The filter is not a Hyper-V switch extension.
 
-The NDIS path observes traffic on eligible host vNICs, not necessarily all VM-to-VM traffic. WFP independently covers traffic presented at the IPFORWARD layers, including forwarding through physical or VPN interfaces; it does not cover all host-local or switched traffic. The package and device API version is **0.3.3.0**: use a matching driver and client, as earlier event layouts are incompatible.
+The NDIS path observes traffic on eligible host vNICs, not necessarily all VM-to-VM traffic. WFP independently covers traffic presented at the IPFORWARD layers, including forwarding through physical or VPN interfaces; it does not cover all host-local or switched traffic. The package and device API version is **0.3.3.0**: use a matching driver and client, as earlier event layouts are incompatible. Command byte 8 (`CleanEndedConnections`) is no longer supported; older controllers must stop sending it even though the event/API version is unchanged.
 
 > **Warning:** This is experimental kernel software. By default, with no controller connected, the active driver drops target-interface IP traffic and forwarded IP traffic at WFP IPFORWARD, apart from WFP self-injection exemptions. This can interrupt network access, including Internet sharing. Use a test machine with local recovery access; offline tests and enabled bindings do not prove correct live filtering.
 
@@ -78,6 +78,8 @@ The uninstaller disarms and removes this filter and its identified driver packag
 ## API
 
 The reusable clients are [PortmasterKext.h](monitor/include/PortmasterKext.h) (`pmkext`, with [DriverProtocol.h](monitor/include/DriverProtocol.h) for the codec) and the independent C++20 [HyperVXNdisFilter.hpp](monitor/include/HyperVXNdisFilter.hpp) (`hypervxndisfilter::Client`). The driver-side wire definitions are in [protocol/src/lib.rs](protocol/src/lib.rs); adapter snapshots use [adapter_info.rs](driver/src/adapter_info.rs).
+
+The former `pmkext::Driver::RequestCleanEndedConnections` method and `Client::Command::CleanEndedConnections` value have been removed. Update and rebuild applications that used them; cache expiry cleanup is automatic.
 
 For a complete header-only example, see [callback_client.cpp](monitor/examples/callback_client.cpp). It connects to an existing device, allows connection events, and runs for ten seconds after startup. The header-only client does not install or load the driver; its `Open()` can wait indefinitely for driver startup, as described below.
 
@@ -191,7 +193,6 @@ Construct `Driver(std::wstring service_name = L"HyperVXNdisFilter")`; the argume
 | `bool RequestLogs(std::string& error)` | Sends `GetLogs`; existing log events are already queued for reading. |
 | `bool RequestBandwidthStats(std::string& error)` | Requests asynchronous bandwidth records for active buckets. No active buckets means no bandwidth records. |
 | `bool RequestMemoryStats(std::string& error)` | Requests a diagnostic `LogLine` with policy storage/counter statistics. |
-| `bool RequestCleanEndedConnections(std::string& error)` | Requests a full asynchronous expiry sweep, coalesced with driver-scheduled cleanup. Does not migrate tables, discover socket teardown or emit END events; successful write does not acknowledge sweep completion. |
 | `bool RequestClearCache(std::string& error)` | Invalidates all permanent verdict entries. Does not answer pending NBLs. |
 | `bool RequestShutdown(std::string& error)` | Issues `IOCTL_SHUTDOWN`; does not signal the `Run` stop event or close the handle. |
 | `void Stop()` | Signals `Run` and requests shutdown once. Safe to call from callbacks or another thread while `Run` is active. |
@@ -215,7 +216,7 @@ A typical integration opens the device, checks its version, installs handlers, a
 | `GetVersion(std::array<uint8_t,4>&)` / `GetFilteredDeviceCount(uint32_t&)` | Synchronous IOCTL queries; exact four-byte replies. Outputs are unchanged on failure. |
 | `GetAdapterInfo(AdapterSnapshot&)` | Synchronous variable-size attached-module query with automatic buffer growth, including not-running modules. Owning `Client::AdapterSnapshot` / `Client::AdapterInfo` types have the fields and validity flags documented above. Leaves output unchanged on failure; malformed replies return `ERROR_INVALID_DATA`, allocation failure returns `ERROR_NOT_ENOUGH_MEMORY`. |
 | `SendVerdict(uint64_t id, Verdict)` | Sends the fixed ten-byte verdict; values 2..7 only. No verdict-application acknowledgement. |
-| `Send(Command)` | Single-byte ClearCache=4, GetLogs=5, GetBandwidthStats=6, PrintMemoryStats=7 or CleanEndedConnections=8. No automatic scheduling. |
+| `Send(Command)` | Single-byte ClearCache=4, GetLogs=5, GetBandwidthStats=6 or PrintMemoryStats=7. No automatic statistics requests. |
 | `Shutdown()` | Calls Stop and issues the policy shutdown IOCTL. Does not close, unload or unbind. |
 
 `Callbacks` contains optional function pointers and their shared `context`:
@@ -289,7 +290,7 @@ A permanent decision is a **TTL cache entry for TCP/UDP only**, not lifetime soc
 
 Within each table, the key is the full normalized `local_ip, local_port, remote_ip, remote_port` tuple. Both directions and different VLANs share a decision when the tuples match **within the same interface, protocol, and IP family**. NDIS path/direction, VLAN, module ID, epoch and Ethernet MAC addresses do not distinguish entries. TCP and UDP, different interface indices, and different IP families have separate caches.
 
-Expired entries stop matching immediately. While caches are nonempty, the driver requests a full expiry sweep every 10 seconds. `CleanEndedConnections` requests the same cleanup asynchronously; a successful write does not acknowledge its completion.
+Expired entries stop matching immediately. While caches are nonempty, the driver automatically requests a full expiry sweep every 10 seconds; the monitor does not need to request cleanup.
 
 Pending decisions, event queues, bandwidth storage, and receive-copy data have no fixed item-count or aggregate byte quota. Nonpaged-pool exhaustion can bugcheck the machine. `PrintMemoryStats` reports storage/counter statistics, and traffic diagnostics are collected only while a controller is online and reset on disconnect. Bandwidth counters use saturating 64-bit arithmetic.
 
@@ -380,9 +381,9 @@ Commands are **unframed**, unlike events. One write can concatenate complete com
 | `GetLogs` | 5 | 1 | Compatibility no-op; log records are already queued. |
 | `GetBandwidthStats` | 6 | 1 | Queues bandwidth deltas for active buckets. |
 | `PrintMemoryStats` | 7 | 1 | Queues an Info `LogLine` containing policy storage/counter statistics. |
-| `CleanEndedConnections` | 8 | 1 | Requests a full asynchronous cache-expiry sweep; no migration or END events. |
+| Former `CleanEndedConnections` | 8 | Unsupported | Rejected; expiry cleanup is automatic. |
 
-Single-byte commands contain only their command byte. Request results are read asynchronously from the same event stream; there is no correlation ID or separate acknowledgement. Diagnostic/statistics records need not be queued when no data is available or a size limit is exceeded.
+Single-byte commands contain only their command byte. Command byte 8 is unsupported, including when it follows otherwise valid commands; the entire batch is rejected before any command takes effect. The unchanged device version cannot distinguish drivers that previously accepted it. Request results are read asynchronously from the same event stream; there is no correlation ID or separate acknowledgement. Diagnostic/statistics records need not be queued when no data is available or a size limit is exceeded.
 
 Empty/truncated writes are rejected with `STATUS_INVALID_PARAMETER`; unsupported command/verdict values and unknown IOCTLs use `STATUS_NOT_SUPPORTED`. A second controller is rejected with `STATUS_SHARING_VIOLATION`. Version and filtered-device-count queries with an undersized output buffer use `STATUS_BUFFER_TOO_SMALL`. The filtered-device-count query rejects nonempty input with `STATUS_INVALID_PARAMETER`. The C++ client validates commands locally before writing and reports Windows I/O failures through `error`.
 

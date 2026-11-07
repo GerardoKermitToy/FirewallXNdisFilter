@@ -310,8 +310,7 @@ unsafe fn open_classification_session() {
     }
 }
 #[cfg(not(test))]
-#[unsafe(no_mangle)]
-extern "C" fn hv_request_cache_cleanup() {
+fn request_cache_cleanup() {
     unsafe {
         if is_stopping() || CACHE_WORK_ITEM.is_null() {
             return;
@@ -404,7 +403,7 @@ unsafe extern "C" fn pending_dpc(_: *mut KDPC, _: PVOID, _: PVOID, _: PVOID) {
 }
 #[cfg(not(test))]
 unsafe extern "C" fn cache_dpc(_: *mut KDPC, _: PVOID, _: PVOID, _: PVOID) {
-    hv_request_cache_cleanup();
+    request_cache_cleanup();
 }
 
 #[cfg(test)]

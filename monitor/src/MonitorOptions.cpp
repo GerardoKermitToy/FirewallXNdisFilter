@@ -265,7 +265,7 @@ void PrintUsage(FILE* out) {
         "  Bandwidth records group one host interface/protocol/address family; index is NDIS base or IPFORWARD source.\n"
         "  NDIS tx/rx are guest out/in; IPFORWARD counts source-relative TX bytes; no PID.\n"
         "  Without a controller or after it disconnects, IP traffic is dropped by default.\n"
-        "  CleanEndedConnections sweeps TTLs; no END is fabricated on expiry/timeout.\n"
+        "  The driver cleans expired cache entries automatically; no END events are fabricated.\n"
         "  UpdateV4/UpdateV6 commands and redirect verdicts are unsupported.\n"
         "  Block/drop for all events can cut host-vNIC traffic and remote access.\n"
         "  Positional .sys paths and PID-suspension options are rejected.\n\n"

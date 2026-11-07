@@ -1193,6 +1193,11 @@ bool TestCallbacksAndLargeRead() {
         CHECK(testio::state.written == expected);
         CHECK(client.Send(Client::Command::GetBandwidthStats) == ERROR_SUCCESS);
         CHECK(testio::state.written.back() == 6);
+        CHECK(client.Send(Client::Command::PrintMemoryStats) == ERROR_SUCCESS);
+        CHECK(testio::state.written.back() == 7);
+        const auto written_before = testio::state.written;
+        CHECK(client.Send(static_cast<Client::Command>(8)) == ERROR_INVALID_PARAMETER);
+        CHECK(testio::state.written == written_before);
         client.Close();
     }
     return true;

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cwchar>
 #include <functional>
 #include <stdexcept>
 #include <utility>
@@ -35,6 +36,18 @@ const GUID foreign_guid = Guid(L"{00000001-0002-0003-0405-060708090A0B}");
 const GUID wsl_guid = Guid(L"{00000011-0002-0003-0405-060708090A0B}");
 const GUID wsl_switch = Guid(L"{00000022-0002-0003-0405-060708090A0B}");
 
+HRESULT hns_lookup_status = S_OK, hns_create_status = S_OK;
+unsigned hns_create_calls = 0;
+HRESULT WINAPI FakeHnsLookup(LPCOLESTR name, LPCLSID clsid) {
+    if (!name || std::wcscmp(name, L"hns.1") != 0 || !clsid) return E_INVALIDARG;
+    *clsid = GUID_NULL;
+    return hns_lookup_status;
+}
+HRESULT WINAPI FakeHnsCreate(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*) {
+    ++hns_create_calls;
+    return hns_create_status;
+}
+
 Adapter Target() { return {target_guid, 1689399750295552ull, L"Renamed host vNIC", true, false, 6}; }
 Adapter WslTarget() { return {wsl_guid, 0x1122334455667788ull, L"Renamed WSL host vNIC", true, false, 6}; }
 
@@ -63,6 +76,8 @@ public:
     bool service = false, component = false, config = false, allowed = false, recovery = false;
     bool consent = true, foreign_enabled = false, target_enabled_on_install = false;
     bool change_luid_after_install = false, change_target_after_confirm = false;
+    bool include_target = true, add_target_after_confirm = false, add_target_after_install = false;
+    bool use_fake_hns = false;
     bool change_wsl_after_confirm = false, change_wsl_luid_after_install = false, skip_wsl_enable = false;
     bool enable_has_effect = true, disable_has_effect = true, leave_service = false;
     Change install_result = Change::Complete, remove_result = Change::Complete, enable_result = Change::Complete, disable_result = Change::Complete;
@@ -77,12 +92,14 @@ public:
     void RequireSupportedOS() override { Step("os"); }
     void RequireMonitorStopped() override { Step("monitor"); }
     Targets CurrentTargets() const {
-        Targets result{target};
+        Targets result;
+        if (include_target) result.push_back(target);
         result.insert(result.end(), extra_targets.begin(), extra_targets.end());
         return result;
     }
     Targets ResolveTargets() override {
         Step("resolve");
+        if (use_fake_hns) return SelectTargets({}, {}, {}, ReadHnsNetworks(FakeHnsLookup, FakeHnsCreate));
         return CurrentTargets();
     }
     bool HasService() override { Step("service"); return service; }
@@ -95,6 +112,7 @@ public:
     bool Confirm(const std::wstring&) override {
         Step("confirm");
         if (change_target_after_confirm) target.guid = foreign_guid;
+        if (add_target_after_confirm) include_target = true;
         if (change_wsl_after_confirm) extra_targets.front().guid = foreign_guid;
         if (appear_after_confirm) service = component = true;
         if (package_after_confirmation) packages.push_back(L"oem999.inf");
@@ -121,6 +139,7 @@ public:
         bindings = {{target.guid, target_enabled_on_install}, {foreign_guid, foreign_enabled}};
         for (const auto& adapter : extra_targets) bindings.push_back({adapter.guid, target_enabled_on_install});
         if (change_luid_after_install) ++target.luid;
+        if (add_target_after_install) include_target = true;
         if (change_wsl_luid_after_install) ++extra_targets.front().luid;
         Step("install");
         return install_result;
@@ -240,8 +259,8 @@ int main() {
             Throws([&] { SelectFixtureTarget({}, {port}, {target}); }, L"missing or ambiguous");
             Throws([&] { SelectFixtureTarget({kDefaultSwitchId, kDefaultSwitchId}, {port}, {target}); }, L"missing or ambiguous");
             Throws([&] { SelectFixtureTarget({kDefaultSwitchId}, {port, port}, {target}); }, L"ambiguous");
-            Throws([&] { SelectFixtureTarget({kDefaultSwitchId}, {}, {target}); }, L"management-OS");
-            Throws([&] { SelectFixtureTarget({kDefaultSwitchId}, {{port.device_id, {foreign_guid}}}, {target}); }, L"management-OS");
+            Require(SelectTargets({kDefaultSwitchId}, {}, {target}, {{L"ICS", kDefaultSwitchId, kDefaultSwitchId}}).empty());
+            Require(SelectTargets({kDefaultSwitchId}, {{port.device_id, {foreign_guid}}}, {target}, {{L"ICS", kDefaultSwitchId, kDefaultSwitchId}}).empty());
             Throws([&] { SelectFixtureTarget({kDefaultSwitchId}, {{port.device_id, {kDefaultSwitchId, foreign_guid}}}, {target}); }, L"ambiguous");
             Throws([&] { SelectFixtureTarget({kDefaultSwitchId}, {port}, {}); }, L"not found");
             Throws([&] { SelectFixtureTarget({kDefaultSwitchId}, {port}, {target, target}); }, L"ambiguous");
@@ -273,6 +292,26 @@ int main() {
             Throws([&] { ValidateBindings({{foreign_guid, false}}, {target}, false); }, L"No HyperVXNdisFilter binding");
             Throws([&] { ValidateBindings({{GUID_NULL, false}}, {target}, false); }, L"ambiguous");
         }},
+        {"unregistered HNS COM API produces an empty safe target set", [] {
+            for (HRESULT status : {CO_E_CLASSSTRING, REGDB_E_CLASSNOTREG}) {
+                hns_lookup_status = status; hns_create_calls = 0;
+                Require(ReadHnsNetworks(FakeHnsLookup, FakeHnsCreate).empty());
+                Require(hns_create_calls == 0);
+                hns_lookup_status = S_OK; hns_create_status = status;
+                Require(ReadHnsNetworks(FakeHnsLookup, FakeHnsCreate).empty());
+                Require(hns_create_calls == 1);
+            }
+        }},
+        {"other HNS COM errors remain failures", [] {
+            for (HRESULT status : {E_ACCESSDENIED, E_OUTOFMEMORY, E_FAIL}) {
+                hns_lookup_status = status; hns_create_calls = 0;
+                Throws([&] { ReadHnsNetworks(FakeHnsLookup, FakeHnsCreate); }, L"Find native HNS API");
+                Require(hns_create_calls == 0);
+                hns_lookup_status = S_OK; hns_create_status = status;
+                Throws([&] { ReadHnsNetworks(FakeHnsLookup, FakeHnsCreate); }, L"Connect to native HNS API");
+                Require(hns_create_calls == 1);
+            }
+        }},
         {"ICS JSON selection depends on type and switch GUID, never names", [] {
             const auto networks = ParseHnsNetworks(LR"json({"Success":true,"Output":[{"Name":"WSL (Hyper-V firewall)","Type":"NAT"},{"Name":"arbitrary","Type":"ICS","ID":"00000001-0002-0003-0405-060708090A0B","SwitchGuid":"00000022-0002-0003-0405-060708090A0B"},{"Type":"ICS","ID":"10000000-0002-0003-0405-060708090A0B","SwitchGuid":"10000000-0002-0003-0405-060708090A0B"}]})json");
             Require(networks.size() == 2);
@@ -300,8 +339,8 @@ int main() {
             const HnsNetwork network{L"ICS", foreign_guid, wsl_switch};
             const auto selected = SelectTargets({wsl_switch}, {port}, {Target()}, {network});
             Require(SameTargets(selected, {Target()}));
-            Throws([&] { SelectTargets({wsl_switch}, {port}, {Target()}, {}); }, L"No HNS ICS");
-            Throws([&] { SelectTargets({wsl_switch}, {port}, {Target()}, {{L"NAT", foreign_guid, wsl_switch}}); }, L"No HNS ICS");
+            Require(SelectTargets({wsl_switch}, {port}, {Target()}, {}).empty());
+            Require(SelectTargets({wsl_switch}, {port}, {Target()}, {{L"NAT", foreign_guid, wsl_switch}}).empty());
         }},
         {"every management-OS Ethernet vNIC on an ICS switch is selected", [] {
             const HnsNetwork network{L"ICS", wsl_switch, wsl_switch};
@@ -311,7 +350,7 @@ int main() {
             Require(SameTargets(targets, {Target(), WslTarget()}));
             Require(SameTargets(targets, SelectTargets({wsl_switch}, {second, first}, {WslTarget(), Target()}, {network})));
             Throws([&] { SelectTargets({}, {first}, {Target()}, {network}); }, L"missing or ambiguous");
-            Throws([&] { SelectTargets({wsl_switch}, {}, {Target()}, {network}); }, L"management-OS");
+            Require(SelectTargets({wsl_switch}, {}, {Target()}, {network}).empty());
             auto spoof = Target(); spoof.guid = foreign_guid; spoof.name = L"vEthernet (Default Switch)";
             Throws([&] { SelectTargets({wsl_switch}, {first}, {spoof}, {network}); }, L"not found");
             Throws([&] { SelectTargets({wsl_switch}, {first, first}, {Target()}, {network}); }, L"ambiguous");
@@ -343,12 +382,62 @@ int main() {
         }},
         {"target allowlist rejects duplicate identities but has no two-adapter quota", [] {
             ValidateTargets({Target(), WslTarget(), {wsl_switch, 777, L"third", true, false, 6}});
-            Throws([&] { ValidateTargets({}); }, L"count");
+            ValidateTargets({});
             Throws([&] { ValidateTargets({Target(), WslTarget(), WslTarget()}); }, L"ambiguous");
             auto wsl = WslTarget(); wsl.guid = target_guid;
             Throws([&] { ValidateTargets({Target(), wsl}); }, L"ambiguous");
             wsl = WslTarget(); wsl.luid = Target().luid;
             Throws([&] { ValidateTargets({Target(), wsl}); }, L"ambiguous");
+        }},
+        {"empty target set installs, resumes and never enables unrelated bindings", [] {
+            FakeSystem system; system.include_target = false;
+            Require(Execute(Install(), system) == 0);
+            Require(system.component && system.service && system.config && system.allowed && system.recovery);
+            Require(system.configured.empty() && system.bindings.size() == 2);
+            Require(std::none_of(system.bindings.begin(), system.bindings.end(), [](const Binding& binding) { return binding.enabled; }));
+            Require(system.At("write-disarmed") < system.At("install") && system.At("install") < system.At("arm"));
+            Require(std::any_of(system.messages.begin(), system.messages.end(), [](const auto& text) { return text.find(L"without NDIS bindings") != std::wstring::npos; }));
+            Require(Execute(Enable(), system) == 0);
+            Require(system.configured.empty() && !system.bindings[0].enabled && !system.bindings[1].enabled);
+            system.include_target = true;
+            Throws([&] { Execute(Enable(), system); }, L"stale configuration");
+            Require(!system.bindings[0].enabled && !system.bindings[1].enabled);
+        }},
+        {"unregistered HNS class still installs the component without NDIS bindings", [] {
+            hns_lookup_status = CO_E_CLASSSTRING; hns_create_calls = 0;
+            FakeSystem system; system.include_target = false; system.use_fake_hns = true;
+            Require(Execute(Install(), system) == 0);
+            Require(system.Called("install") && system.component && system.service && system.config);
+            Require(system.configured.empty() && hns_create_calls == 0);
+            Require(std::none_of(system.bindings.begin(), system.bindings.end(), [](const Binding& binding) { return binding.enabled; }));
+            FakeSystem existing; existing.Installed(); existing.use_fake_hns = true;
+            Throws([&] { Execute(Enable(), existing); }, L"stale configuration");
+            existing.RequireNoMutation();
+        }},
+        {"new target during empty-set install aborts without retargeting", [] {
+            for (const bool during_install : {false, true}) {
+                FakeSystem system; system.include_target = false;
+                system.add_target_after_confirm = !during_install;
+                system.add_target_after_install = during_install;
+                Throws([&] { Execute(Install(), system); }, L"changed");
+                Require(!system.Called("arm") && !system.allowed);
+                Require(system.Called("remove") == during_install);
+            }
+        }},
+        {"empty target set rejects every enabled binding and rolls back", [] {
+            FakeSystem system; system.include_target = false; system.foreign_enabled = true;
+            Throws([&] { Execute(Install(), system); }, L"unexpectedly enabled");
+            Require(system.Called("remove") && !system.Called("arm") && !system.Called("enable"));
+            ValidateBindings({{target_guid, false}, {foreign_guid, false}}, {}, false, true);
+            Throws([&] { ValidateBindings({{target_guid, true}}, {}, false); }, L"unexpectedly enabled");
+        }},
+        {"empty target install reboot retains disarmed configuration for resume", [] {
+            FakeSystem system; system.include_target = false; system.install_result = Change::RebootRequired;
+            Require(Execute(Install(), system) == kRebootRequired);
+            Require(system.configured.empty() && system.component && !system.allowed && !system.recovery);
+            system.install_result = Change::Complete;
+            Require(Execute(Enable(), system) == 0);
+            Require(system.allowed && system.recovery && system.configured.empty());
         }},
         {"setup enables more than two exact targets without editing a foreign path", [] {
             FakeSystem system;

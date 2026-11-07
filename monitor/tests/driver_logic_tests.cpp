@@ -83,6 +83,10 @@ bool TestTargetAdmission() {
     auto data = Targets(3);
     std::array<uint8_t,16> guid{};
     std::copy_n(data.data() + 4, 16, guid.data());
+    const auto empty = Targets(0);
+    CHECK(empty.size() == 4 && HvTargetsValid(empty.data(), 4));
+    CHECK(!HvTargetsMatch(empty.data(), 4, guid.data(), 0x1000));
+    CHECK(!HvTargetAdapterMatch(empty.data(), 4, guid.data(), 0x1000));
     CHECK(!HvTargetAdapterMatch(nullptr, 76, guid.data(), 0x1000));
     CHECK(!HvTargetAdapterMatch(data.data(), 76, nullptr, 0x1000));
     CHECK(!HvTargetAdapterMatch(data.data(), 76, guid.data(), 0));

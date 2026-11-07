@@ -6,7 +6,7 @@
 #define HV_TARGET_ENTRY_SIZE 24u
 // Counts are bounded only by the native u32 registry-value byte length.
 static inline int HvTargetsSize(unsigned int count, unsigned int* size) {
-    if (!count || count > (~0u - 4u) / HV_TARGET_ENTRY_SIZE) return 0;
+    if (count > (~0u - 4u) / HV_TARGET_ENTRY_SIZE) return 0;
     *size = 4u + count * HV_TARGET_ENTRY_SIZE;
     return 1;
 }

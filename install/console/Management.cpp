@@ -201,13 +201,11 @@ void ValidateTargets(const Targets& targets) {
 Targets SelectTargets(const std::vector<GUID>& switches, const std::vector<HostPort>& ports,
                       const std::vector<Adapter>& adapters, const std::vector<HnsNetwork>& networks) {
     const auto selected = SelectIcsSwitches(networks);
-    if (selected.empty()) throw Error{L"No HNS ICS networks were found. No adapter will be guessed."};
     Targets targets;
     for (const auto& switch_id : selected) {
         if (std::count(switches.begin(), switches.end(), switch_id) != 1) {
             throw Error{L"An HNS ICS Hyper-V switch is missing or ambiguous. No name-based fallback is allowed."};
         }
-        bool found = false;
         for (const auto& port : ports) {
             if (std::find(port.switches.begin(), port.switches.end(), switch_id) == port.switches.end()) continue;
             if (port.switches.size() != 1) throw Error{L"An HNS ICS management-OS port has ambiguous switch associations."};
@@ -223,9 +221,7 @@ Targets SelectTargets(const std::vector<GUID>& switches, const std::vector<HostP
                 throw Error{L"The target is not an Ethernet host vNIC with a valid NET_LUID."};
             }
             targets.push_back(*target);
-            found = true;
         }
-        if (!found) throw Error{L"Expected a management-OS vNIC connected to each HNS ICS switch."};
     }
     ValidateTargets(targets);
     // Match PowerShell's canonical GUID text ordering, independent of HNS/WMI enumeration order.
@@ -287,6 +283,9 @@ int Execute(const Options& options, System& system) {
             if (!system.HasComponent()) throw Error{L"HyperVXNdisFilter is not installed. Run Install.exe without --enable first."};
             system.VerifyConfiguration(targets);
             ValidateBindings(system.ReadBindings(), targets, false);
+        }
+        if (targets.empty()) {
+            system.Print(L"No HNS ICS host vNIC targets were discovered. Setup will continue without NDIS bindings.\n");
         }
         for (const auto& target : targets) {
             system.Print(L"Exact target: " + target.name + L", NET_LUID=" + std::to_wstring(target.luid) + L"\n");

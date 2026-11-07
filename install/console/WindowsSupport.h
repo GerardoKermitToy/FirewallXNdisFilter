@@ -73,7 +73,9 @@ struct CoString {
 
 Targets ResolveWindowsTargets();
 std::vector<HnsNetwork> ParseHnsNetworks(const std::wstring& json);
-std::vector<HnsNetwork> ReadHnsNetworks();
+std::vector<HnsNetwork> ReadHnsNetworks(
+    decltype(&CLSIDFromProgIDEx) lookup = CLSIDFromProgIDEx,
+    decltype(&CoCreateInstance) create = CoCreateInstance);
 void ValidateInfFile(const std::filesystem::path& inf);
 void ValidateRemovalInfFile(const std::filesystem::path& inf);
 bool IsPublishedInfName(const std::wstring& name);

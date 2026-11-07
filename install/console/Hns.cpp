@@ -25,6 +25,13 @@ struct Arguments {
     VARIANT values[3]{};
     ~Arguments() { for (auto& value : values) VariantClear(&value); }
 };
+
+bool HnsApiUnregistered(HRESULT status) {
+    if (status != CO_E_CLASSSTRING && status != REGDB_E_CLASSNOTREG) return false;
+    WriteText(L"WARNING: the native HNS API is not registered; ICS adapters cannot be discovered. "
+              L"Continuing with an empty NDIS target allowlist.\n");
+    return true;
+}
 } // namespace
 
 std::vector<HnsNetwork> ParseHnsNetworks(const std::wstring& json) {
@@ -64,14 +71,19 @@ std::vector<HnsNetwork> ParseHnsNetworks(const std::wstring& json) {
     return networks;
 }
 
-std::vector<HnsNetwork> ReadHnsNetworks() {
+std::vector<HnsNetwork> ReadHnsNetworks(decltype(&CLSIDFromProgIDEx) lookup,
+                                        decltype(&CoCreateInstance) create) {
     // Same native read-only endpoint used by Windows' Get-HnsNetwork. No child
     // process, network creation, WSL startup, or HNS configuration mutation.
     CLSID clsid{};
-    Check(CLSIDFromProgIDEx(L"hns.1", &clsid), L"Find native HNS API");
+    const HRESULT lookup_status = lookup(L"hns.1", &clsid);
+    if (HnsApiUnregistered(lookup_status)) return {};
+    Check(lookup_status, L"Find native HNS API");
     ComPtr<IDispatch> hns;
-    Check(CoCreateInstance(clsid, nullptr, CLSCTX_INPROC_SERVER | CLSCTX_LOCAL_SERVER,
-                           IID_PPV_ARGS(&hns)), L"Connect to native HNS API");
+    const HRESULT create_status = create(clsid, nullptr, CLSCTX_INPROC_SERVER | CLSCTX_LOCAL_SERVER,
+                                         IID_PPV_ARGS(&hns));
+    if (HnsApiUnregistered(create_status)) return {};
+    Check(create_status, L"Connect to native HNS API");
     LPOLESTR method = const_cast<LPOLESTR>(L"Request2");
     DISPID id = 0;
     Check(hns->GetIDsOfNames(IID_NULL, &method, 1, LOCALE_INVARIANT, &id), L"Find HNS read method");

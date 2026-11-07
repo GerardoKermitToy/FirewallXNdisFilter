@@ -10,7 +10,7 @@ The NDIS path observes traffic on eligible host vNICs, not necessarily all VM-to
 
 Requirements:
 
-- Windows x64 build **25341 or newer**, Hyper-V and at least one HNS ICS network for NDIS installation.
+- Windows x64 build **25341 or newer**. Hyper-V management-OS Ethernet vNICs associated with HNS ICS networks are required for NDIS traffic filtering, but not to install the package.
 - Visual Studio C++ x64 tools, CMake and Ninja; Rust 1.91+ with the `x86_64-pc-windows-msvc` target.
 - Windows SDK and WDK **10.0.28000.0**, and LLVM with libclang. Set `LIBCLANG_PATH` if libclang is not in `%ProgramFiles%\LLVM\bin`.
 - A signing certificate and root certificate. The [windows_kext_mod certificate instructions](https://github.com/GerardoKermitToy/windows_kext_mod#1-create-the-local-certificates) explain how to create the local keys used in the example below. Keep private keys out of source control.
@@ -33,7 +33,7 @@ Use an elevated Administrator/SYSTEM console, stop any monitor, and keep local r
 ./dist/Install.exe
 ```
 
-The installer uses the package beside the EXE and selects all host vNICs associated with HNS networks of type `ICS`. It does not start WSL or create networks. If discovery is empty or ambiguous, installation fails rather than selecting a fallback. Use `--what-if` for read-only preflight or `--yes` to skip confirmation. Adding/removing an ICS target, changing its network type, or recreating an adapter requires uninstalling and reinstalling; the stored target set is not expanded automatically. Conflicting previously staged packages can also cause installation to fail; use the matching uninstaller rather than overwriting package files.
+The installer uses the package beside the EXE and selects all host vNICs associated with HNS networks of type `ICS`. It does not start WSL or create networks. If no eligible adapters are found, installation continues with an empty allowlist and no NDIS bindings; no fallback adapter is selected. If the native HNS COM API is not registered, setup warns that discovery is unavailable and likewise uses an empty allowlist, without assuming whether eligible adapters exist. Malformed or ambiguous discovery and other discovery failures still stop installation. Use `--what-if` for read-only preflight or `--yes` to skip confirmation. Adding/removing an ICS target, changing its network type, or recreating an adapter requires uninstalling and reinstalling; the stored target set is not expanded automatically, including when initially empty. Conflicting previously staged packages can also cause installation to fail; use the matching uninstaller rather than overwriting package files.
 
 If installation returns **3010**, reboot and then resume using the existing target configuration:
 

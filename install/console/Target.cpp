@@ -106,6 +106,9 @@ private:
 
 Targets ResolveWindowsTargets() {
     const auto networks = ReadHnsNetworks();
+    // An empty ICS inventory, including an unregistered HNS API, needs no
+    // Hyper-V WMI namespace. Other HNS errors and invalid identities fail closed.
+    if (SelectIcsSwitches(networks).empty()) return {};
     Wmi hyperv(L"ROOT\\virtualization\\v2");
     const auto switches = hyperv.Query(L"SELECT Name FROM Msvm_VirtualEthernetSwitch");
     std::vector<GUID> identities;

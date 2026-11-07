@@ -91,11 +91,11 @@ Test-Case 'duplicate management vNIC identity is rejected' {
 }
 Test-Case 'guest vNIC cannot be selected' {
     $script:vnics[0].IsManagementOs = $false
-    Assert-Throws { Resolve-HyperVXNdisFilterAdapters } 'Expected a management-OS vNIC'
+    Assert-True (@(Resolve-HyperVXNdisFilterAdapters).Count -eq 0)
 }
 Test-Case 'unrelated switch management vNIC cannot be selected' {
     $script:vnics[0].SwitchId = [guid]::NewGuid()
-    Assert-Throws { Resolve-HyperVXNdisFilterAdapters } 'Expected a management-OS vNIC'
+    Assert-True (@(Resolve-HyperVXNdisFilterAdapters).Count -eq 0)
 }
 Test-Case 'invalid management device GUID is rejected' {
     $script:vnics[0].DeviceId = 'not-a-guid'
@@ -210,11 +210,23 @@ Test-Case 'network and switch names never authorize or exclude adapters' {
     Assert-True (@(Resolve-HyperVXNdisFilterAdapters).Count -eq 1)
     Assert-True ((Resolve-HyperVXNdisFilterAdapters).Name -eq 'A renamed WSL vNIC')
 }
-Test-Case 'empty or non-ICS HNS inventory never falls back to Default Switch' {
+Test-Case 'empty or non-ICS HNS inventory returns no targets and never falls back' {
     $script:networks[0].Type = 'NAT'
-    Assert-Throws { Resolve-HyperVXNdisFilterAdapters } 'No HNS ICS'
+    Assert-True (@(Resolve-HyperVXNdisFilterAdapters).Count -eq 0)
     $script:networks = @()
-    Assert-Throws { Resolve-HyperVXNdisFilterAdapters } 'No HNS ICS'
+    Assert-True (@(Resolve-HyperVXNdisFilterAdapters).Count -eq 0)
+}
+Test-Case 'empty target set is stored, checked, and rejects foreign enabled paths' {
+    $script:networks = @()
+    $targets = @(Resolve-HyperVXNdisFilterAdapters)
+    Set-HyperVXNdisFilterTargetConfiguration -Adapters $targets
+    Assert-True ($script:config.TargetAdapters.Length -eq 4 -and [BitConverter]::ToUInt32($script:config.TargetAdapters, 0) -eq 0)
+    Assert-HyperVXNdisFilterTargetConfiguration -Adapters $targets
+    Assert-True (@(Assert-HyperVXNdisFilterBindingScope -Adapters $targets).Count -eq 0)
+    $script:bindings[0].Enabled = $true
+    Assert-Throws { Assert-HyperVXNdisFilterBindingScope -Adapters $targets } 'unexpectedly enabled binding'
+    $script:networks = @([pscustomobject]@{ Type = 'ICS'; ID = $script:fixtureSwitchId; SwitchGuid = $script:fixtureSwitchId })
+    Assert-Throws { Assert-HyperVXNdisFilterTargetConfiguration -Adapters @(Resolve-HyperVXNdisFilterAdapters) } 'does not match'
 }
 Test-Case 'all HNS ICS network IDs must be nonzero and unique' {
     Add-WslFixture

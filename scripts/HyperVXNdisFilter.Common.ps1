@@ -21,7 +21,7 @@ function Resolve-HyperVXNdisFilterAdapters {
         }
         [void]$switchIds.Add($switchId)
     }
-    if (!$switchIds.Count) { throw 'No HNS ICS networks were found. No adapter will be guessed.' }
+    if (!$switchIds.Count) { return }
     $switches = @(Get-VMSwitch -ErrorAction Stop)
     $vnics = @(Get-VMNetworkAdapter -ManagementOS -ErrorAction Stop)
     $inventory = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop)
@@ -31,7 +31,6 @@ function Resolve-HyperVXNdisFilterAdapters {
             throw 'An HNS ICS Hyper-V switch is missing or ambiguous. No alternate adapter will be selected.'
         }
         $ports = @($vnics | Where-Object { $_.IsManagementOs -and $_.SwitchId -eq $id })
-        if (!$ports.Count) { throw 'Expected a management-OS vNIC on each HNS ICS switch. No binding was changed.' }
         foreach ($port in $ports) {
             $guid = [guid]::Empty
             if (![guid]::TryParse([string]$port.DeviceId, [ref]$guid) -or $guid -eq [guid]::Empty) {
@@ -55,7 +54,7 @@ function ConvertTo-HyperVXNdisFilterTargets {
     param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Adapters)
 
     $size = 4L + 24L * $Adapters.Count
-    if (!$Adapters.Count -or $size -gt [uint32]::MaxValue) { throw 'Invalid target adapter count or registry byte-length overflow.' }
+    if ($size -gt [uint32]::MaxValue) { throw 'Target adapter registry byte-length overflow.' }
     $guids = [System.Collections.Generic.HashSet[guid]]::new()
     $luids = [System.Collections.Generic.HashSet[uint64]]::new()
     foreach ($adapter in $Adapters) {
@@ -81,7 +80,7 @@ function ConvertFrom-HyperVXNdisFilterTargets {
     if ($Bytes.Length -lt 4) { throw 'Invalid target configuration length.' }
     $count = [BitConverter]::ToUInt32($Bytes, 0)
     $size = 4L + 24L * $count
-    if (!$count -or $size -gt [uint32]::MaxValue -or $size -ne $Bytes.LongLength) { throw 'Invalid target configuration length.' }
+    if ($size -gt [uint32]::MaxValue -or $size -ne $Bytes.LongLength) { throw 'Invalid target configuration length.' }
     $targets = [System.Collections.Generic.List[object]]::new()
     for ($i = 0; $i -lt $count; ++$i) {
         $guidBytes = [byte[]]::new(16)
@@ -101,7 +100,7 @@ function Get-HyperVXNdisFilterBindings {
 
 function Assert-HyperVXNdisFilterBindingScope {
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][object[]]$Adapters, [switch]$AllDisabled)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Adapters, [switch]$AllDisabled)
 
     [void](ConvertTo-HyperVXNdisFilterTargets -Adapters $Adapters)
     $names = @($Adapters | ForEach-Object { $_.Name })
@@ -120,7 +119,7 @@ function Assert-HyperVXNdisFilterBindingScope {
 
 function Assert-HyperVXNdisFilterTargetConfiguration {
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][object[]]$Adapters)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Adapters)
 
     $expected = ConvertTo-HyperVXNdisFilterTargets -Adapters $Adapters
     $config = Get-ItemProperty -LiteralPath $script:HyperVXNdisFilterConfigPath -ErrorAction Stop
@@ -138,7 +137,7 @@ function Assert-HyperVXNdisFilterTargetConfiguration {
 
 function Set-HyperVXNdisFilterTargetConfiguration {
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][object[]]$Adapters)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Adapters)
 
     $bytes = ConvertTo-HyperVXNdisFilterTargets -Adapters $Adapters
     # Called only for a fresh installation, before NetCfg can load either binary.

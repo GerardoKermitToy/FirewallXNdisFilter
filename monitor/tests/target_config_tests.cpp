@@ -75,7 +75,7 @@ int main() {
     // Pure shared-codec tests and fake registry callbacks only. Never open a
     // production registry key, NETIO adapter, driver device or readiness event.
     unsigned size = 77;
-    CHECK(!HvTargetsSize(0, &size) && size == 77);
+    CHECK(HvTargetsSize(0, &size) && size == 4);
     CHECK(HvTargetsSize(1, &size) && size == 28);
     CHECK(HvTargetsSize(3, &size) && size == 76);
     const unsigned max_count = (~0u - 4u) / HV_TARGET_ENTRY_SIZE;
@@ -84,6 +84,10 @@ int main() {
     CHECK(!HvTargetsSize(max_count + 1, &size) && size == unchanged);
     CHECK(!HvTargetsSize(~0u, &size) && size == unchanged);
 
+    const auto empty = MakeConfig(0);
+    const GUID candidate{1, 0, 0, {}};
+    CHECK(empty.data.size() == 4 && HvTargetsValid(empty.data.data(), 4));
+    CHECK(!empty.Matches(candidate, 0x1000));
     for (const unsigned count : {1u, 2u, 3u, 129u, 3000u}) {
         const auto config = MakeConfig(count);
         CHECK(HvTargetsValid(config.data.data(), static_cast<unsigned>(config.data.size())));
@@ -124,6 +128,10 @@ int main() {
     TargetConfig output = MakeConfig(1);
     CHECK(ReadTargetConfig(output, true, ReadFake) == ERROR_SUCCESS);
     CHECK(output.data == registry.bytes && registry.probes == 1 && registry.reads == 1);
+    registry = {};
+    registry.bytes = empty.data;
+    CHECK(ReadTargetConfig(output, true, ReadFake) == ERROR_SUCCESS);
+    CHECK(output.data == empty.data && !output.Matches(candidate, 0x1000));
     registry = {};
     registry.bytes = MakeConfig(3000).data;
     CHECK(ReadTargetConfig(output, true, ReadFake) == ERROR_SUCCESS && output.data.size() > 65536);

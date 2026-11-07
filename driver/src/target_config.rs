@@ -19,7 +19,7 @@ fn matches(data: &[u8], guid: &[u8], luid: u64) -> bool {
     else {
         return false;
     };
-    if count == 0 || size as usize != data.len() {
+    if size as usize != data.len() {
         return false;
     }
     let entries = &data[4..];

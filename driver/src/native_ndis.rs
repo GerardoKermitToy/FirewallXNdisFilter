@@ -221,6 +221,12 @@ unsafe fn end_io(a: *mut Adapter, session: bool) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PacketCreateError {
+    Paused,
+    Resource,
+}
+
 unsafe fn create_ndis_packet(
     a: *mut Adapter,
     original: PNET_BUFFER_LIST,
@@ -228,12 +234,12 @@ unsafe fn create_ndis_packet(
     flags: u32,
     direction: u32,
     resources: bool,
-) -> PNET_BUFFER_LIST {
+) -> Result<PNET_BUFFER_LIST, PacketCreateError> {
     unsafe {
         ndis_lock(addr_of_mut!((*a).lock));
         if (*a).running == 0 {
             ndis_unlock(addr_of_mut!((*a).lock));
-            return null_mut();
+            return Err(PacketCreateError::Paused);
         }
         retain_active_locked(a);
         ndis_unlock(addr_of_mut!((*a).lock));
@@ -250,7 +256,7 @@ unsafe fn create_ndis_packet(
         };
         if unlikely(nbl.is_null()) {
             release_active(a, 1);
-            return null_mut();
+            return Err(PacketCreateError::Resource);
         }
         let context = packet::allocate_packet_context(nbl);
         (*context).adapter = a.cast();
@@ -259,7 +265,7 @@ unsafe fn create_ndis_packet(
         (*context).direction = direction;
         (*context).owner = packet::OWNER_NDIS;
         (*context).copied = u8::from(resources);
-        nbl
+        Ok(nbl)
     }
 }
 
@@ -475,7 +481,7 @@ unsafe fn classify_chain(
             if original.is_null() {
                 break;
             }
-            let mut nbl = null_mut();
+            let mut nbl = Err(PacketCreateError::Paused);
             let mut result = 1;
             // A closed controller session still parses non-IP frames and selects
             // immediate policy fallback for IP; it does not close NDIS admission.
@@ -483,7 +489,7 @@ unsafe fn classify_chain(
                 let mut state: LOCK_STATE_EX = zeroed();
                 api::NdisAcquireRWLockRead((*a).classification_lock, &mut state, 0);
                 nbl = create_ndis_packet(a, original, port, flags, direction, resources);
-                if !nbl.is_null() {
+                if let Ok(nbl) = nbl {
                     let cancel = if direction == SEND {
                         (*original).NetBufferListInfo[NetBufferListCancelId as usize] as usize
                     } else {
@@ -509,34 +515,39 @@ unsafe fn classify_chain(
                 ndis_unlock(addr_of_mut!((*a).lock));
                 cancelled
             };
-            if nbl.is_null() {
-                policy::HvResourceDrop();
-                if direction == SEND {
-                    (*original).__bindgen_anon_2.Status = if cancelled {
-                        HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
-                    } else if admitted {
-                        HV_WDK_NDIS_RESOURCES as NDIS_STATUS
-                    } else {
-                        HV_WDK_NDIS_PAUSED as NDIS_STATUS
-                    };
-                    api::NdisFSendNetBufferListsComplete(
-                        (*a).filter,
-                        original,
-                        send_complete_flags(),
-                    );
-                } else if !resources {
-                    api::NdisFReturnNetBufferLists((*a).filter, original, return_flags());
+            match nbl {
+                Err(reason) => {
+                    match reason {
+                        PacketCreateError::Paused => policy::HvPausedDrop(),
+                        PacketCreateError::Resource => policy::HvResourceDrop(),
+                    }
+                    if direction == SEND {
+                        (*original).__bindgen_anon_2.Status = if cancelled {
+                            HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+                        } else if reason == PacketCreateError::Paused {
+                            HV_WDK_NDIS_PAUSED as NDIS_STATUS
+                        } else {
+                            HV_WDK_NDIS_RESOURCES as NDIS_STATUS
+                        };
+                        api::NdisFSendNetBufferListsComplete(
+                            (*a).filter,
+                            original,
+                            send_complete_flags(),
+                        );
+                    } else if !resources {
+                        api::NdisFReturnNetBufferLists((*a).filter, original, return_flags());
+                    }
                 }
-            } else if result >= 0 {
-                let finish = if cancelled && result != 0 {
-                    FINISH_CANCEL
-                } else {
-                    result as u32
-                };
-                hv_finish(nbl as usize, finish);
+                Ok(nbl) if result >= 0 => {
+                    let finish = if cancelled && result != 0 {
+                        FINISH_CANCEL
+                    } else {
+                        result as u32
+                    };
+                    hv_finish(nbl as usize, finish);
+                }
+                Ok(_) => {} // Policy owns the NBL; it may already have been freed.
             }
-            // For a negative result only the pointer value was compared above.
-            // An early verdict may already have freed the NBL and its context.
         }
     }
 }

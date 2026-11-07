@@ -671,6 +671,10 @@ pub extern "C" fn HvWfpStatus(healthy: u32) {
     });
 }
 #[unsafe(no_mangle)]
+pub extern "C" fn HvPausedDrop() {
+    with_state(|e| e.paused_drop());
+}
+#[unsafe(no_mangle)]
 pub extern "C" fn HvResourceDrop() {
     with_state(|e| e.resource_drop());
 }

@@ -890,11 +890,19 @@ impl Engine {
             self.stats.dropped = self.stats.dropped.saturating_add(1);
         }
     }
+    fn count_unclassified_drop(&mut self) {
+        self.stats.received = self.stats.received.saturating_add(1);
+        self.stats.dropped = self.stats.dropped.saturating_add(1);
+    }
+    pub fn paused_drop(&mut self) {
+        if self.online {
+            self.count_unclassified_drop();
+        }
+    }
     pub fn resource_drop(&mut self) {
         if self.online {
-            self.stats.received = self.stats.received.saturating_add(1);
+            self.count_unclassified_drop();
             self.stats.overflow = self.stats.overflow.saturating_add(1);
-            self.stats.dropped = self.stats.dropped.saturating_add(1);
         }
     }
     fn event_room(&self, packet: &Packet) -> bool {
@@ -1737,6 +1745,30 @@ mod tests {
             assert!(work.take_deferred().is_none());
             assert!(e.interfaces.is_empty());
         }
+    }
+
+    #[test]
+    fn paused_drops_preserve_totals_without_reporting_resource_overflow() {
+        let mut e = Engine::new();
+        e.paused_drop();
+        e.resource_drop();
+        assert_eq!(e.stats(), Stats::EMPTY);
+
+        e.connect();
+        e.paused_drop();
+        assert_eq!(
+            (e.stats().received, e.stats().dropped, e.stats().overflow),
+            (1, 1, 0)
+        );
+        e.resource_drop();
+        assert_eq!(
+            (e.stats().received, e.stats().dropped, e.stats().overflow),
+            (2, 2, 1)
+        );
+
+        e.disconnect();
+        e.paused_drop();
+        assert_eq!(e.stats(), Stats::EMPTY);
     }
 
     #[test]

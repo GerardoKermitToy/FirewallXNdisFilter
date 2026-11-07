@@ -64,6 +64,9 @@ struct State {
     attributes_status: NDIS_STATUS,
     next_index: u32,
     detach_on_pause: bool,
+    pause_after_forward: bool,
+    cancel_after_pause: Option<usize>,
+    paused_drops: u32,
     resource_drops: u32,
     snapshot_growth: usize,
     nbl_pools: usize,
@@ -101,6 +104,9 @@ impl Default for State {
             attributes_status: HV_WDK_NDIS_SUCCESS as NDIS_STATUS,
             next_index: 100,
             detach_on_pause: false,
+            pause_after_forward: false,
+            cancel_after_pause: None,
+            paused_drops: 0,
             resource_drops: 0,
             snapshot_growth: 0,
             nbl_pools: 0,
@@ -321,7 +327,24 @@ pub(super) mod calls {
         });
     }
     pub(crate) unsafe fn NdisAcquireRWLockRead(_: PNDIS_RW_LOCK_EX, _: PLOCK_STATE_EX, _: UCHAR) {
-        state(|s| s.rw_depth += 1);
+        let (cancel, a) = state(|s| {
+            s.rw_depth += 1;
+            let paused = s.cancel_after_pause.is_some()
+                && s.adapter != 0
+                && unsafe { (*(s.adapter as *mut Adapter)).running == 0 };
+            let cancel = if paused {
+                s.cancel_after_pause.take()
+            } else {
+                None
+            };
+            (cancel, s.adapter)
+        });
+        if let Some(cancel) = cancel {
+            // Model cancellation on another CPU after this NBL became current.
+            state(|s| s.publishing = true);
+            unsafe { cancel_send(a as NDIS_HANDLE, cancel as PVOID) };
+            state(|s| s.publishing = false);
+        }
     }
     pub(crate) unsafe fn NdisAcquireRWLockWrite(_: PNDIS_RW_LOCK_EX, _: PLOCK_STATE_EX, _: UCHAR) {
         state(|s| s.rw_depth += 1);
@@ -431,6 +454,16 @@ pub(super) mod calls {
             s.attributes_status
         })
     }
+    fn pause_after_forward(a: usize, pause: bool) {
+        if !pause {
+            return;
+        }
+        let mut parameters = NDIS_FILTER_PAUSE_PARAMETERS::default();
+        assert_eq!(
+            unsafe { filter_pause(a as NDIS_HANDLE, &mut parameters) },
+            HV_WDK_NDIS_PENDING as NDIS_STATUS
+        );
+    }
     pub(crate) unsafe fn NdisFSendNetBufferLists(
         _: NDIS_HANDLE,
         nbl: PNET_BUFFER_LIST,
@@ -438,9 +471,13 @@ pub(super) mod calls {
         flags: ULONG,
     ) {
         assert_unlocked();
-        let (inline, a) = state(|s| {
+        let (inline, a, pause) = state(|s| {
             s.events.push(Event::Send(nbl as usize, flags));
-            (s.inline, s.adapter)
+            (
+                s.inline,
+                s.adapter,
+                core::mem::take(&mut s.pause_after_forward),
+            )
         });
         if inline {
             unsafe {
@@ -451,6 +488,7 @@ pub(super) mod calls {
                 );
             }
         }
+        pause_after_forward(a, pause);
     }
     pub(crate) unsafe fn NdisFSendNetBufferListsComplete(
         _: NDIS_HANDLE,
@@ -488,9 +526,13 @@ pub(super) mod calls {
         assert_unlocked();
         assert_eq!(count, 1);
         assert_eq!(flags & NDIS_RECEIVE_FLAGS_RESOURCES, 0);
-        let (inline, a) = state(|s| {
+        let (inline, a, pause) = state(|s| {
             s.events.push(Event::Indicate(nbl as usize, flags));
-            (s.inline, s.adapter)
+            (
+                s.inline,
+                s.adapter,
+                core::mem::take(&mut s.pause_after_forward),
+            )
         });
         if inline {
             unsafe {
@@ -501,6 +543,7 @@ pub(super) mod calls {
                 );
             }
         }
+        pause_after_forward(a, pause);
     }
     pub(crate) unsafe fn NdisFReturnNetBufferLists(
         _: NDIS_HANDLE,
@@ -646,6 +689,9 @@ pub(super) mod calls {
                 hv_finish(n, 1);
             }
         }
+    }
+    pub(crate) fn HvPausedDrop() {
+        state(|s| s.paused_drops += 1);
     }
     pub(crate) fn HvResourceDrop() {
         state(|s| s.resource_drops += 1);
@@ -1020,7 +1066,8 @@ fn resources_receive_uses_private_deep_copy_and_never_returns_original_or_privat
             NDIS_RECEIVE_FLAGS_RESOURCES,
             RECEIVE,
             true,
-        );
+        )
+        .expect("receive copy should succeed");
         assert!(!copied.is_null());
         assert_ne!(copied as usize, address);
         assert_eq!(
@@ -1071,6 +1118,8 @@ fn resource_receive_data_view_failure_never_retains_original() {
         stop(&mut *a);
     }
     state(|s| {
+        assert_eq!(s.paused_drops, 0);
+        assert_eq!(s.resource_drops, 1);
         assert!(
             !s.events
                 .iter()
@@ -1109,7 +1158,8 @@ fn paused_callbacks_complete_sends_return_owned_receives_and_leave_resource_chai
         assert_eq!(a.active, 0);
     }
     state(|s| {
-        assert_eq!(s.resource_drops, 4);
+        assert_eq!(s.paused_drops, 4);
+        assert_eq!(s.resource_drops, 0);
         assert_eq!(
             s.events
                 .iter()
@@ -1123,6 +1173,153 @@ fn paused_callbacks_complete_sends_return_owned_receives_and_leave_resource_chai
                 .any(|e| matches!(e, Event::Classify(_, _, _, _)))
         );
     });
+}
+
+#[test]
+fn pause_between_send_chain_members_reports_pause_or_cancellation() {
+    for cancelled in [false, true] {
+        let f = Fixture::new();
+        let mut a = f.adapter();
+        let mut first = Box::<NET_BUFFER_LIST>::default();
+        let mut second = Box::<NET_BUFFER_LIST>::default();
+        let second_address = (&mut *second as *mut NET_BUFFER_LIST) as usize;
+        let cancel = 0x1234usize;
+        state(|s| {
+            s.pause_after_forward = true;
+            s.cancel_after_pause = cancelled.then_some(cancel);
+        });
+        let expected = if cancelled {
+            HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+        } else {
+            HV_WDK_NDIS_PAUSED as NDIS_STATUS
+        };
+        unsafe {
+            second.NetBufferListInfo[NetBufferListCancelId as usize] = cancel as PVOID;
+            start(&mut *a);
+            packet::set_next_nbl(&mut *first, &mut *second);
+            send((&mut *a as *mut Adapter).cast(), &mut *first, 0, 0);
+            assert_eq!(second.__bindgen_anon_2.Status, expected);
+            assert_eq!(a.active, 0);
+        }
+        state(|s| {
+            assert_eq!(s.paused_drops, 1);
+            assert_eq!(s.resource_drops, 0);
+            assert_eq!(
+                s.events
+                    .iter()
+                    .filter(|e| matches!(e, Event::Classify(_, _, _, _)))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                s.events
+                    .iter()
+                    .filter(|e| matches!(e, Event::Send(_, _)))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                s.events
+                    .iter()
+                    .filter(|e| matches!(e, Event::Complete(address, status, _) if *address == second_address && *status == expected))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                s.events
+                    .iter()
+                    .filter(|e| matches!(e, Event::Cancel(77, id) if *id == cancel))
+                    .count(),
+                usize::from(cancelled)
+            );
+            assert_eq!(
+                s.events
+                    .iter()
+                    .filter(|e| matches!(e, Event::PauseComplete))
+                    .count(),
+                1
+            );
+        });
+    }
+}
+
+#[test]
+fn pause_between_receive_chain_members_preserves_ownership_without_resource_drops() {
+    for resources in [false, true] {
+        let f = Fixture::new();
+        let mut a = f.adapter();
+        let mut first = Source::new();
+        let mut second = Source::new();
+        let second_address = (&mut *second.nbl as *mut NET_BUFFER_LIST) as usize;
+        state(|s| s.pause_after_forward = true);
+        unsafe {
+            start(&mut *a);
+            packet::set_next_nbl(&mut *first.nbl, &mut *second.nbl);
+            receive(
+                (&mut *a as *mut Adapter).cast(),
+                &mut *first.nbl,
+                0,
+                2,
+                if resources {
+                    NDIS_RECEIVE_FLAGS_RESOURCES
+                } else {
+                    0
+                },
+            );
+            if resources {
+                assert_eq!(
+                    packet::next_nbl(&mut *first.nbl),
+                    &mut *second.nbl as *mut _
+                );
+            } else {
+                assert!(packet::next_nbl(&mut *first.nbl).is_null());
+            }
+            assert!(first.nbl.Context.is_null());
+            assert!(second.nbl.Context.is_null());
+            assert_eq!(a.active, 0);
+        }
+        state(|s| {
+            assert_eq!(s.paused_drops, 1);
+            assert_eq!(s.resource_drops, 0);
+            assert_eq!(
+                s.events
+                    .iter()
+                    .filter(|e| matches!(e, Event::Classify(_, _, _, _)))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                s.events
+                    .iter()
+                    .filter(|e| matches!(e, Event::Indicate(_, _)))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                s.events
+                    .iter()
+                    .filter(|e| matches!(e, Event::Return(_, _)))
+                    .count(),
+                if resources { 0 } else { 2 }
+            );
+            assert_eq!(
+                s.events
+                    .iter()
+                    .filter(
+                        |e| matches!(e, Event::Return(address, _) if *address == second_address)
+                    )
+                    .count(),
+                usize::from(!resources)
+            );
+            assert_eq!(
+                s.events
+                    .iter()
+                    .filter(|e| matches!(e, Event::PauseComplete))
+                    .count(),
+                1
+            );
+        });
+    }
 }
 
 #[test]

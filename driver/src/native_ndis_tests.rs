@@ -29,6 +29,7 @@ enum Event {
     Invalidate(u32),
     Drain,
     Attach(u32),
+    RollbackAttach(u32),
     Detach(u32),
     OidComplete(usize, NDIS_STATUS),
     OidCancel(usize),
@@ -652,6 +653,9 @@ pub(super) mod calls {
     pub(crate) fn HvRestart(_: u32) -> u32 {
         state(|s| u32::from(s.restart_ok))
     }
+    pub(crate) fn HvRollbackAttach(index: u32) {
+        state(|s| s.events.push(Event::RollbackAttach(index)));
+    }
     pub(crate) fn HvDetach(index: u32) {
         state(|s| s.events.push(Event::Detach(index)));
     }
@@ -957,6 +961,83 @@ fn locally_dropped_lso_uses_completion_metadata() {
         );
         assert!(malformed.nbl.NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize].is_null());
         stop(&mut *a);
+    }
+}
+
+#[test]
+fn paused_lso_sends_return_completion_metadata_with_or_without_cancellation() {
+    for version in [
+        NDIS_TCP_LARGE_SEND_OFFLOAD_V2_TYPE,
+        NDIS_TCP_LARGE_SEND_OFFLOAD_V1_TYPE,
+    ] {
+        for cancelled in [false, true] {
+            let f = Fixture::new();
+            let mut a = f.adapter();
+            let mut first = Box::<NET_BUFFER_LIST>::default();
+            let mut second = Source::new();
+            let mut info: NDIS_TCP_LARGE_SEND_OFFLOAD_NET_BUFFER_LIST_INFO = unsafe { zeroed() };
+            let cancel = 0x1234usize;
+            state(|s| {
+                s.pause_after_forward = true;
+                s.cancel_after_pause = cancelled.then_some(cancel);
+            });
+            unsafe {
+                second.data[34 + 12] = 5 << 4;
+                info.__bindgen_anon_1.LsoV1Transmit.set_MSS(64);
+                info.__bindgen_anon_1.LsoV1Transmit.set_TcpHeaderOffset(34);
+                info.__bindgen_anon_1.LsoV1Transmit.set_Type(version);
+                if version == NDIS_TCP_LARGE_SEND_OFFLOAD_V2_TYPE {
+                    info.__bindgen_anon_1
+                        .LsoV2Transmit
+                        .set_IPVersion(NDIS_TCP_LARGE_SEND_OFFLOAD_IPv6);
+                }
+                second.nbl.NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize] =
+                    info.__bindgen_anon_1.Value;
+                second.nbl.NetBufferListInfo[NetBufferListCancelId as usize] = cancel as PVOID;
+                start(&mut *a);
+                packet::set_next_nbl(&mut *first, &mut *second.nbl);
+                send((&mut *a as *mut Adapter).cast(), &mut *first, 0, 0);
+                assert_eq!(
+                    second.nbl.__bindgen_anon_2.Status,
+                    if cancelled {
+                        HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+                    } else {
+                        HV_WDK_NDIS_PAUSED as NDIS_STATUS
+                    }
+                );
+                info.__bindgen_anon_1.Value =
+                    second.nbl.NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize];
+                if version == NDIS_TCP_LARGE_SEND_OFFLOAD_V1_TYPE {
+                    assert_eq!(info.__bindgen_anon_1.LsoV1TransmitComplete.Type(), version);
+                    assert_eq!(info.__bindgen_anon_1.LsoV1TransmitComplete.TcpPayload(), 74);
+                } else {
+                    assert_eq!(info.__bindgen_anon_1.LsoV2TransmitComplete.Type(), version);
+                    assert_eq!(info.__bindgen_anon_1.LsoV2TransmitComplete.Reserved(), 0);
+                    assert_eq!(info.__bindgen_anon_1.LsoV2TransmitComplete.Reserved2(), 0);
+                }
+                assert_eq!(a.active, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn paused_malformed_lso_keeps_pause_status_and_clears_transmit_metadata() {
+    let f = Fixture::new();
+    let mut a = f.adapter();
+    let mut source = Source::new();
+    let mut info: NDIS_TCP_LARGE_SEND_OFFLOAD_NET_BUFFER_LIST_INFO = unsafe { zeroed() };
+    unsafe {
+        info.__bindgen_anon_1.LsoV1Transmit.set_MSS(64);
+        info.__bindgen_anon_1.LsoV1Transmit.set_TcpHeaderOffset(120);
+        source.nbl.NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize] =
+            info.__bindgen_anon_1.Value;
+        send((&mut *a as *mut Adapter).cast(), &mut *source.nbl, 0, 0);
+        assert_eq!(
+            source.nbl.__bindgen_anon_2.Status,
+            HV_WDK_NDIS_PAUSED as NDIS_STATUS
+        );
+        assert!(source.nbl.NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize].is_null());
     }
 }
 
@@ -1709,7 +1790,10 @@ fn attach_rejects_gate_or_media_and_unwinds_nonallocation_failures() {
             HV_WDK_NDIS_FAILURE as NDIS_STATUS
         );
     }
-    state(|s| assert!(s.events.contains(&Event::Detach(8))));
+    state(|s| {
+        assert!(s.events.contains(&Event::RollbackAttach(8)));
+        assert!(!s.events.contains(&Event::Detach(8)));
+    });
 }
 
 #[test]

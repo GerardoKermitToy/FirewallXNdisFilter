@@ -522,6 +522,8 @@ unsafe fn classify_chain(
                         PacketCreateError::Resource => policy::HvResourceDrop(),
                     }
                     if direction == SEND {
+                        // Preserve cancellation/pause status even if LSO metadata is malformed.
+                        let _ = complete_local_lso(original);
                         (*original).__bindgen_anon_2.Status = if cancelled {
                             HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
                         } else if reason == PacketCreateError::Paused {
@@ -1184,7 +1186,7 @@ pub(super) unsafe extern "C" fn filter_attach(
             spin_unlock(addr_of_mut!(ADAPTER_INFO_LOCK), irql);
             return status;
         }
-        policy::HvDetach((*a).interface_index);
+        policy::HvRollbackAttach((*a).interface_index);
         policy::HvDrain();
         free_adapter(a);
         status

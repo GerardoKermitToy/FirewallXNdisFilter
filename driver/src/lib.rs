@@ -225,6 +225,10 @@ pub extern "C" fn HvAttach(interface_index: u32) -> u32 {
     with_state(|e| e.attach(interface_index) as u32)
 }
 #[unsafe(no_mangle)]
+pub extern "C" fn HvRollbackAttach(interface_index: u32) {
+    with_state(|e| e.rollback_attach(interface_index));
+}
+#[unsafe(no_mangle)]
 pub extern "C" fn HvRestart(interface_index: u32) -> u32 {
     with_state(|e| e.restart(interface_index) as u32)
 }

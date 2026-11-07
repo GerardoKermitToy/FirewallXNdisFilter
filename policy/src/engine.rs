@@ -699,8 +699,23 @@ impl Engine {
             }
         }
     }
+    // Roll back only an attachment that never reached NDIS restart. Forwarding
+    // may already share this index, so its pending requests and caches stay live.
+    pub fn rollback_attach(&mut self, interface_index: u32) {
+        if interface_index != 0
+            && self
+                .interfaces
+                .iter()
+                .any(|s| s.interface_index == interface_index && s.ndis_attached && !s.running)
+        {
+            self.release_attachment(interface_index);
+        }
+    }
     pub fn detach(&mut self, interface_index: u32) {
         self.invalidate(interface_index, true);
+        self.release_attachment(interface_index);
+    }
+    fn release_attachment(&mut self, interface_index: u32) {
         if let Some(handle) = self
             .interfaces
             .find(|s| s.interface_index == interface_index && interface_index != 0)
@@ -1677,6 +1692,90 @@ mod tests {
         assert_eq!(e.interfaces.len(), 1);
         e.disconnect();
         assert!(e.interfaces.is_empty());
+    }
+
+    #[test]
+    fn failed_attach_rollback_preserves_forward_cache_and_pending() {
+        let mut e = Engine::new();
+        e.connect();
+        let keys = [
+            cache_packet(false, 6, 1000),
+            cache_packet(false, 17, 1001),
+            cache_packet(true, 6, 1002),
+            cache_packet(true, 17, 1003),
+        ];
+        let mut work = BandwidthWork::prepare(e.bandwidth_plan());
+        for (i, &p) in keys.iter().enumerate() {
+            let Submission::Pending(id) =
+                e.submit_forward_with_work(7, p, i + 1, 100, record(&p), &mut work)
+            else {
+                panic!("expected cache-seeding request");
+            };
+            e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
+        }
+        let before = cache_packet(false, 17, 2000);
+        let Submission::Pending(before_id) =
+            e.submit_forward_with_work(7, before, 10, 102, record(&before), &mut work)
+        else {
+            panic!("expected existing WFP request");
+        };
+        assert!(e.attach(7));
+        let during = cache_packet(false, 17, 2001);
+        let Submission::Pending(during_id) =
+            e.submit_forward_with_work(7, during, 11, 102, record(&during), &mut work)
+        else {
+            panic!("expected WFP request during NDIS attachment");
+        };
+
+        // NdisFSetAttributes failed before the NDIS module could restart.
+        e.rollback_attach(7);
+        while let Some(retired) = e.take_retired_caches() {
+            drop(retired);
+        }
+        assert_eq!(e.cache_candidates(), 1);
+        assert_eq!(e.pending_count(), 2);
+        assert_eq!(e.take_due(103), None);
+        assert_eq!(e.verdict(before_id, Verdict::Accept, 104).unwrap().nbl, 10);
+        assert_eq!(e.verdict(during_id, Verdict::Accept, 104).unwrap().nbl, 11);
+        for (i, p) in keys.iter().enumerate() {
+            assert_eq!(
+                e.preflight(7, p, 100 + i, 105),
+                Err(Action {
+                    nbl: 100 + i,
+                    finish: Finish::Allow,
+                })
+            );
+        }
+        assert!(e.attach(7));
+    }
+
+    #[test]
+    fn failed_attach_rollback_removes_only_unpublished_ndis_state() {
+        let mut e = Engine::new();
+        e.connect();
+        assert!(e.attach(7));
+        e.rollback_attach(7);
+        assert!(e.interfaces.is_empty());
+        assert!(e.attach(7));
+        assert!(e.restart(7));
+        e.rollback_attach(7); // A running module is not a failed attachment.
+        assert!(!e.attach(7));
+        e.detach(7);
+        assert!(e.interfaces.is_empty());
+
+        // WFP may first observe an index while NDIS setup is still in progress.
+        assert!(e.attach(8));
+        let packet = cache_packet(false, 6, 2000);
+        let mut work = BandwidthWork::prepare(e.bandwidth_plan());
+        let Submission::Pending(id) =
+            e.submit_forward_with_work(8, packet, 10, 100, record(&packet), &mut work)
+        else {
+            panic!("expected WFP request during NDIS attachment");
+        };
+        e.rollback_attach(8);
+        e.rollback_attach(8);
+        assert_eq!(e.verdict(id, Verdict::Accept, 101).unwrap().nbl, 10);
+        assert!(e.attach(8));
     }
 
     #[test]

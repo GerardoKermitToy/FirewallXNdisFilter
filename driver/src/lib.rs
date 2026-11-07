@@ -32,7 +32,10 @@ use core::{
 };
 use hyperv_policy::{
     cache::{CLEANUP_SLOTS_PER_BATCH, CacheAllocator, CacheWork},
-    engine::{Action, BandwidthTable, BandwidthWork, Engine, Finish, Submission, allocate_record},
+    engine::{
+        Action, BandwidthTable, BandwidthWork, Engine, Finish, Submission, VerdictError,
+        allocate_record,
+    },
     packet::{self, NdisPath, Packet, SNAPSHOT},
 };
 use hyperv_protocol::{self as wire, Command};
@@ -722,22 +725,27 @@ pub unsafe extern "C" fn HvWrite(data: *const u8, len: u32) -> i32 {
                 reclaim_retired();
                 drain();
             }
-            Command::Verdict { id, verdict } => {
+            Command::Verdict { id, verdict } => loop {
                 // Expiry and topology changes may win the race. A stale ID is a
                 // harmless no-op (never a cache write), as on asynchronous kext I/O.
                 let plan = with_state(|e| e.cache_plan(id, verdict, unsafe { hv_now() }));
                 let mut work = CacheWork::prepare(plan);
-                let action = with_bandwidth(|e, bandwidth, now| {
+                let result = with_bandwidth(|e, bandwidth, now| {
                     e.verdict_with_work(id, verdict, now, &mut work, bandwidth)
-                        .ok()
                 });
                 drop(work);
-                if let Some(a) = action {
-                    finish(a);
-                } else {
-                    drain();
+                match result {
+                    Ok(action) => {
+                        finish(action);
+                        break;
+                    }
+                    Err(VerdictError::RetryCache) => reclaim_retired(),
+                    Err(VerdictError::NotFound) => {
+                        drain();
+                        break;
+                    }
                 }
-            }
+            },
             Command::ClearCache => {
                 with_state(|e| e.clear_cache());
                 reclaim_retired();

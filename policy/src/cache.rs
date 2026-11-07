@@ -344,6 +344,7 @@ impl CachePlan {
 // current/previous tables for all four caches can retire in one cleanup batch.
 pub struct CacheWork {
     growth: Option<Allocation>,
+    attempted: Option<(bool, usize)>,
     retired: [Buffer; 8],
     retired_count: usize,
 }
@@ -351,15 +352,22 @@ impl CacheWork {
     pub const fn empty() -> Self {
         Self {
             growth: None,
+            attempted: None,
             retired: [const { Buffer::EMPTY }; 8],
             retired_count: 0,
         }
     }
     pub fn prepare(plan: Option<CachePlan>) -> Self {
         Self {
+            attempted: plan.map(|plan| (plan.ipv6, plan.capacity)),
             growth: plan.and_then(CachePlan::allocate),
             ..Self::empty()
         }
+    }
+    // Do not repeat an unchanged plan if its checked allocation size failed.
+    // A changed family or capacity needs fresh preparation outside PolicyLock.
+    pub(crate) fn needs_preparation(&self, plan: CachePlan) -> bool {
+        self.attempted != Some((plan.ipv6, plan.capacity))
     }
     fn retire(&mut self, buffer: &mut Buffer) -> bool {
         if buffer.data.is_null() {

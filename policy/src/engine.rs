@@ -35,6 +35,8 @@ pub enum Submission {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerdictError {
     NotFound,
+    // The cache changed while its storage was being prepared outside PolicyLock.
+    RetryCache,
 }
 
 struct Interface {
@@ -1189,12 +1191,17 @@ impl Engine {
         Action { nbl: p.nbl, finish }
     }
     pub fn verdict(&mut self, id: u64, verdict: Verdict, now: u64) -> Result<Action, VerdictError> {
-        while let Some(retired) = self.take_retired_caches() {
-            drop(retired);
+        loop {
+            while let Some(retired) = self.take_retired_caches() {
+                drop(retired);
+            }
+            let mut work = CacheWork::prepare(self.cache_plan(id, verdict, now));
+            let mut bandwidth = BandwidthWork::prepare(self.bandwidth_plan());
+            match self.verdict_with_work(id, verdict, now, &mut work, &mut bandwidth) {
+                Err(VerdictError::RetryCache) => continue,
+                result => return result,
+            }
         }
-        let mut work = CacheWork::prepare(self.cache_plan(id, verdict, now));
-        let mut bandwidth = BandwidthWork::prepare(self.bandwidth_plan());
-        self.verdict_with_work(id, verdict, now, &mut work, &mut bandwidth)
     }
     pub fn verdict_with_work(
         &mut self,
@@ -1214,10 +1221,20 @@ impl Engine {
             return Err(VerdictError::NotFound);
         }
         if verdict.permanent()
-            && let Some(bank) = self.cache_bank(p.interface_index, &p.packet)
+            && Self::cache_eligible(&p.packet)
+            && let Some(bank) = self.interfaces.find(|interface| {
+                interface.interface_index == p.interface_index
+                    && (interface.running || interface.forwarding)
+            })
         {
-            // SAFETY: cache_bank returned this live node; insertion cannot detach it.
-            if unlikely(!unsafe { self.interfaces.get_mut(bank) }.caches.insert(
+            // SAFETY: the handle was just found and remains live under PolicyLock.
+            let interface = unsafe { self.interfaces.get_mut(bank) };
+            if interface.dirty {
+                // Old storage must be detached and freed before installing the
+                // new decision; the pending ID remains live for the retry.
+                return Err(VerdictError::RetryCache);
+            }
+            let inserted = interface.caches.insert(
                 &p.packet.connection,
                 Decision {
                     allow: verdict.allows(),
@@ -1225,11 +1242,20 @@ impl Engine {
                 },
                 now,
                 work,
-            )) {
+            );
+            let retry = !inserted
+                && interface
+                    .caches
+                    .plan(&p.packet.connection)
+                    .is_some_and(|plan| work.needs_preparation(plan));
+            self.update_cache_candidates(bank);
+            if retry {
+                return Err(VerdictError::RetryCache);
+            }
+            if unlikely(!inserted) {
                 self.stats.cache_allocation_failures =
                     self.stats.cache_allocation_failures.saturating_add(1);
             }
-            self.update_cache_candidates(bank);
         }
         Ok(self.claim(
             handle,
@@ -1538,6 +1564,19 @@ mod tests {
         p.connection.protocol = 17;
         p.ip_len = 100;
         p.payload_len = 100;
+        p
+    }
+    fn cache_packet(ipv6: bool, protocol: u8, source_port: u16) -> Packet {
+        let mut p = packet();
+        p.flow.ipv6 = ipv6;
+        p.connection.ipv6 = ipv6;
+        p.flow.protocol = protocol;
+        p.connection.protocol = protocol;
+        p.flow.source[0] = 10;
+        p.flow.destination[0] = 20;
+        p.flow.source_port = source_port;
+        p.flow.destination_port = 443;
+        p.orient(NdisPath::Receive);
         p
     }
     fn record(p: &Packet) -> Option<Vec<u8>> {
@@ -3195,23 +3234,24 @@ mod tests {
     }
 
     #[test]
-    fn failed_cache_insertion_and_session_reset_disable_cache_candidates() {
+    fn missing_cache_preparation_retries_and_session_reset_disables_candidates() {
         let mut e = engine();
         let k = 101;
         let id = submit(&mut e, k, 1);
         let mut bandwidth = BandwidthWork::prepare(e.bandwidth_plan());
-        e.verdict_with_work(
-            id,
-            Verdict::PermanentAccept,
-            101,
-            &mut CacheWork::empty(),
-            &mut bandwidth,
-        )
-        .unwrap();
-        assert_eq!(e.pending_count(), 0);
+        assert_eq!(
+            e.verdict_with_work(
+                id,
+                Verdict::PermanentAccept,
+                101,
+                &mut CacheWork::empty(),
+                &mut bandwidth,
+            ),
+            Err(VerdictError::RetryCache)
+        );
+        assert_eq!(e.pending_count(), 1);
         assert_eq!(e.cache_candidates(), 0);
-        assert_eq!(e.stats().cache_allocation_failures, 1);
-        let id = submit(&mut e, k, 2);
+        assert_eq!(e.stats().cache_allocation_failures, 0);
         e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
         assert_ne!(e.cache_candidates(), 0);
         e.clear_cache();
@@ -3223,6 +3263,165 @@ mod tests {
         assert_eq!(e.cache_candidates(), 0);
         e.connect();
         assert_eq!(e.cache_candidates(), 0);
+    }
+
+    #[test]
+    fn new_forward_verdict_waits_for_paused_interface_cache_retirement() {
+        for ipv6 in [false, true] {
+            for protocol in [6, 17] {
+                for verdict in [
+                    Verdict::PermanentAccept,
+                    Verdict::PermanentBlock,
+                    Verdict::PermanentDrop,
+                ] {
+                    let mut e = engine();
+                    assert!(e.ensure_forward(101));
+                    let old = cache_packet(ipv6, protocol, 1000);
+                    let Submission::Pending(id) = e.submit(101, old, 1, None, 100, record(&old))
+                    else {
+                        panic!("expected old pending packet");
+                    };
+                    e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
+                    e.invalidate(101, true);
+
+                    let new = cache_packet(ipv6, protocol, 2000);
+                    let mut bandwidth = BandwidthWork::prepare(e.bandwidth_plan());
+                    let Submission::Pending(id) =
+                        e.submit_forward_with_work(101, new, 2, 102, record(&new), &mut bandwidth)
+                    else {
+                        panic!("new forward packet must be pending");
+                    };
+                    let mut work = CacheWork::prepare(e.cache_plan(id, verdict, 103));
+                    assert_eq!(
+                        e.verdict_with_work(id, verdict, 103, &mut work, &mut bandwidth),
+                        Err(VerdictError::RetryCache)
+                    );
+                    assert_eq!(e.pending_count(), 1);
+                    assert_eq!(e.stats().cache_allocation_failures, 0);
+                    drop(work);
+
+                    drop(e.take_retired_caches().expect("old cache must be retired"));
+                    let mut work = CacheWork::prepare(e.cache_plan(id, verdict, 104));
+                    let action = e
+                        .verdict_with_work(id, verdict, 104, &mut work, &mut bandwidth)
+                        .unwrap();
+                    let finish = if verdict.allows() {
+                        Finish::Allow
+                    } else {
+                        Finish::Drop
+                    };
+                    assert_eq!(action, Action { nbl: 2, finish });
+                    assert_eq!(e.pending_count(), 0);
+                    assert_eq!(
+                        e.preflight(101, &new, 3, 105),
+                        Err(Action { nbl: 3, finish })
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn verdict_replans_when_expiry_cleanup_retires_the_table() {
+        for ipv6 in [false, true] {
+            for protocol in [6, 17] {
+                for verdict in [
+                    Verdict::PermanentAccept,
+                    Verdict::PermanentBlock,
+                    Verdict::PermanentDrop,
+                ] {
+                    let mut e = engine();
+                    e.configure(8000, 1000, true);
+                    let old = cache_packet(ipv6, protocol, 1000);
+                    let Submission::Pending(id) = e.submit(101, old, 1, None, 100, record(&old))
+                    else {
+                        panic!("expected old pending packet");
+                    };
+                    e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
+
+                    let new = cache_packet(ipv6, protocol, 2000);
+                    let Submission::Pending(id) = e.submit(101, new, 2, None, 10099, record(&new))
+                    else {
+                        panic!("new packet must be pending");
+                    };
+                    // There is room when the verdict is planned. The normal
+                    // expiry worker can retire that table before it is applied.
+                    let plan = e.cache_plan(id, verdict, 10100);
+                    assert!(plan.is_none());
+                    let mut work = CacheWork::prepare(plan);
+                    e.clean(10101);
+                    let mut bandwidth = BandwidthWork::prepare(e.bandwidth_plan());
+                    assert_eq!(
+                        e.verdict_with_work(id, verdict, 10102, &mut work, &mut bandwidth),
+                        Err(VerdictError::RetryCache)
+                    );
+                    assert_eq!(e.pending_count(), 1);
+                    assert_eq!(e.stats().cache_allocation_failures, 0);
+                    drop(work);
+
+                    let mut work = CacheWork::prepare(e.cache_plan(id, verdict, 10103));
+                    let action = e
+                        .verdict_with_work(id, verdict, 10103, &mut work, &mut bandwidth)
+                        .unwrap();
+                    let finish = if verdict.allows() {
+                        Finish::Allow
+                    } else {
+                        Finish::Drop
+                    };
+                    assert_eq!(action, Action { nbl: 2, finish });
+                    assert_eq!(e.pending_count(), 0);
+                    assert_eq!(
+                        e.preflight(101, &new, 3, 10104),
+                        Err(Action { nbl: 3, finish })
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retry_rechecks_cancellation_invalidation_and_deadline() {
+        for scenario in 0..3 {
+            let mut e = engine();
+            let p = cache_packet(false, 17, 2000);
+            let Submission::Pending(id) = e.submit(101, p, 1, Some(44), 100, record(&p)) else {
+                panic!("expected pending packet");
+            };
+            let mut bandwidth = BandwidthWork::prepare(e.bandwidth_plan());
+            assert_eq!(
+                e.verdict_with_work(
+                    id,
+                    Verdict::PermanentAccept,
+                    101,
+                    &mut CacheWork::empty(),
+                    &mut bandwidth,
+                ),
+                Err(VerdictError::RetryCache)
+            );
+            assert_eq!(e.pending_count(), 1);
+            let now = match scenario {
+                0 => {
+                    assert_eq!(e.cancel(101, 44).unwrap().finish, Finish::Cancel);
+                    102
+                }
+                1 => {
+                    e.invalidate(101, true);
+                    assert!(e.restart(101));
+                    102
+                }
+                _ => 2100,
+            };
+            let mut work = CacheWork::prepare(e.cache_plan(id, Verdict::PermanentAccept, now));
+            assert_eq!(
+                e.verdict_with_work(id, Verdict::PermanentAccept, now, &mut work, &mut bandwidth,),
+                Err(VerdictError::NotFound)
+            );
+            if scenario != 0 {
+                assert!(e.take_due(now).is_some());
+            }
+            assert_eq!(e.pending_count(), 0);
+            assert_eq!(e.cache_candidates(), 0);
+        }
     }
 
     #[test]

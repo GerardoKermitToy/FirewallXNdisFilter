@@ -54,6 +54,22 @@ fn maintain(caches: &mut Caches, now: u64) {
 }
 
 #[test]
+fn failed_checked_size_is_not_retried_as_a_stale_plan() {
+    let invalid = CachePlan {
+        ipv6: false,
+        capacity: 1usize << (usize::BITS - 1),
+        allocator: CacheAllocator::GLOBAL,
+    };
+    let work = CacheWork::prepare(Some(invalid));
+    assert!(work.growth.is_none());
+    assert!(!work.needs_preparation(invalid));
+    assert!(work.needs_preparation(CachePlan {
+        capacity: INITIAL_CAPACITY,
+        ..invalid
+    }));
+}
+
+#[test]
 fn separate_tables_grow_past_1024_without_evicting_live_entries() {
     let mut caches = caches();
     for n in 0..8192 {

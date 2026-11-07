@@ -33,6 +33,7 @@ struct Adapter {
     nb_pool: NDIS_HANDLE,
     lock: NDIS_SPIN_LOCK,
     classification_lock: PNDIS_RW_LOCK_EX,
+    send_batches: *mut ndis::SendBatch,
     oid_rundown: EX_RUNDOWN_REF,
     adapter_link: LIST_ENTRY,
     info: AdapterInfo,

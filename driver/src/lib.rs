@@ -17,6 +17,7 @@ mod native_packet;
 #[cfg(feature = "native-wdk")]
 mod native_wfp;
 mod packet_snapshot;
+mod send_guard;
 mod target_config;
 #[cfg(feature = "native-wdk")]
 mod wdk;
@@ -37,6 +38,7 @@ use hyperv_policy::{
 use hyperv_protocol::{self as wire, Command};
 use likely_stable::unlikely;
 use packet_snapshot::{ParserScratch, Snapshot, SnapshotError};
+use send_guard::with_send_guard;
 
 type Handle = *mut c_void;
 const SUCCESS: i32 = 0;
@@ -367,6 +369,7 @@ pub extern "C" fn HvClassify(
     path: u32,
     cancel: usize,
     session: u32,
+    send_guard: Handle,
 ) -> i32 {
     let Some(path) = NdisPath::decode(path) else {
         with_state(|e| e.malformed());
@@ -377,6 +380,7 @@ pub extern "C" fn HvClassify(
         interface_index,
         PacketInput::Ethernet(path, cancel),
         session,
+        send_guard,
     )
 }
 #[unsafe(no_mangle)]
@@ -401,9 +405,16 @@ pub extern "C" fn HvClassifyIp(
         interface_index,
         PacketInput::Ip(direction, family == 6, cacheable != 0),
         session,
+        core::ptr::null_mut(),
     )
 }
-fn classify(nbl: usize, interface_index: u32, input: PacketInput, session: u32) -> i32 {
+fn classify(
+    nbl: usize,
+    interface_index: u32,
+    input: PacketInput,
+    session: u32,
+    send_guard: Handle,
+) -> i32 {
     let mut first: Option<Packet> = None;
     let mut saw_non_ip = false;
     let mut nb = unsafe { hv_first_nb(nbl) };
@@ -488,40 +499,64 @@ fn classify(nbl: usize, interface_index: u32, input: PacketInput, session: u32) 
         nb = unsafe { hv_next_nb(nb) };
     }
     let Some(mut packet) = first else {
-        with_state(|e| e.non_ip());
-        return 0;
+        return with_state(|e| {
+            with_send_guard(send_guard, |cancelled| {
+                if cancelled {
+                    finish_code(Finish::Cancel)
+                } else {
+                    e.non_ip();
+                    finish_code(Finish::Allow)
+                }
+            })
+        });
     };
     packet.orient_direction(input.direction());
     if session == 0 {
         // The native Rust layer can close the policy rundown while the LWF remains bound.
         // Do not publish a pending event into a session that is being torn down;
         // use the configured immediate fallback instead.
-        return with_state(|e| finish_code(e.fallback()));
+        return with_state(|e| {
+            with_send_guard(send_guard, |cancelled| {
+                finish_code(if cancelled {
+                    Finish::Cancel
+                } else {
+                    e.fallback()
+                })
+            })
+        });
     }
     // Only NDIS sends have a cancel ID; WFP route metadata stays in the shim.
     let cancel = input.cancel();
     let wants_event = match with_bandwidth(|e, work, now| {
-        if input.is_forward() {
-            if !e.is_online() {
+        with_send_guard(send_guard, |cancelled| {
+            if cancelled {
                 return Err(Action {
                     nbl,
-                    finish: e.fallback(),
+                    finish: Finish::Cancel,
                 });
             }
-            if !e.ensure_forward(interface_index) {
-                e.resource_drop();
-                return Err(Action {
-                    nbl,
-                    finish: Finish::Drop,
-                });
+            if input.is_forward() {
+                if !e.is_online() {
+                    return Err(Action {
+                        nbl,
+                        finish: e.fallback(),
+                    });
+                }
+                if !e.ensure_forward(interface_index) {
+                    e.resource_drop();
+                    return Err(Action {
+                        nbl,
+                        finish: Finish::Drop,
+                    });
+                }
             }
-        }
-        e.preflight_with_work(interface_index, &packet, nbl, now, work)
+            e.preflight_with_work(interface_index, &packet, nbl, now, work)
+        })
     }) {
         Ok(wants_event) => wants_event,
         Err(action) => return finish_code(action.finish),
     };
-    let record = if wants_event {
+    let mut record = if wants_event {
         match capture_packet(unsafe { hv_first_nb(nbl) }, nbl, &packet) {
             Ok(record) => record,
             Err(()) => {
@@ -538,11 +573,26 @@ fn classify(nbl: usize, interface_index: u32, input: PacketInput, session: u32) 
         None
     };
     match with_bandwidth(|e, work, now| {
-        if input.is_forward() {
-            e.submit_forward_with_work(interface_index, packet, nbl, now, record, work)
-        } else {
-            e.submit_with_work(interface_index, packet, nbl, cancel, now, record, work)
-        }
+        with_send_guard(send_guard, |cancelled| {
+            if cancelled {
+                Submission::Finish(Action {
+                    nbl,
+                    finish: Finish::Cancel,
+                })
+            } else if input.is_forward() {
+                e.submit_forward_with_work(interface_index, packet, nbl, now, record.take(), work)
+            } else {
+                e.submit_with_work(
+                    interface_index,
+                    packet,
+                    nbl,
+                    cancel,
+                    now,
+                    record.take(),
+                    work,
+                )
+            }
+        })
     }) {
         Submission::Pending(_) => -1,
         Submission::Finish(a) => finish_code(a.finish),

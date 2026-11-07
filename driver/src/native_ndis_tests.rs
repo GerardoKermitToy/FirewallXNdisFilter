@@ -48,6 +48,8 @@ struct State {
     adapter: usize,
     classify_result: i32,
     early_finish: Option<u32>,
+    cancel_during_classify: Option<usize>,
+    cancel_after_publish: Option<usize>,
     publishing: bool,
     pending: Vec<usize>,
     invalidated: BTreeSet<u32>,
@@ -83,6 +85,8 @@ impl Default for State {
             adapter: 0,
             classify_result: 0,
             early_finish: None,
+            cancel_during_classify: None,
+            cancel_after_publish: None,
             publishing: false,
             pending: Vec::new(),
             invalidated: BTreeSet::new(),
@@ -652,7 +656,24 @@ pub(super) mod calls {
         direction: u32,
         cancel: usize,
         session: u32,
+        guard: PVOID,
     ) -> i32 {
+        let (cancel_during_classify, adapter) =
+            state(|s| (s.cancel_during_classify.take(), s.adapter));
+        if let Some(id) = cancel_during_classify {
+            // Model cancellation on another CPU while this classifier holds
+            // the read lock and has not yet published ownership to policy.
+            state(|s| s.publishing = true);
+            unsafe { cancel_send(adapter as NDIS_HANDLE, id as PVOID) };
+            state(|s| s.publishing = false);
+        }
+        if !guard.is_null() {
+            let cancelled = unsafe { hv_send_guard_lock(guard) != 0 };
+            unsafe { hv_send_guard_unlock(guard) };
+            if cancelled {
+                return FINISH_CANCEL as i32;
+            }
+        }
         let (result, early) = state(|s| {
             assert!(s.rw_depth > 0);
             s.events
@@ -662,6 +683,12 @@ pub(super) mod calls {
             }
             (s.classify_result, s.early_finish)
         });
+        if let Some(id) = state(|s| s.cancel_after_publish.take()) {
+            assert!(result < 0 && early.is_none());
+            state(|s| s.publishing = true);
+            unsafe { cancel_send(adapter as NDIS_HANDLE, id as PVOID) };
+            state(|s| s.publishing = false);
+        }
         if let Some(finish) = early {
             // Model the userspace verdict racing publication on another CPU.
             // This CPU does not own the classifier's RW-lock acquisition.
@@ -915,6 +942,38 @@ fn early_verdict_can_complete_and_free_original_before_classify_returns() {
 }
 
 #[test]
+fn cancellation_after_publication_can_free_nbl_before_classify_returns() {
+    let f = Fixture::new();
+    let mut a = f.adapter();
+    let nbl = Box::into_raw(Box::<NET_BUFFER_LIST>::default());
+    let cancel: usize = 0xabc;
+    unsafe { (*nbl).NetBufferListInfo[NetBufferListCancelId as usize] = cancel as PVOID };
+    state(|s| {
+        s.classify_result = -1;
+        s.cancel_after_publish = Some(cancel);
+        s.free_original = true;
+    });
+    unsafe {
+        start(&mut *a);
+        send((&mut *a as *mut Adapter).cast(), nbl, 0, 0);
+        // The fake upper driver freed nbl during cancellation; do not inspect it.
+        assert_eq!(a.active, 0);
+        assert!(a.send_batches.is_null());
+        stop(&mut *a);
+    }
+    state(|s| {
+        assert_eq!(s.events.iter().filter(|event| matches!(event,
+            Event::Complete(_, status, _) if *status == HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+        )).count(), 1);
+        assert!(
+            !s.events
+                .iter()
+                .any(|event| matches!(event, Event::Send(_, _)))
+        );
+    });
+}
+
+#[test]
 fn original_receive_allow_returns_lower_and_recomputes_dispatch_flags() {
     let f = Fixture::new();
     let mut a = f.adapter();
@@ -1159,6 +1218,138 @@ fn last_send_completion_can_synchronously_pause_complete_and_detach_adapter() {
                 .count(),
             1
         )
+    });
+}
+
+#[test]
+fn send_batch_registration_unlinks_any_position() {
+    fn empty(a: *mut Adapter) -> SendBatch {
+        SendBatch {
+            adapter: a,
+            previous: null_mut(),
+            next: null_mut(),
+            remaining: null_mut(),
+            current_cancel: 0,
+            current: false,
+            cancelled: false,
+        }
+    }
+    let f = Fixture::new();
+    let mut a = f.adapter();
+    let adapter = &mut *a as *mut Adapter;
+    let mut first = empty(adapter);
+    let mut middle = empty(adapter);
+    let mut last = empty(adapter);
+    unsafe {
+        ndis_lock(addr_of_mut!((*adapter).lock));
+        register_send_batch(adapter, &mut first);
+        register_send_batch(adapter, &mut middle);
+        register_send_batch(adapter, &mut last);
+        unregister_send_batch(adapter, &mut middle);
+        assert_eq!(a.send_batches, &mut last as *mut SendBatch);
+        assert_eq!(last.next, &mut first as *mut SendBatch);
+        assert_eq!(first.previous, &mut last as *mut SendBatch);
+        unregister_send_batch(adapter, &mut last);
+        assert_eq!(a.send_batches, &mut first as *mut SendBatch);
+        assert!(first.previous.is_null());
+        unregister_send_batch(adapter, &mut first);
+        assert!(a.send_batches.is_null());
+        ndis_unlock(addr_of_mut!((*adapter).lock));
+    }
+}
+
+#[test]
+fn cancel_during_classification_aborts_current_and_matching_chain_members() {
+    let f = Fixture::new();
+    let mut a = f.adapter();
+    let mut first = Box::<NET_BUFFER_LIST>::default();
+    let mut other = Box::<NET_BUFFER_LIST>::default();
+    let mut last = Box::<NET_BUFFER_LIST>::default();
+    let mut reused = Box::<NET_BUFFER_LIST>::default();
+    let cancel = 0xabcusize;
+    first.NetBufferListInfo[NetBufferListCancelId as usize] = cancel as PVOID;
+    other.NetBufferListInfo[NetBufferListCancelId as usize] = 0xdefusize as PVOID;
+    last.NetBufferListInfo[NetBufferListCancelId as usize] = cancel as PVOID;
+    reused.NetBufferListInfo[NetBufferListCancelId as usize] = cancel as PVOID;
+    state(|s| {
+        s.classify_result = -1;
+        s.cancel_during_classify = Some(cancel);
+    });
+    unsafe {
+        packet::set_next_nbl(&mut *first, &mut *other);
+        packet::set_next_nbl(&mut *other, &mut *last);
+        start(&mut *a);
+        send((&mut *a as *mut Adapter).cast(), &mut *first, 0, 0);
+        assert_eq!(
+            first.__bindgen_anon_2.Status,
+            HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+        );
+        assert_eq!(
+            last.__bindgen_anon_2.Status,
+            HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+        );
+        assert!(first.Context.is_null());
+        assert!(last.Context.is_null());
+        assert!(!other.Context.is_null());
+        assert!((*a).send_batches.is_null());
+        assert_eq!(a.active, 1);
+
+        // A new send with the same ID, after cancellation returns, is not stale.
+        send((&mut *a as *mut Adapter).cast(), &mut *reused, 0, 0);
+        assert!(!reused.Context.is_null());
+        let pending = state(|s| core::mem::take(&mut s.pending));
+        assert_eq!(pending.len(), 2);
+        assert!(pending.contains(&((&mut *other as *mut NET_BUFFER_LIST) as usize)));
+        assert!(pending.contains(&((&mut *reused as *mut NET_BUFFER_LIST) as usize)));
+        for nbl in pending {
+            hv_finish(nbl, 0);
+        }
+        assert_eq!(a.active, 0);
+        stop(&mut *a);
+    }
+    state(|s| {
+        let aborted = s.events.iter().filter(|event| {
+            matches!(event, Event::Complete(_, status, _) if *status == HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS)
+        }).count();
+        assert_eq!(aborted, 2);
+        assert!(s.events.contains(&Event::LowerCancel(cancel)));
+    });
+}
+
+#[test]
+fn cancellation_can_free_current_and_unprocessed_nbls_inline() {
+    let f = Fixture::new();
+    let mut a = f.adapter();
+    let first = Box::into_raw(Box::<NET_BUFFER_LIST>::default());
+    let last = Box::into_raw(Box::<NET_BUFFER_LIST>::default());
+    let cancel: usize = 0x456;
+    unsafe {
+        (*first).NetBufferListInfo[NetBufferListCancelId as usize] = cancel as PVOID;
+        (*last).NetBufferListInfo[NetBufferListCancelId as usize] = cancel as PVOID;
+        packet::set_next_nbl(first, last);
+    }
+    state(|s| {
+        s.classify_result = -1;
+        s.cancel_during_classify = Some(cancel);
+        s.free_original = true;
+    });
+    unsafe {
+        start(&mut *a);
+        send((&mut *a as *mut Adapter).cast(), first, 0, 0);
+        // Both NBLs were freed by the fake upper driver; do not inspect them.
+        assert_eq!(a.active, 0);
+        assert!(a.send_batches.is_null());
+        stop(&mut *a);
+    }
+    state(|s| {
+        assert_eq!(s.events.iter().filter(|event| matches!(event,
+            Event::Complete(_, status, _) if *status == HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+        )).count(), 2);
+        assert!(
+            !s.events
+                .iter()
+                .any(|event| matches!(event, Event::Send(_, _)))
+        );
     });
 }
 

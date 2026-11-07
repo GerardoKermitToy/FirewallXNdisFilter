@@ -23,6 +23,41 @@ use tests::calls as policy;
 mod tests;
 
 const MAX_STAGING_ATTEMPTS: u32 = 8;
+const FINISH_CANCEL: u32 = 2;
+
+// A send callback owns this stack node until it has processed its whole chain.
+// The adapter lock protects the list, the unprocessed NBL links, and the
+// current classification's cancellation flag. Published NBLs are never kept
+// here: policy owns them and an early verdict may already have freed them.
+pub(super) struct SendBatch {
+    adapter: *mut Adapter,
+    previous: *mut SendBatch,
+    next: *mut SendBatch,
+    remaining: PNET_BUFFER_LIST,
+    current_cancel: usize,
+    current: bool,
+    cancelled: bool,
+}
+
+// Policy calls these only while holding PolicyLock. Cancellation never takes
+// PolicyLock while holding the adapter lock, so publication and cancellation
+// are serialized without completing NBLs under either lock.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn hv_send_guard_lock(guard: *mut core::ffi::c_void) -> u32 {
+    unsafe {
+        let batch = guard.cast::<SendBatch>();
+        ndis_lock(addr_of_mut!((*(*batch).adapter).lock));
+        u32::from((*batch).cancelled)
+    }
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn hv_send_guard_unlock(guard: *mut core::ffi::c_void) {
+    unsafe {
+        let batch = guard.cast::<SendBatch>();
+        ndis_unlock(addr_of_mut!((*(*batch).adapter).lock));
+    }
+}
 
 /// Choose the greatest supported runtime, rather than advertising the build
 /// machine's WDK version on an older NDIS runtime.
@@ -339,7 +374,7 @@ pub(super) unsafe extern "C" fn hv_finish(nbl_address: usize, finish: u32) {
         packet::free_packet_context(nbl);
         if send {
             let lso_complete = complete_local_lso(nbl);
-            (*nbl).__bindgen_anon_2.Status = if finish == 2 {
+            (*nbl).__bindgen_anon_2.Status = if finish == FINISH_CANCEL {
                 HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
             } else if !lso_complete {
                 HV_WDK_NDIS_RESOURCES as NDIS_STATUS
@@ -356,6 +391,61 @@ pub(super) unsafe extern "C" fn hv_finish(nbl_address: usize, finish: u32) {
     }
 }
 
+unsafe fn register_send_batch(a: *mut Adapter, batch: *mut SendBatch) {
+    unsafe {
+        (*batch).next = (*a).send_batches;
+        if !(*batch).next.is_null() {
+            (*(*batch).next).previous = batch;
+        }
+        (*a).send_batches = batch;
+    }
+}
+
+unsafe fn unregister_send_batch(a: *mut Adapter, batch: *mut SendBatch) {
+    unsafe {
+        if !(*batch).remaining.is_null() || (*batch).current {
+            hv_bugcheck();
+        }
+        let previous = (*batch).previous;
+        let next = (*batch).next;
+        if previous.is_null() {
+            if (*a).send_batches != batch {
+                hv_bugcheck();
+            }
+            (*a).send_batches = next;
+        } else {
+            if (*previous).next != batch {
+                hv_bugcheck();
+            }
+            (*previous).next = next;
+        }
+        if !next.is_null() {
+            if (*next).previous != batch {
+                hv_bugcheck();
+            }
+            (*next).previous = previous;
+        }
+    }
+}
+
+unsafe fn next_send(batch: *mut SendBatch) -> PNET_BUFFER_LIST {
+    unsafe {
+        let a = (*batch).adapter;
+        ndis_lock(addr_of_mut!((*a).lock));
+        let original = (*batch).remaining;
+        if !original.is_null() {
+            (*batch).remaining = packet::next_nbl(original);
+            packet::set_next_nbl(original, null_mut());
+            (*batch).current_cancel =
+                (*original).NetBufferListInfo[NetBufferListCancelId as usize] as usize;
+            (*batch).current = true;
+            (*batch).cancelled = false;
+        }
+        ndis_unlock(addr_of_mut!((*a).lock));
+        original
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn classify_chain(
     a: *mut Adapter,
@@ -366,13 +456,24 @@ unsafe fn classify_chain(
     resources: bool,
     admitted: bool,
     session: bool,
+    batch: *mut SendBatch,
 ) {
     unsafe {
-        while !chain.is_null() {
-            let original = chain;
-            chain = packet::next_nbl(original);
-            if !resources {
-                packet::set_next_nbl(original, null_mut());
+        loop {
+            let original = if batch.is_null() {
+                let original = chain;
+                if !original.is_null() {
+                    chain = packet::next_nbl(original);
+                    if !resources {
+                        packet::set_next_nbl(original, null_mut());
+                    }
+                }
+                original
+            } else {
+                next_send(batch)
+            };
+            if original.is_null() {
+                break;
             }
             let mut nbl = null_mut();
             let mut result = 1;
@@ -394,14 +495,26 @@ unsafe fn classify_chain(
                         direction,
                         cancel,
                         u32::from(session),
+                        batch.cast(),
                     );
                 }
                 api::NdisReleaseRWLock((*a).classification_lock, &mut state);
             }
+            let cancelled = if batch.is_null() {
+                false
+            } else {
+                ndis_lock(addr_of_mut!((*a).lock));
+                let cancelled = (*batch).cancelled;
+                (*batch).current = false;
+                ndis_unlock(addr_of_mut!((*a).lock));
+                cancelled
+            };
             if nbl.is_null() {
                 policy::HvResourceDrop();
                 if direction == SEND {
-                    (*original).__bindgen_anon_2.Status = if admitted {
+                    (*original).__bindgen_anon_2.Status = if cancelled {
+                        HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+                    } else if admitted {
                         HV_WDK_NDIS_RESOURCES as NDIS_STATUS
                     } else {
                         HV_WDK_NDIS_PAUSED as NDIS_STATUS
@@ -415,7 +528,12 @@ unsafe fn classify_chain(
                     api::NdisFReturnNetBufferLists((*a).filter, original, return_flags());
                 }
             } else if result >= 0 {
-                hv_finish(nbl as usize, result as u32);
+                let finish = if cancelled && result != 0 {
+                    FINISH_CANCEL
+                } else {
+                    result as u32
+                };
+                hv_finish(nbl as usize, finish);
             }
             // For a negative result only the pointer value was compared above.
             // An early verdict may already have freed the NBL and its context.
@@ -431,8 +549,36 @@ pub(super) unsafe extern "C" fn send(
 ) {
     unsafe {
         let a = context.cast::<Adapter>();
-        let (admitted, session) = begin_io(a);
-        classify_chain(a, chain, port, flags, SEND, false, admitted, session);
+        let mut batch = SendBatch {
+            adapter: a,
+            previous: null_mut(),
+            next: null_mut(),
+            remaining: chain,
+            current_cancel: 0,
+            current: false,
+            cancelled: false,
+        };
+        let batch = addr_of_mut!(batch);
+        let session = api::ExAcquireRundownProtection(addr_of_mut!(CLASSIFICATION_RUNDOWN)) != 0;
+        ndis_lock(addr_of_mut!((*a).lock));
+        let admitted = (*a).running != 0;
+        retain_active_locked(a);
+        register_send_batch(a, batch);
+        ndis_unlock(addr_of_mut!((*a).lock));
+        classify_chain(
+            a,
+            null_mut(),
+            port,
+            flags,
+            SEND,
+            false,
+            admitted,
+            session,
+            batch,
+        );
+        ndis_lock(addr_of_mut!((*a).lock));
+        unregister_send_batch(a, batch);
+        ndis_unlock(addr_of_mut!((*a).lock));
         end_io(a, session);
     }
 }
@@ -470,10 +616,52 @@ pub(super) unsafe extern "C" fn send_complete(
 pub(super) unsafe extern "C" fn cancel_send(context: NDIS_HANDLE, cancel: PVOID) {
     unsafe {
         let a = context.cast::<Adapter>();
+        let mut cancelled = null_mut();
+        let mut tail: PNET_BUFFER_LIST = null_mut();
         ndis_lock(addr_of_mut!((*a).lock));
         retain_active_locked(a);
+        let mut batch = (*a).send_batches;
+        while !batch.is_null() {
+            if (*batch).current && (*batch).current_cancel == cancel as usize {
+                (*batch).cancelled = true;
+            }
+            let mut previous: PNET_BUFFER_LIST = null_mut();
+            let mut nbl = (*batch).remaining;
+            while !nbl.is_null() {
+                let next = packet::next_nbl(nbl);
+                if ptr::eq(
+                    (*nbl).NetBufferListInfo[NetBufferListCancelId as usize],
+                    cancel,
+                ) {
+                    if previous.is_null() {
+                        (*batch).remaining = next;
+                    } else {
+                        packet::set_next_nbl(previous, next);
+                    }
+                    packet::set_next_nbl(nbl, null_mut());
+                    if tail.is_null() {
+                        cancelled = nbl;
+                    } else {
+                        packet::set_next_nbl(tail, nbl);
+                    }
+                    tail = nbl;
+                } else {
+                    previous = nbl;
+                }
+                nbl = next;
+            }
+            batch = (*batch).next;
+        }
         ndis_unlock(addr_of_mut!((*a).lock));
         policy::HvCancel((*a).interface_index, cancel as usize);
+        while !cancelled.is_null() {
+            let nbl = cancelled;
+            cancelled = packet::next_nbl(nbl);
+            packet::set_next_nbl(nbl, null_mut());
+            let _ = complete_local_lso(nbl);
+            (*nbl).__bindgen_anon_2.Status = HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS;
+            api::NdisFSendNetBufferListsComplete((*a).filter, nbl, send_complete_flags());
+        }
         api::NdisFCancelSendNetBufferLists((*a).filter, cancel);
         release_active(a, 1);
     }
@@ -498,6 +686,7 @@ pub(super) unsafe extern "C" fn receive(
             flags & NDIS_RECEIVE_FLAGS_RESOURCES != 0,
             admitted,
             session,
+            null_mut(),
         );
         end_io(a, session);
     }

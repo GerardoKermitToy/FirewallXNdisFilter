@@ -4,7 +4,7 @@
 extern crate std;
 
 use self::std::{
-    alloc::{Layout, alloc, alloc_zeroed, dealloc},
+    alloc::{Layout, alloc, dealloc},
     boxed::Box,
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
@@ -82,15 +82,20 @@ pub(super) mod calls {
     use super::*;
 
     pub(crate) unsafe fn ExAllocatePool2(flags: POOL_FLAGS, bytes: SIZE_T, tag: ULONG) -> PVOID {
-        assert_eq!(flags, FWX_WDK_POOL_FLAG_NON_PAGED as POOL_FLAGS);
+        assert_eq!(
+            flags,
+            (FWX_WDK_POOL_FLAG_NON_PAGED | FWX_WDK_POOL_FLAG_UNINITIALIZED) as POOL_FLAGS
+        );
         assert_eq!(tag, TAG);
         assert!(bytes > 0);
         if fail() {
             return null_mut();
         }
         let layout = Layout::from_size_align(bytes as usize, 16).unwrap();
-        let pointer = unsafe { alloc_zeroed(layout) };
+        let pointer = unsafe { alloc(layout) };
         assert!(!pointer.is_null());
+        // Detect any bytes exposed before the receive copy initializes them.
+        unsafe { ptr::write_bytes(pointer, 0xa5, bytes as usize) };
         state(|s| assert!(s.pools.insert(pointer as usize, layout).is_none()));
         pointer.cast()
     }
@@ -618,6 +623,31 @@ fn receive_copy_deep_copies_all_nbs_preserves_scalar_oob_and_original_offsets() 
 }
 
 #[test]
+fn receive_copy_fully_overwrites_uninitialized_pool_for_contiguous_and_split_mdl() {
+    for length in [1usize, 2, 64, 1500, 65_535] {
+        reset(None);
+        let data = vec![0; length];
+        let mid = length / 2;
+        let mut inputs = [
+            Input::new(&[&data], 0, length as u32),
+            Input::new(&[&data[..mid], &data[mid..]], 0, length as u32),
+        ];
+        let mut original = source(&mut inputs);
+        unsafe {
+            let copied = copy(&mut original);
+            assert!(!copied.is_null());
+            let first = first_nb(copied);
+            let second = next_nb(first);
+            assert_eq!(bytes(first), data.as_slice(), "contiguous length {length}");
+            assert_eq!(bytes(second), data.as_slice(), "split length {length}");
+            assert!(next_nb(second).is_null());
+            free_receive_copy(copied);
+        }
+        assert_no_leaks();
+    }
+}
+
+#[test]
 fn split_wrapper_uses_cloned_descriptors_and_rejects_opaque_send_metadata() {
     reset(None);
     let mut inputs = [Input::new(&[b"abcdef"], 0, 6)];
@@ -756,6 +786,19 @@ fn data_view_failures_clean_partial_copy_exactly_once() {
     assert!(!copy.is_null());
     state(|s| assert_eq!(s.attempts, 13));
     unsafe { free_receive_copy(copy) };
+    assert_no_leaks();
+}
+
+#[test]
+fn partially_filled_receive_storage_is_freed_on_data_view_failure() {
+    reset(None);
+    let mut inputs = [Input::new(&[b"abc"], 0, 3), Input::new(&[b"xy"], 0, 4)];
+    let mut original = source(&mut inputs);
+    // The second MDL chain is shorter than its declared length: the fake NDIS
+    // call copies two bytes to storage, then fails before the NB is published.
+    assert!(unsafe { copy(&mut original) }.is_null());
+    assert_eq!(inputs[0].data[0].as_ref(), b"abc");
+    assert_eq!(inputs[1].data[0].as_ref(), b"xy");
     assert_no_leaks();
 }
 

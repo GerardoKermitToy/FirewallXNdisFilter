@@ -403,8 +403,9 @@ pub(crate) unsafe fn copy_receive(
                 free_receive_copy(copy);
                 return null_mut();
             }
+            // The entire allocation is filled below before it is exposed by an NB.
             let storage = crate::native::pool_allocation(api::ExAllocatePool2(
-                FWX_WDK_POOL_FLAG_NON_PAGED as POOL_FLAGS,
+                (FWX_WDK_POOL_FLAG_NON_PAGED | FWX_WDK_POOL_FLAG_UNINITIALIZED) as POOL_FLAGS,
                 length as SIZE_T,
                 TAG,
             ));

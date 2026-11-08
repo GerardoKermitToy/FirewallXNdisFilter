@@ -1,12 +1,12 @@
-# HyperVXNdisFilter monitor
+# FirewallXNdisFilter monitor
 
-Standalone C++20 monitor/client library for the Rust NDIS LWF on compatible physical and virtual host Ethernet adapters. The kernel image is **`HyperVXNdisFilter.sys`**; service/device names are `HyperVXNdisFilter`, and startup notification is `Global\HyperVXNdisFilter.DriverReady`. These names and the header-only namespace were renamed together; older-name aliases are not provided. It keeps the familiar `pmkext::Driver`, `Handlers`, verdict values and direct device access, without depending on a Portmaster source tree at build/run time. The 0.3.3.0 Connection API carries the host adapter `interface_index` immediately after `id`, without a process ID, and preserves complete IP packets.
+Standalone C++20 monitor/client library for the Rust NDIS LWF on compatible physical and virtual host Ethernet adapters. The kernel image is **`FirewallXNdisFilter.sys`**; service/device names are `FirewallXNdisFilter`, and startup notification is `Global\FirewallXNdisFilter.DriverReady`. These names and the header-only namespace were renamed together; older-name aliases are not provided. It keeps the familiar `pmkext::Driver`, `Handlers`, verdict values and direct device access, without depending on a Portmaster source tree at build/run time. The 0.3.3.0 Connection API carries the host adapter `interface_index` immediately after `id`, without a process ID, and preserves complete IP packets.
 
 ## Header-only callback client
 
-[HyperVXNdisFilter.hpp](include/HyperVXNdisFilter.hpp) is an independent C++20 Windows x64 client in namespace **`hypervxndisfilter`**, not `pmkext`. It needs no monitor sources or client library. MSVC automatically links its system Advapi32 dependency; other toolchains must link Advapi32 explicitly. Full method/type contracts are in the root [API reference](../README.md#lightweight-header-only-client).
+[FirewallXNdisFilter.hpp](include/FirewallXNdisFilter.hpp) is an independent C++20 Windows x64 client in namespace **`firewallxndisfilter`**, not `pmkext`. It needs no monitor sources or client library. MSVC automatically links its system Advapi32 dependency; other toolchains must link Advapi32 explicitly. Full method/type contracts are in the root [API reference](../README.md#lightweight-header-only-client).
 
-`Client::Open()` waits **without a startup timeout** for `Global\HyperVXNdisFilter.DriverReady` after an open failure, except `ERROR_SHARING_VIOLATION`, which returns immediately even after a startup notification. Releasing another controller is not a startup signal; retrying a busy device is the caller's responsibility. The protected manual-reset event is reset before retrying to avoid stale signals and lost wakeups. Stop cancels the wait; there is no device polling. Once opened, `Run(callbacks, duration_ms)` uses the calling thread, blocking on data/stop/deadline; it creates no worker/poll thread of its own. There are no automatic statistics requests or verdicts. `on_connection_v4/v6` receive packed fixed-header and complete-IP payload pointers directly into the input buffer; `on_bandwidth_v4/v6` receive `(context, protocol, interface_index, entries, count)`, borrowing the entire packed tuple array in one call. No normalized event structures are rebuilt or individual entries/payloads allocated/copied; receive storage grows fallibly for larger bandwidth groups and is reused. All callback pointers/views expire on callback return. A head/tail cursor defers partial-frame compaction until writable space is short. Stop then join all callers before Close/destruction. An optional Run duration does not limit Open's startup wait.
+`Client::Open()` waits **without a startup timeout** for `Global\FirewallXNdisFilter.DriverReady` after an open failure, except `ERROR_SHARING_VIOLATION`, which returns immediately even after a startup notification. Releasing another controller is not a startup signal; retrying a busy device is the caller's responsibility. The protected manual-reset event is reset before retrying to avoid stale signals and lost wakeups. Stop cancels the wait; there is no device polling. Once opened, `Run(callbacks, duration_ms)` uses the calling thread, blocking on data/stop/deadline; it creates no worker/poll thread of its own. There are no automatic statistics requests or verdicts. `on_connection_v4/v6` receive packed fixed-header and complete-IP payload pointers directly into the input buffer; `on_bandwidth_v4/v6` receive `(context, protocol, interface_index, entries, count)`, borrowing the entire packed tuple array in one call. No normalized event structures are rebuilt or individual entries/payloads allocated/copied; receive storage grows fallibly for larger bandwidth groups and is reused. All callback pointers/views expire on callback return. A head/tail cursor defers partial-frame compaction until writable space is short. Stop then join all callers before Close/destruction. An optional Run duration does not limit Open's startup wait.
 
 The pointer callbacks replace the former unified `Connection` / `Bandwidth` callbacks in this header only. Fixed layouts have one-byte alignment and compile-time size/offset checks; read numeric fields by value, without taking naturally aligned integer pointers/references to them. Both this header and the separate `pmkext` API expose `interface_index:u32` immediately after `id:u64` and require driver wire version **0.3.3.0**. It is the host adapter index (`BaseMiniportIfIndex`), retained per attached module, not a guest interface or compartment ID. Packed ConnectionV4/V6 headers are 27/51 bytes. BandwidthV4/V6 entries remain 28/52 bytes; the shared interface index is in the group header, not repeated per entry. In pmkext it is `BandwidthStats::interface_index`. Do not mix older SYS/client generations.
 
@@ -22,9 +22,9 @@ cmake --build C:\hyperv\monitor\build --config Release --parallel
 ctest --test-dir C:\hyperv\monitor\build -C Release --output-on-failure -L no-driver
 ```
 
-For Visual Studio 2022 use `-G "Visual Studio 17 2022"`. Alternatively configure with Ninja from an x64 VS developer shell and add `-DCMAKE_BUILD_TYPE=Release`; the executable then appears directly in the build directory. A parent build can configure this CMake project without building a driver. Targets include `hyperv_monitor`, `pmkext`, and `hyperv_xndis_filter_notify` (the separate NetCfg binding-policy DLL, built but never registered by CMake).
+For Visual Studio 2022 use `-G "Visual Studio 17 2022"`. Alternatively configure with Ninja from an x64 VS developer shell and add `-DCMAKE_BUILD_TYPE=Release`; the executable then appears directly in the build directory. A parent build can configure this CMake project without building a driver. Targets include `firewallx_monitor`, `pmkext`, and `firewallx_ndis_filter_notify` (the separate NetCfg binding-policy DLL, built but never registered by CMake).
 
-With the VS generator the executable is `build\Release\hyperv_monitor.exe`. It deliberately uses an **as-invoker** manifest so `--help` and invalid-CLI tests need neither elevation nor a device. Actual device access still requires elevated Administrator/SYSTEM because of the driver's device ACL.
+With the VS generator the executable is `build\Release\firewallx_monitor.exe`. It deliberately uses an **as-invoker** manifest so `--help` and invalid-CLI tests need neither elevation nor a device. Actual device access still requires elevated Administrator/SYSTEM because of the driver's device ACL.
 
 All MSVC targets, including static libraries, standalone header-client examples, setup tools and offline tests, compile with `/Zi`; EXE/DLL links use `/DEBUG:FULL` and `/PDBALTPATH:%_PDB%`. Release optimizations are preserved. Linker PDBs go to the build root (the configuration subdirectory with the VS generator), and the main package build copies the product PDBs to `dist/` alongside their binaries.
 
@@ -36,7 +36,7 @@ CTest registers **only no-driver tests**: exact IPv4/IPv6/event/command codecs a
 
 An NDIS LWF is a NetCfg network component, not a legacy demand-start service. Install explicitly using the native `dist/Install.exe`, which enables the filter's eligible NetCfg binding paths on compatible Ethernet adapters. Adapters that do not expose an eligible path, including Wintun/WireGuard, are not covered. Use `Install.exe --enable` to resume after a requested reboot and `Uninstall.exe` for removal. The older ICS-only `Set-Binding.ps1` helper is retired and does not change bindings. Setup EXEs do not launch PowerShell/netcfg.exe. The monitor does not install, start or bind a driver.
 
-`Driver::Open()` opens the existing `\\.\HyperVXNdisFilter` device only; it does not start an IPC server. `Driver::Install(...)` keeps its old signature but returns a descriptive **not supported** error without touching SCM or registry state. `Stop()` sends the existing shutdown IOCTL to end the device session and release pending packets; `Cleanup()` closes handles. Neither disables, uninstalls or unloads the LWF.
+`Driver::Open()` opens the existing `\\.\FirewallXNdisFilter` device only; it does not start an IPC server. `Driver::Install(...)` keeps its old signature but returns a descriptive **not supported** error without touching SCM or registry state. `Stop()` sends the existing shutdown IOCTL to end the device session and release pending packets; `Cleanup()` closes handles. Neither disables, uninstalls or unloads the LWF.
 
 `Driver::GetFilteredDeviceCount(uint32_t& out, std::string& error)` queries the number of running NDIS filter modules, not installed/enabled bindings. The monitor prints `Filtered network devices: N (running NDIS modules)` at startup and on changes, querying at `--poll` intervals (default 1000 ms). Status lines use `--out`/`--timestamps`. Paused or detached modules do not count; a loaded driver can report zero. This is an instantaneous interception-state snapshot, not a traffic or connectivity test. Unsupported/failed queries produce a warning, not a fabricated zero, and subsequent polls retry without stopping monitoring.
 
@@ -50,20 +50,20 @@ A positive `--duration N` limits the monitoring phase. Zero/negative/junk durati
 
 ```powershell
 # Help only: no device access.
-.\build\Release\hyperv_monitor.exe --help
+.\build\Release\firewallx_monitor.exe --help
 
 # Runtime examples only; require an explicitly installed/bound LWF,
 # elevation, and separate permission to run against live host-vNIC traffic.
-.\build\Release\hyperv_monitor.exe  # Interactive: wait for startup, then Ctrl+C exits.
-.\build\Release\hyperv_monitor.exe --duration 10 --only-logs
-.\build\Release\hyperv_monitor.exe --duration 30 --out run.log --timestamps --payload
-.\build\Release\hyperv_monitor.exe --duration 30 --filter-protocol 17
-.\build\Release\hyperv_monitor.exe --duration 30 --verdict block --match 192.0.2.10:53
+.\build\Release\firewallx_monitor.exe  # Interactive: wait for startup, then Ctrl+C exits.
+.\build\Release\firewallx_monitor.exe --duration 10 --only-logs
+.\build\Release\firewallx_monitor.exe --duration 30 --out run.log --timestamps --payload
+.\build\Release\firewallx_monitor.exe --duration 30 --filter-protocol 17
+.\build\Release\firewallx_monitor.exe --duration 30 --verdict block --match 192.0.2.10:53
 ```
 
 Supported options include `--out`, `--filter-ip IP[:PORT]` (`[IPv6]:PORT` for IPv6), `--filter-protocol`, `--match`, `--verdict`, `--no-verdicts`, `--payload`, `--poll`, `--timestamps`, `--memory-stats` and `--verdict-delay-ms`. `--only-logs`, `--no-conn` and `--no-bandwidth` are retained. Numeric values and ports are validated without truncation or wrapping. Display filters combine with AND, never change verdicts, and IP/port pairs must match the same endpoint. `--match` selects the normalized `remote` endpoint reported by the driver in both directions on every interface; the console does not reverse direction, endpoints or bandwidth counters based on interface roles.
 
-Duration/console-stop checks run at most 100 ms apart regardless of a longer `--poll`. Device I/O is joined before closing the controller. The monitor singleton is `Global\HyperVXNdisFilterMonitor.Singleton`.
+Duration/console-stop checks run at most 100 ms apart regardless of a longer `--poll`. Device I/O is joined before closing the controller. The monitor singleton is `Global\FirewallXNdisFilterMonitor.Singleton`.
 
 ## Wire format and NDIS semantics
 
@@ -100,7 +100,7 @@ These are independent copies/adaptations of the local `C:\portmaster_v3` source 
 * `kext_client\src\PortmasterKext.cpp`, `main.cpp`;
 * `kext_client\tests\ip_address_tests.cpp`, `delayed_verdict_tests.cpp`, `record_output_tests.cpp`;
 
-`DriverProtocol.*`, `MonitorOptions.*`, standalone CMake wiring and new codec/CLI tests were added during the HyperVXNdisFilter adaptation. The copied client's SCM lifecycle, PID suspension, thread-ID IOCTL and redirect support were removed/disabled; the monitor does not load a driver. The monitor has no winrpc source, include, target or link dependency; the unused sibling sources are not built. No monitor source path points back to the original repository.
+`DriverProtocol.*`, `MonitorOptions.*`, standalone CMake wiring and new codec/CLI tests were added during the FirewallXNdisFilter adaptation. The copied client's SCM lifecycle, PID suspension, thread-ID IOCTL and redirect support were removed/disabled; the monitor does not load a driver. The monitor has no winrpc source, include, target or link dependency; the unused sibling sources are not built. No monitor source path points back to the original repository.
 
 The original repository's **GNU GPL version 3** license is preserved verbatim as `LICENSE`; this adaptation retains that license. Source provenance does not imply that the original WFP driver's lifecycle or host process semantics apply to a host-adapter NDIS LWF.
 

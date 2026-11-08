@@ -1,8 +1,8 @@
-use hyperv_policy::{
+use firewallx_policy::{
     engine::{Engine, Finish, Submission, allocate_record},
     packet::{self, NdisPath, Packet, SNAPSHOT},
 };
-use hyperv_protocol::{MAX_PAYLOAD, MAX_RECORD, Verdict, connection_header_len};
+use firewallx_protocol::{MAX_PAYLOAD, MAX_RECORD, Verdict, connection_header_len};
 
 fn frame(ipv6: bool, vlans: usize, ip_len: usize, offload: bool) -> Vec<u8> {
     let l2 = 14 + vlans * 4;

@@ -6,8 +6,8 @@
 #include <iphlpapi.h>
 #include <netioapi.h>
 
-namespace hyperv_xndis_filter {
-inline constexpr wchar_t kConfigKey[] = L"SOFTWARE\\HyperVXNdisFilter\\Lwf";
+namespace firewallx_ndis_filter {
+inline constexpr wchar_t kConfigKey[] = L"SOFTWARE\\FirewallXNdisFilter\\Lwf";
 // Version 4 deliberately cannot be confused with the older ICS allowlist.
 // While armed, the standard Ethernet LWF may bind newly enabled paths too.
 inline constexpr DWORD kBindingConfigVersion = 4;

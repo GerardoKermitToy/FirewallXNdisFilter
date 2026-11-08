@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <utility>
 
-using namespace hyperv_xndis_filter::setup;
+using namespace firewallx_ndis_filter::setup;
 namespace {
 
 void Require(bool value, const char* message = "assertion failed") {
@@ -239,7 +239,7 @@ int main() {
             Throws([&] { ValidateBindings({{target.guid, true}}, {target}, true); }, L"unexpectedly enabled");
             Throws([&] { ValidateBindings({{target.guid, true}, {foreign_guid, true}}, {target}, false); }, L"unexpectedly enabled");
             Throws([&] { ValidateBindings({{target.guid, true}, {target.guid, false}}, {target}, false, true); }, L"did not enable");
-            Throws([&] { ValidateBindings({{foreign_guid, false}}, {target}, false); }, L"No HyperVXNdisFilter binding");
+            Throws([&] { ValidateBindings({{foreign_guid, false}}, {target}, false); }, L"No FirewallXNdisFilter binding");
             Throws([&] { ValidateBindings({{GUID_NULL, false}}, {target}, false); }, L"ambiguous");
         }},
         {"binding snapshot rejects duplicate identities but has no two-adapter quota", [] {
@@ -327,7 +327,7 @@ int main() {
         {"both adapters require paths and reject an enabled foreign path", [] {
             const Targets targets{Target(), WslTarget()};
             ValidateBindings({{target_guid, true}, {wsl_guid, true}, {foreign_guid, false}}, targets, false, true);
-            Throws([&] { ValidateBindings({{target_guid, false}}, targets, false); }, L"No HyperVXNdisFilter binding");
+            Throws([&] { ValidateBindings({{target_guid, false}}, targets, false); }, L"No FirewallXNdisFilter binding");
             Throws([&] { ValidateBindings({{target_guid, true}, {wsl_guid, false}}, targets, false, true); }, L"did not enable");
             Throws([&] { ValidateBindings({{target_guid, true}, {wsl_guid, true}, {foreign_guid, true}}, targets, false); }, L"unexpectedly enabled");
         }},

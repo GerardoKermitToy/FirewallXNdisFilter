@@ -8,13 +8,13 @@
 #include <string>
 #include <vector>
 
-namespace hyperv_xndis_filter::setup {
+namespace firewallx_ndis_filter::setup {
 
 inline constexpr int kRebootRequired = ERROR_SUCCESS_REBOOT_REQUIRED;
 // Coherent driver-store package for the PID-free, full-packet, blocking-read 0.3.3.0 API.
 inline constexpr wchar_t kPackageVersion[] = L"0.3.3.0";
-inline constexpr wchar_t kDriverFileName[] = L"HyperVXNdisFilter.sys";
-inline constexpr wchar_t kServiceName[] = L"HyperVXNdisFilter";
+inline constexpr wchar_t kDriverFileName[] = L"FirewallXNdisFilter.sys";
+inline constexpr wchar_t kServiceName[] = L"FirewallXNdisFilter";
 
 enum class Action { Install, Enable, Uninstall };
 enum class Change { Complete, RebootRequired };
@@ -88,4 +88,4 @@ std::unique_ptr<System> CreateWindowsSystem();
 std::filesystem::path ExecutableDirectory();
 void WriteText(const std::wstring& text, bool error = false);
 
-} // namespace hyperv_xndis_filter::setup
+} // namespace firewallx_ndis_filter::setup

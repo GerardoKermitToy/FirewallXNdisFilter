@@ -16,7 +16,7 @@ mod cache;
 #[path = "../src/bandwidth.rs"]
 mod driver_bandwidth;
 
-use hyperv_protocol::{
+use firewallx_protocol::{
     BandwidthEntry, Connection, Direction, bandwidth_entry_len, bandwidth_record_len,
     encode_bandwidth_entry,
 };

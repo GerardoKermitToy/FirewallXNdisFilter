@@ -12,10 +12,10 @@
 #include <iostream>
 #include <algorithm>
 
-namespace hyperv_xndis_filter::setup {
+namespace firewallx_ndis_filter::setup {
 namespace {
 
-constexpr wchar_t kServiceKey[] = L"SYSTEM\\CurrentControlSet\\Services\\HyperVXNdisFilter";
+constexpr wchar_t kServiceKey[] = L"SYSTEM\\CurrentControlSet\\Services\\FirewallXNdisFilter";
 
 class Network {
 public:
@@ -25,7 +25,7 @@ public:
             if (writable_) {
                 Check(config.As(&lock_), L"Get NetCfg write lock");
                 CoString holder;
-                const HRESULT result = lock_->AcquireWriteLock(15000, L"HyperVXNdisFilter console setup", &holder.value);
+                const HRESULT result = lock_->AcquireWriteLock(15000, L"FirewallXNdisFilter console setup", &holder.value);
                 if (result != S_OK) {
                     throw Error{L"NetCfg write lock is unavailable" +
                                 (holder.value ? L" (held by " + std::wstring(holder.value) + L")" : std::wstring{}) +
@@ -42,7 +42,7 @@ public:
     ~Network() { Close(); }
 
     void Refresh(bool cancel = false) {
-        if (cancel) Check(config->Cancel(), L"Discard pending HyperVXNdisFilter NetCfg changes");
+        if (cancel) Check(config->Cancel(), L"Discard pending FirewallXNdisFilter NetCfg changes");
         Check(config->Uninitialize(), L"Refresh NetCfg session");
         initialized_ = false;
         Initialize();
@@ -60,7 +60,7 @@ public:
     ComPtr<INetCfgComponent> Component() {
         ComPtr<INetCfgComponent> component;
         const HRESULT result = config->FindComponent(kComponentId, &component);
-        Check(result, L"Find HyperVXNdisFilter component");
+        Check(result, L"Find FirewallXNdisFilter component");
         if (result != S_OK && result != S_FALSE) throw Error{L"Unexpected NetCfg component lookup result."};
         if (!component) {
             const HRESULT identity = CheckFilterIdentityAvailable(config.Get());
@@ -102,18 +102,18 @@ struct Path {
 
 std::vector<Path> Paths(Network& network) {
     auto component = network.Component();
-    if (!component) throw Error{L"The HyperVXNdisFilter component is not installed."};
+    if (!component) throw Error{L"The FirewallXNdisFilter component is not installed."};
     GUID filter_instance{}, component_class{};
-    Check(component->GetInstanceGuid(&filter_instance), L"Read HyperVXNdisFilter instance GUID");
-    Check(component->GetClassGuid(&component_class), L"Read HyperVXNdisFilter component class");
+    Check(component->GetInstanceGuid(&filter_instance), L"Read FirewallXNdisFilter instance GUID");
+    Check(component->GetClassGuid(&component_class), L"Read FirewallXNdisFilter component class");
     if (filter_instance != kFilterInstanceId || component_class != GUID_DEVCLASS_NETSERVICE) {
-        throw Error{L"The installed component is not the expected HyperVXNdisFilter LWF instance."};
+        throw Error{L"The installed component is not the expected FirewallXNdisFilter LWF instance."};
     }
     ComPtr<INetCfgComponentBindings> bindings;
-    Check(component.As(&bindings), L"Get HyperVXNdisFilter bindings");
+    Check(component.As(&bindings), L"Get FirewallXNdisFilter bindings");
     ComPtr<IEnumNetCfgBindingPath> enumerator;
-    Check(bindings->EnumBindingPaths(EBP_BELOW, &enumerator), L"Enumerate HyperVXNdisFilter binding paths");
-    if (!enumerator) throw Error{L"Missing HyperVXNdisFilter binding path enumerator."};
+    Check(bindings->EnumBindingPaths(EBP_BELOW, &enumerator), L"Enumerate FirewallXNdisFilter binding paths");
+    if (!enumerator) throw Error{L"Missing FirewallXNdisFilter binding path enumerator."};
     std::vector<GUID> adapter_instances;
     Check(ReadBindingAdapterInventory(network.config.Get(), adapter_instances), L"Read NetCfg/NETIO adapter inventory");
     std::vector<Path> paths;
@@ -122,12 +122,12 @@ std::vector<Path> Paths(Network& network) {
         ULONG fetched = 0;
         HRESULT result = enumerator->Next(1, &entry.path, &fetched);
         if (result == S_FALSE && fetched == 0 && !entry.path) break;
-        Check(result, L"Read HyperVXNdisFilter binding path");
+        Check(result, L"Read FirewallXNdisFilter binding path");
         if (result != S_OK || fetched != 1 || !entry.path) throw Error{L"Invalid NetCfg binding path."};
         result = entry.path->IsEnabled();
         if (result != S_OK && result != S_FALSE) {
-            Check(result, L"Read HyperVXNdisFilter binding state");
-            throw Error{L"Unexpected HyperVXNdisFilter binding state."};
+            Check(result, L"Read FirewallXNdisFilter binding state");
+            throw Error{L"Unexpected FirewallXNdisFilter binding state."};
         }
         entry.binding.enabled = result == S_OK;
         BindingPathIdentity identity;
@@ -144,7 +144,7 @@ std::vector<Path> Paths(Network& network) {
         }
         Check(inspected, context.c_str());
         if (!identity.owns_path || identity.adapters != 1 || identity.adapter == GUID_NULL) {
-            throw Error{L"HyperVXNdisFilter binding path does not resolve to exactly one adapter. No binding will be guessed."};
+            throw Error{L"FirewallXNdisFilter binding path does not resolve to exactly one adapter. No binding will be guessed."};
         }
         entry.binding.adapter = identity.adapter;
         paths.push_back(std::move(entry));
@@ -154,7 +154,7 @@ std::vector<Path> Paths(Network& network) {
 
 Change Applied(Network& network, HRESULT operation) {
     const HRESULT result = network.config->Apply();
-    Check(result, L"Apply HyperVXNdisFilter NetCfg changes");
+    Check(result, L"Apply FirewallXNdisFilter NetCfg changes");
     const bool reboot = result == NETCFG_S_REBOOT || operation == NETCFG_S_REBOOT;
     network.Refresh();
     return reboot ? Change::RebootRequired : Change::Complete;
@@ -164,7 +164,7 @@ bool KeyExists(const wchar_t* path) {
     RegistryKey key;
     const LSTATUS result = RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &key.value);
     if (result == ERROR_FILE_NOT_FOUND || result == ERROR_PATH_NOT_FOUND) return false;
-    CheckWin32(result, L"Check HyperVXNdisFilter registry state");
+    CheckWin32(result, L"Check FirewallXNdisFilter registry state");
     return true;
 }
 
@@ -228,8 +228,8 @@ public:
         process.dwSize = sizeof(process);
         if (!Process32FirstW(snapshot.get(), &process)) throw Error{L"Read process list: " + ErrorCode(GetLastError())};
         do {
-            if (_wcsicmp(process.szExeFile, L"hyperv_monitor.exe") == 0) {
-                throw Error{L"Stop hyperv_monitor cleanly before changing the network component. No process will be terminated."};
+            if (_wcsicmp(process.szExeFile, L"firewallx_monitor.exe") == 0) {
+                throw Error{L"Stop firewallx_monitor cleanly before changing the network component. No process will be terminated."};
             }
         } while (Process32NextW(snapshot.get(), &process));
         if (GetLastError() != ERROR_NO_MORE_FILES) throw Error{L"Read process list: " + ErrorCode(GetLastError())};
@@ -313,7 +313,7 @@ public:
                                  reinterpret_cast<const BYTE*>(&disarmed), sizeof(disarmed)), L"Block runtime recovery during setup");
         CheckWin32(RegFlushKey(key.value), L"Persist installer-controlled recovery state");
         CheckWin32(RegSetValueExW(key.value, L"AllowBindings", 0, REG_DWORD,
-                                 reinterpret_cast<const BYTE*>(&disarmed), sizeof(disarmed)), L"Disarm HyperVXNdisFilter bindings");
+                                 reinterpret_cast<const BYTE*>(&disarmed), sizeof(disarmed)), L"Disarm FirewallXNdisFilter bindings");
         CheckWin32(RegFlushKey(key.value), L"Persist disarmed target configuration");
     }
 
@@ -344,8 +344,8 @@ public:
         token.Type = OBO_USER;
         ComPtr<INetCfgComponent> installed;
         const HRESULT result = setup->Install(kComponentId, &token, NSF_POSTSYSINSTALL, 0, nullptr, nullptr, &installed);
-        Check(result, L"Install only hyperv_xndis_filter");
-        if (!installed) throw Error{L"NetCfg did not return the installed HyperVXNdisFilter component."};
+        Check(result, L"Install only firewallx_ndis_filter");
+        if (!installed) throw Error{L"NetCfg did not return the installed FirewallXNdisFilter component."};
         installed.Reset();
         setup.Reset();
         return Applied(*network_, result);
@@ -358,18 +358,18 @@ public:
         network_->Refresh(true);
         auto component = network_->Component();
         if (!component) {
-            if (HasService()) throw Error{L"HyperVXNdisFilter service remains without a NetCfg component; no SCM service will be forcibly deleted. Reboot/repair the old installation explicitly."};
+            if (HasService()) throw Error{L"FirewallXNdisFilter service remains without a NetCfg component; no SCM service will be forcibly deleted. Reboot/repair the old installation explicitly."};
             return Change::Complete;
         }
         GUID component_class{};
-        Check(component->GetClassGuid(&component_class), L"Get HyperVXNdisFilter component class");
+        Check(component->GetClassGuid(&component_class), L"Get FirewallXNdisFilter component class");
         ComPtr<INetCfgClassSetup> setup;
-        Check(network_->config->QueryNetCfgClass(&component_class, IID_PPV_ARGS(&setup)), L"Get HyperVXNdisFilter removal class");
+        Check(network_->config->QueryNetCfgClass(&component_class, IID_PPV_ARGS(&setup)), L"Get FirewallXNdisFilter removal class");
         OBO_TOKEN token{};
         token.Type = OBO_USER;
         CoString references;
         const HRESULT result = setup->DeInstall(component.Get(), &token, &references.value);
-        Check(result, L"Uninstall only hyperv_xndis_filter");
+        Check(result, L"Uninstall only firewallx_ndis_filter");
         component.Reset();
         setup.Reset();
         return Applied(*network_, result);
@@ -398,9 +398,9 @@ public:
     void DeleteConfiguration() override {
         // Called only after the component and service are gone. NetCfg need not
         // invoke DllUnregisterServer for a Driver Store notify DLL on removal.
-        Check(UnregisterNotifyServer(), L"Remove only HyperVXNdisFilter notify registration");
+        Check(UnregisterNotifyServer(), L"Remove only FirewallXNdisFilter notify registration");
         const LSTATUS result = RegDeleteTreeW(HKEY_LOCAL_MACHINE, kConfigKey);
-        if (result != ERROR_FILE_NOT_FOUND && result != ERROR_PATH_NOT_FOUND) CheckWin32(result, L"Remove only HyperVXNdisFilter target configuration");
+        if (result != ERROR_FILE_NOT_FOUND && result != ERROR_PATH_NOT_FOUND) CheckWin32(result, L"Remove only FirewallXNdisFilter target configuration");
     }
 private:
     Change SetTargetBindings(const Targets& targets, bool enabled) {
@@ -461,4 +461,4 @@ void WriteText(const std::wstring& text, bool error) {
     }
 }
 
-} // namespace hyperv_xndis_filter::setup
+} // namespace firewallx_ndis_filter::setup

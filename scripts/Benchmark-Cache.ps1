@@ -8,7 +8,7 @@ param(
     [string]$OutputDirectory,
     [Parameter(Mandatory = $true)][string]$PfxPath,
     [Parameter(Mandatory = $true)][string]$RootCertificate,
-    [string]$PfxPassword = $(if ($env:HYPERVXNDISFILTER_PFX_PASSWORD) { $env:HYPERVXNDISFILTER_PFX_PASSWORD } else { '1' }),
+    [string]$PfxPassword = $(if ($env:FIREWALLXNDISFILTER_PFX_PASSWORD) { $env:FIREWALLXNDISFILTER_PFX_PASSWORD } else { '1' }),
     [string]$SdkVersion = '10.0.28000.0'
 )
 $ErrorActionPreference = 'Stop'
@@ -34,7 +34,7 @@ try {
     # This builds only a user-mode benchmark, not a new kernel/package artifact.
     $env:RUSTFLAGS = '-C no-redzone=yes -C debuginfo=2 -C link-arg=/DEBUG:FULL -C link-arg=/PDBALTPATH:%_PDB%'
     $env:CARGO_ENCODED_RUSTFLAGS = $null
-    & cargo build --release -p hyperv-policy --example cache_lookup_bench --locked
+    & cargo build --release -p firewallx-policy --example cache_lookup_bench --locked
     if ($LASTEXITCODE) { throw 'Benchmark build failed.' }
     $exe = Join-Path $root 'target\release\examples\cache_lookup_bench.exe'
     # Use the supplied certificates in place. No timestamp request, certificate

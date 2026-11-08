@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use hyperv_policy::packet::SNAPSHOT;
+use firewallx_policy::packet::SNAPSHOT;
 
 #[derive(Default)]
 pub struct Snapshot {

@@ -6,13 +6,11 @@
 mod adapter_info;
 #[path = "../../../driver/src/device_control.rs"]
 mod device_control;
-#[path = "../../../driver/src/target_config.rs"]
-mod target_config;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     unsafe extern "C" {
-        fn hv_bugcheck() -> !;
+        fn fwx_bugcheck() -> !;
     }
-    unsafe { hv_bugcheck() }
+    unsafe { fwx_bugcheck() }
 }

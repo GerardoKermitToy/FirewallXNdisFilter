@@ -12,7 +12,5 @@ mod native;
 mod native_local_address;
 #[path = "../../../driver/src/native_packet.rs"]
 mod native_packet;
-#[path = "../../../driver/src/target_config.rs"]
-mod target_config;
 #[path = "../../../driver/src/wdk.rs"]
 mod wdk;

@@ -82,7 +82,7 @@ pub(super) mod calls {
     use super::*;
 
     pub(crate) unsafe fn ExAllocatePool2(flags: POOL_FLAGS, bytes: SIZE_T, tag: ULONG) -> PVOID {
-        assert_eq!(flags, HV_WDK_POOL_FLAG_NON_PAGED as POOL_FLAGS);
+        assert_eq!(flags, FWX_WDK_POOL_FLAG_NON_PAGED as POOL_FLAGS);
         assert_eq!(tag, TAG);
         assert!(bytes > 0);
         if fail() {
@@ -289,7 +289,7 @@ pub(super) mod calls {
             (*nbl).Context = header;
             state(|s| assert!(s.contexts.insert(header as usize, layout).is_none()));
         }
-        HV_WDK_NDIS_STATUS_SUCCESS as NDIS_STATUS
+        FWX_WDK_NDIS_STATUS_SUCCESS as NDIS_STATUS
     }
 
     pub(crate) unsafe fn NdisFreeNetBufferListContext(nbl: *mut NET_BUFFER_LIST, size: USHORT) {
@@ -629,11 +629,11 @@ fn snapshots_borrow_contiguous_bytes_or_copy_owned_bytes_without_advancing_offse
     unsafe {
         assert!(!allocate_packet_context(&mut *source).is_null());
         let packet = &mut *source as *mut NET_BUFFER_LIST as usize;
-        let nb = hv_first_nb(packet);
+        let nb = fwx_first_nb(packet);
         assert_eq!(nb, (&mut *inputs[0].nb as *mut NET_BUFFER).cast());
-        assert!(hv_next_nb(nb).is_null());
+        assert!(fwx_next_nb(nb).is_null());
         let (mut copied, mut trusted, mut length, mut offload) = (99, 99, 99, 99);
-        let borrowed = hv_snapshot_view(
+        let borrowed = fwx_snapshot_view(
             nb,
             packet,
             null_mut(),
@@ -647,7 +647,7 @@ fn snapshots_borrow_contiguous_bytes_or_copy_owned_bytes_without_advancing_offse
         assert_eq!((copied, trusted, length, offload), (4, 4, 6, 0));
         let mut output = [0u8; 8];
         assert_eq!(
-            hv_snapshot(
+            fwx_snapshot(
                 nb,
                 packet,
                 output.as_mut_ptr(),
@@ -662,7 +662,7 @@ fn snapshots_borrow_contiguous_bytes_or_copy_owned_bytes_without_advancing_offse
         assert_eq!(&output, b"abcdef\0\0");
         assert_eq!((copied, trusted, length, offload), (6, 6, 6, 0));
         assert_eq!(
-            hv_snapshot(
+            fwx_snapshot(
                 nb,
                 packet,
                 null_mut(),
@@ -676,7 +676,7 @@ fn snapshots_borrow_contiguous_bytes_or_copy_owned_bytes_without_advancing_offse
         );
         assert_eq!((copied, trusted, length, offload), (0, 0, 6, 0));
         assert!(
-            hv_snapshot_view(
+            fwx_snapshot_view(
                 null_mut(),
                 packet,
                 null_mut(),
@@ -710,10 +710,10 @@ fn split_snapshots_require_scratch_and_report_observed_length_on_mapping_failure
     unsafe {
         allocate_packet_context(&mut *source);
         let packet = &mut *source as *mut NET_BUFFER_LIST as usize;
-        let nb = hv_first_nb(packet);
+        let nb = fwx_first_nb(packet);
         let (mut copied, mut trusted, mut length, mut offload) = (99, 99, 99, 99);
         assert!(
-            hv_snapshot_view(
+            fwx_snapshot_view(
                 nb,
                 packet,
                 null_mut(),
@@ -728,7 +728,7 @@ fn split_snapshots_require_scratch_and_report_observed_length_on_mapping_failure
         assert_eq!((copied, trusted, length, offload), (0, 0, 6, 0));
         let mut scratch = [0u8; 5];
         assert_eq!(
-            hv_snapshot_view(
+            fwx_snapshot_view(
                 nb,
                 packet,
                 scratch.as_mut_ptr(),
@@ -746,7 +746,7 @@ fn split_snapshots_require_scratch_and_report_observed_length_on_mapping_failure
         source.NetBufferListInfo[UdpRecvSegCoalesceOffloadInfo as usize] = 2 as PVOID;
         state(|s| s.fail_at = Some(s.attempts + 1));
         assert_eq!(
-            hv_snapshot(
+            fwx_snapshot(
                 nb,
                 packet,
                 scratch.as_mut_ptr(),

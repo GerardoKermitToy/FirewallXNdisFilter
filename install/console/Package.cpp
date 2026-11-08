@@ -8,7 +8,7 @@
 #include <cstring>
 #include <map>
 
-namespace hyperv_xndis_filter::setup {
+namespace firewallx_ndis_filter::setup {
 namespace {
 
 class Inf {
@@ -32,7 +32,7 @@ public:
 
     void Require(const wchar_t* section, const wchar_t* key, DWORD field, const wchar_t* expected) {
         if (_wcsicmp(Field(section, key, field).c_str(), expected) != 0) {
-            throw Error{std::wstring(L"Not the target-restricted HyperVXNdisFilter LWF package: ") + section + L"/" + key};
+            throw Error{std::wstring(L"Not the target-restricted FirewallXNdisFilter LWF package: ") + section + L"/" + key};
         }
     }
 
@@ -40,9 +40,9 @@ public:
         INFCONTEXT context{};
         if (!SetupFindFirstLineW(handle_, L"Models.NTamd64.10.0...25341", nullptr, &context) ||
             _wcsicmp(Get(context, 1).c_str(), L"Install") != 0 ||
-            _wcsicmp(Get(context, 2).c_str(), L"hyperv_xndis_filter") != 0 ||
+            _wcsicmp(Get(context, 2).c_str(), L"firewallx_ndis_filter") != 0 ||
             SetupFindNextLine(&context, &context)) {
-            throw Error{L"Expected exactly the target-restricted HyperVXNdisFilter LWF model."};
+            throw Error{L"Expected exactly the target-restricted FirewallXNdisFilter LWF model."};
         }
     }
 
@@ -50,7 +50,7 @@ public:
         RequireUnique(L"Version", L"Signature", L"$Windows NT$");
         RequireUnique(L"Version", L"Class", L"NetService");
         RequireUnique(L"Version", L"ClassGUID", L"{4D36E974-E325-11CE-BFC1-08002BE10318}");
-        RequireUnique(L"Version", L"CatalogFile", L"HyperVXNdisFilter.cat");
+        RequireUnique(L"Version", L"CatalogFile", L"FirewallXNdisFilter.cat");
         INFCONTEXT manufacturer{};
         if (!SetupFindFirstLineW(handle_, L"Manufacturer", nullptr, &manufacturer)) {
             throw Error{L"Missing INF manufacturer for package removal."};
@@ -68,7 +68,7 @@ public:
                 }
                 do {
                     if (++models > 4096 || SetupGetFieldCount(&model) != 2 ||
-                        _wcsicmp(Get(model, 2).c_str(), L"hyperv_xndis_filter") != 0) {
+                        _wcsicmp(Get(model, 2).c_str(), L"firewallx_ndis_filter") != 0) {
                         throw Error{L"Package has an unrelated or ambiguous component model; refusing removal."};
                     }
                     RequireOwnInstall(Get(model, 1));
@@ -81,14 +81,14 @@ public:
         Require(L"DestinationDirs", L"DriverFiles", 1, L"13");
         Require(L"DestinationDirs", L"NotifyFiles", 1, L"13");
         RequireFileList(L"DriverFiles", kDriverFileName);
-        RequireFileList(L"NotifyFiles", L"HyperVXNdisFilterNotify.dll");
+        RequireFileList(L"NotifyFiles", L"FirewallXNdisFilterNotify.dll");
         Require(L"SourceDisksFiles", kDriverFileName, 1, L"1");
-        Require(L"SourceDisksFiles", L"HyperVXNdisFilterNotify.dll", 1, L"1");
+        Require(L"SourceDisksFiles", L"FirewallXNdisFilterNotify.dll", 1, L"1");
         // SetupAPI expands DIRID 13 to a temporary destination (normally '.')
         // until the INF is staged. Compare fields in the same parse context.
         const auto driver = TargetFile(L"DriverFiles", kDriverFileName);
         Require(L"Service", L"ServiceBinary", 1, driver.c_str());
-        const auto dll = TargetFile(L"NotifyFiles", L"HyperVXNdisFilterNotify.dll");
+        const auto dll = TargetFile(L"NotifyFiles", L"FirewallXNdisFilterNotify.dll");
         RequireNdi(L"Ndi", L"ComponentDll", dll.c_str());
     }
 
@@ -131,7 +131,7 @@ private:
                 SetupGetFieldCount(&service) != 3 ||
                 _wcsicmp(Get(service, 0).c_str(), L"AddService") != 0 ||
                 _wcsicmp(Get(service, 1).c_str(), kServiceName) != 0) {
-                throw Error{L"Package does not exclusively install the HyperVXNdisFilter service."};
+                throw Error{L"Package does not exclusively install the FirewallXNdisFilter service."};
             }
             const auto definition = Get(service, 3);
             if (SetupFindNextLine(&service, &service)) {
@@ -140,7 +140,7 @@ private:
             RequireUnique(definition.c_str(), L"ServiceType", L"1");
             const std::filesystem::path binary(UniqueField(definition.c_str(), L"ServiceBinary"));
             if (_wcsicmp(binary.filename().c_str(), kDriverFileName) != 0) {
-                throw Error{L"Package service does not use HyperVXNdisFilter.sys; refusing removal."};
+                throw Error{L"Package service does not use FirewallXNdisFilter.sys; refusing removal."};
             }
         }
         if (!found) throw Error{L"Missing DDInstall sections for package removal: " + base};
@@ -158,7 +158,7 @@ private:
     }
     void RequireUnique(const wchar_t* section, const wchar_t* key, const wchar_t* expected) {
         if (_wcsicmp(UniqueField(section, key).c_str(), expected) != 0) {
-            throw Error{std::wstring(L"Not an exclusively owned HyperVXNdisFilter package: ") + section + L"/" + key};
+            throw Error{std::wstring(L"Not an exclusively owned FirewallXNdisFilter package: ") + section + L"/" + key};
         }
     }
     void RequireFileList(const wchar_t* section, const wchar_t* expected) {
@@ -289,7 +289,7 @@ void ValidateInfFile(const std::filesystem::path& path) {
     Inf inf(path);
     inf.Require(L"Version", L"Class", 1, L"NetService");
     inf.Require(L"Version", L"ClassGUID", 1, L"{4D36E974-E325-11CE-BFC1-08002BE10318}");
-    inf.Require(L"Version", L"CatalogFile", 1, L"HyperVXNdisFilter.cat");
+    inf.Require(L"Version", L"CatalogFile", 1, L"FirewallXNdisFilter.cat");
     inf.Require(L"Version", L"DriverVer", 2, kPackageVersion);
     inf.RequireModel();
     inf.Require(L"Install.Services", L"AddService", 1, kServiceName);
@@ -351,10 +351,10 @@ std::vector<Handle> LockMatchingPackage(const std::filesystem::path& package, co
         // Compare every byte, including the catalog, and retain both file locks.
         if (!SameFileContents(expected[i].get(), files[i].get())) {
             throw Error{L"Driver Store package differs from the validated source: " + (package / kPackageFiles[i]).wstring() +
-                        L". Installation stopped before NetCfg activation. Explicitly remove the old HyperVXNdisFilter packages with Uninstall.exe before retrying; no package was overwritten or purged."};
+                        L". Installation stopped before NetCfg activation. Explicitly remove the old FirewallXNdisFilter packages with Uninstall.exe before retrying; no package was overwritten or purged."};
         }
     }
     return files;
 }
 
-} // namespace hyperv_xndis_filter::setup
+} // namespace firewallx_ndis_filter::setup

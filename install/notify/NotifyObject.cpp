@@ -35,8 +35,8 @@ public:
     }
     HRESULT STDMETHODCALLTYPE Initialize(INetCfgComponent*, INetCfg* config, BOOL) override {
         try {
-            const HRESULT hr = hyperv_xndis_filter::ReadBindingAdapterInventory(config, adapters_);
-            hyperv_xndis_filter::TraceNetCfg("Initialize adapter inventory", hr);
+            const HRESULT hr = firewallx_ndis_filter::ReadBindingAdapterInventory(config, adapters_);
+            firewallx_ndis_filter::TraceNetCfg("Initialize adapter inventory", hr);
             return hr;
         } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
         catch (...) { return E_UNEXPECTED; }
@@ -45,10 +45,10 @@ public:
     HRESULT STDMETHODCALLTYPE ApplyPnpChanges(INetCfgPnpReconfigCallback*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE CancelChanges() override { return S_OK; }
     HRESULT STDMETHODCALLTYPE QueryBindingPath(DWORD flags, INetCfgBindingPath* path) override {
-        return hyperv_xndis_filter::EvaluateBindingPath(flags, path, adapters_);
+        return firewallx_ndis_filter::EvaluateBindingPath(flags, path, adapters_);
     }
     HRESULT STDMETHODCALLTYPE NotifyBindingPath(DWORD flags, INetCfgBindingPath*) override {
-        hyperv_xndis_filter::TraceNetCfg("NotifyBindingPath", S_OK, flags);
+        firewallx_ndis_filter::TraceNetCfg("NotifyBindingPath", S_OK, flags);
         return S_OK;
     }
 };
@@ -95,7 +95,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
 extern "C" HRESULT __stdcall DllGetClassObject(REFCLSID clsid, REFIID iid, void** out) {
     if (out == nullptr) return E_POINTER;
     *out = nullptr;
-    if (clsid != hyperv_xndis_filter::kNotifyClsid) return CLASS_E_CLASSNOTAVAILABLE;
+    if (clsid != firewallx_ndis_filter::kNotifyClsid) return CLASS_E_CLASSNOTAVAILABLE;
     auto* factory = new (std::nothrow) ClassFactory;
     if (factory == nullptr) return E_OUTOFMEMORY;
     const HRESULT hr = factory->QueryInterface(iid, out);
@@ -106,10 +106,10 @@ extern "C" HRESULT __stdcall DllCanUnloadNow() {
         InterlockedCompareExchange(&locks, 0, 0) == 0 ? S_OK : S_FALSE;
 }
 extern "C" HRESULT __stdcall DllRegisterServer() {
-    try { return hyperv_xndis_filter::RegisterNotifyServer(moduleHandle); }
+    try { return firewallx_ndis_filter::RegisterNotifyServer(moduleHandle); }
     catch (...) { return E_OUTOFMEMORY; }
 }
 extern "C" HRESULT __stdcall DllUnregisterServer() {
-    try { return hyperv_xndis_filter::UnregisterNotifyServer(); }
+    try { return firewallx_ndis_filter::UnregisterNotifyServer(); }
     catch (...) { return E_OUTOFMEMORY; }
 }

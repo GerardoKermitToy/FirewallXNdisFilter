@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
-project(hyperv_monitor LANGUAGES CXX)
+project(firewallx_monitor LANGUAGES CXX)
 
 if(NOT WIN32)
-    message(FATAL_ERROR "HyperVXNdisFilter monitor targets Windows only.")
+    message(FATAL_ERROR "FirewallXNdisFilter monitor targets Windows only.")
 endif()
 
 if(MSVC)
@@ -38,37 +38,37 @@ else()
     target_compile_options(pmkext PRIVATE -Wall -Wextra)
 endif()
 
-add_executable(hyperv_monitor src/main.cpp)
-target_link_libraries(hyperv_monitor PRIVATE pmkext advapi32)
+add_executable(firewallx_monitor src/main.cpp)
+target_link_libraries(firewallx_monitor PRIVATE pmkext advapi32)
 if(MSVC)
-    target_compile_options(hyperv_monitor PRIVATE /W4 /permissive- /utf-8)
+    target_compile_options(firewallx_monitor PRIVATE /W4 /permissive- /utf-8)
     # Help/invalid-CLI tests must run without elevation or device access. Actual
     # device sessions still require an elevated token because of the driver ACL.
-    target_link_options(hyperv_monitor PRIVATE
+    target_link_options(firewallx_monitor PRIVATE
         /ENTRY:wmainCRTStartup
         "/MANIFESTUAC:level='asInvoker' uiAccess='false'"
     )
 else()
-    target_compile_options(hyperv_monitor PRIVATE -Wall -Wextra)
-    target_link_options(hyperv_monitor PRIVATE -municode)
+    target_compile_options(firewallx_monitor PRIVATE -Wall -Wextra)
+    target_link_options(firewallx_monitor PRIVATE -municode)
 endif()
 
 # NetCfg loads this user-mode COM object during explicit installation/binding.
 # Building it never registers it or changes network configuration.
-add_library(hyperv_xndis_filter_notify SHARED
+add_library(firewallx_ndis_filter_notify SHARED
     ../install/notify/BindingPolicy.cpp
     ../install/notify/NotifyObject.cpp
-    ../install/notify/HyperVXNdisFilterNotify.def
+    ../install/notify/FirewallXNdisFilterNotify.def
 )
-set_target_properties(hyperv_xndis_filter_notify PROPERTIES OUTPUT_NAME HyperVXNdisFilterNotify
-    PDB_NAME HyperVXNdisFilterNotify
+set_target_properties(firewallx_ndis_filter_notify PROPERTIES OUTPUT_NAME FirewallXNdisFilterNotify
+    PDB_NAME FirewallXNdisFilterNotify
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-target_compile_features(hyperv_xndis_filter_notify PRIVATE cxx_std_20)
-target_compile_definitions(hyperv_xndis_filter_notify PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN)
-target_link_libraries(hyperv_xndis_filter_notify PRIVATE ole32 advapi32 uuid iphlpapi)
+target_compile_features(firewallx_ndis_filter_notify PRIVATE cxx_std_20)
+target_compile_definitions(firewallx_ndis_filter_notify PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN)
+target_link_libraries(firewallx_ndis_filter_notify PRIVATE ole32 advapi32 uuid iphlpapi)
 if(MSVC)
-    target_compile_options(hyperv_xndis_filter_notify PRIVATE /W4 /WX /permissive- /utf-8 /guard:cf)
-    target_link_options(hyperv_xndis_filter_notify PRIVATE /DYNAMICBASE /NXCOMPAT /GUARD:CF)
+    target_compile_options(firewallx_ndis_filter_notify PRIVATE /W4 /WX /permissive- /utf-8 /guard:cf)
+    target_link_options(firewallx_ndis_filter_notify PRIVATE /DYNAMICBASE /NXCOMPAT /GUARD:CF)
 endif()
 
 # Independent header-only consumers: no pmkext library or codec dependency.
@@ -122,7 +122,7 @@ if(BUILD_TESTING)
         endif()
         add_test(NAME ${test_name}
             COMMAND "${CMAKE_COMMAND}" -E env --unset=RUSTFLAGS --unset=CARGO_ENCODED_RUSTFLAGS
-                "${CARGO_EXECUTABLE}" test --release --locked -p hyperv-native-tests --lib
+                "${CARGO_EXECUTABLE}" test --release --locked -p firewallx-native-tests --lib
                 "${test_filter}" -- --test-threads=1)
         set_tests_properties(${test_name} PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE LABELS "no-driver"
             PASS_REGULAR_EXPRESSION "test result: ok\\. [1-9][0-9]* passed"
@@ -130,14 +130,14 @@ if(BUILD_TESTING)
     endforeach()
     # Portable kernel logic uses its own host archive for adapter/header fixtures.
     set(DRIVER_RUST_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/driver-rust")
-    set(DRIVER_RUST_LIBRARY "${DRIVER_RUST_TARGET_DIR}/release/hyperv_driver_tests.lib")
+    set(DRIVER_RUST_LIBRARY "${DRIVER_RUST_TARGET_DIR}/release/firewallx_driver_tests.lib")
     add_custom_command(OUTPUT "${DRIVER_RUST_LIBRARY}"
         COMMAND "${CMAKE_COMMAND}" -E env --unset=RUSTFLAGS --unset=CARGO_ENCODED_RUSTFLAGS
-            "${CARGO_EXECUTABLE}" build --release --locked -p hyperv-driver-tests
+            "${CARGO_EXECUTABLE}" build --release --locked -p firewallx-driver-tests
             --target-dir "${DRIVER_RUST_TARGET_DIR}"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
         DEPENDS tests/driver_rust/lib.rs tests/driver_rust/Cargo.toml tests/driver_rust/build.rs
-            ../driver/src/adapter_info.rs ../driver/src/device_control.rs ../driver/src/target_config.rs
+            ../driver/src/adapter_info.rs ../driver/src/device_control.rs
             ../protocol/src/lib.rs ../driver/build_constants.rs ../Cargo.toml ../Cargo.lock
         VERBATIM)
     add_custom_target(driver_rust_test_library DEPENDS "${DRIVER_RUST_LIBRARY}")
@@ -160,17 +160,17 @@ if(BUILD_TESTING)
     add_executable(notify_object_tests tests/notify_object_tests.cpp)
     target_compile_features(notify_object_tests PRIVATE cxx_std_20)
     target_link_libraries(notify_object_tests PRIVATE uuid)
-    add_dependencies(notify_object_tests hyperv_xndis_filter_notify)
+    add_dependencies(notify_object_tests firewallx_ndis_filter_notify)
     if(MSVC)
         target_compile_options(notify_object_tests PRIVATE /W4 /permissive- /utf-8 /wd4191)
     endif()
-    add_test(NAME notify_object_tests COMMAND notify_object_tests $<TARGET_FILE:hyperv_xndis_filter_notify>)
+    add_test(NAME notify_object_tests COMMAND notify_object_tests $<TARGET_FILE:firewallx_ndis_filter_notify>)
     set_tests_properties(notify_object_tests PROPERTIES TIMEOUT 15 LABELS "no-driver")
-    add_test(NAME monitor_help COMMAND hyperv_monitor --help)
+    add_test(NAME monitor_help COMMAND firewallx_monitor --help)
     set_tests_properties(monitor_help PROPERTIES TIMEOUT 10 LABELS "no-driver"
                         PASS_REGULAR_EXPRESSION "positive seconds")
     add_test(NAME monitor_cli_tests
-        COMMAND "${CMAKE_COMMAND}" "-DMONITOR=$<TARGET_FILE:hyperv_monitor>"
+        COMMAND "${CMAKE_COMMAND}" "-DMONITOR=$<TARGET_FILE:firewallx_monitor>"
                 "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/monitor_cli_tests.cmake")
     set_tests_properties(monitor_cli_tests PROPERTIES TIMEOUT 40 LABELS "no-driver")

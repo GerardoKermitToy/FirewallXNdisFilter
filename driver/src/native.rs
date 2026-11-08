@@ -156,10 +156,10 @@ use wide;
 
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
-pub(crate) extern "C" fn hv_bugcheck() -> ! {
+pub(crate) extern "C" fn fwx_bugcheck() -> ! {
     unsafe {
         KeBugCheckEx(
-            HV_WDK_DRIVER_VERIFIER_DETECTED_VIOLATION as u32,
+            FWX_WDK_DRIVER_VERIFIER_DETECTED_VIOLATION as u32,
             0x48565253,
             0,
             0,
@@ -172,7 +172,7 @@ pub(crate) extern "C" fn hv_bugcheck() -> ! {
 fn pool_allocation_failed() -> ! {
     #[cfg(not(test))]
     unsafe {
-        KeBugCheckEx(HV_WDK_NO_PAGES_AVAILABLE as u32, 0, 0, 0, 0)
+        KeBugCheckEx(FWX_WDK_NO_PAGES_AVAILABLE as u32, 0, 0, 0, 0)
     }
     #[cfg(test)]
     panic!("ExAllocatePool2 failed")
@@ -188,17 +188,17 @@ pub(crate) fn pool_allocation(pointer: PVOID) -> PVOID {
 
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
-extern "C" fn hv_lock() -> usize {
+extern "C" fn fwx_lock() -> usize {
     unsafe { spin_lock(addr_of_mut!(POLICY_LOCK)) as usize }
 }
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
-extern "C" fn hv_unlock(irql: usize) {
+extern "C" fn fwx_unlock(irql: usize) {
     unsafe { spin_unlock(addr_of_mut!(POLICY_LOCK), irql as u8) }
 }
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
-extern "C" fn hv_now() -> u64 {
+extern "C" fn fwx_now() -> u64 {
     // The precise DDI requires a writable QPC timestamp output, even when only
     // interrupt time is consumed by policy.
     let mut qpc = 0;
@@ -206,13 +206,13 @@ extern "C" fn hv_now() -> u64 {
 }
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
-extern "C" fn hv_allocate(size: usize) -> *mut u8 {
+extern "C" fn fwx_allocate(size: usize) -> *mut u8 {
     unsafe {
         if size == 0 {
             null_mut()
         } else {
             pool_allocation(ExAllocatePool2(
-                (HV_WDK_POOL_FLAG_NON_PAGED | HV_WDK_POOL_FLAG_UNINITIALIZED) as u64,
+                (FWX_WDK_POOL_FLAG_NON_PAGED | FWX_WDK_POOL_FLAG_UNINITIALIZED) as u64,
                 size as u64,
                 TAG,
             ))
@@ -222,18 +222,18 @@ extern "C" fn hv_allocate(size: usize) -> *mut u8 {
 }
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
-unsafe extern "C" fn hv_free(data: *mut u8, _: usize) {
+unsafe extern "C" fn fwx_free(data: *mut u8, _: usize) {
     unsafe { ExFreePoolWithTag(data.cast(), TAG) }
 }
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
-extern "C" fn hv_cache_allocate(size: usize) -> *mut u8 {
+extern "C" fn fwx_cache_allocate(size: usize) -> *mut u8 {
     unsafe {
         if size == 0 {
             null_mut()
         } else {
             pool_allocation(ExAllocatePool2(
-                (HV_WDK_POOL_FLAG_NON_PAGED | HV_WDK_POOL_FLAG_UNINITIALIZED) as u64,
+                (FWX_WDK_POOL_FLAG_NON_PAGED | FWX_WDK_POOL_FLAG_UNINITIALIZED) as u64,
                 size as u64,
                 CACHE_TAG,
             ))
@@ -243,7 +243,7 @@ extern "C" fn hv_cache_allocate(size: usize) -> *mut u8 {
 }
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
-unsafe extern "C" fn hv_cache_free(data: *mut u8, _: usize) {
+unsafe extern "C" fn fwx_cache_free(data: *mut u8, _: usize) {
     unsafe { ExFreePoolWithTag(data.cast(), CACHE_TAG) }
 }
 unsafe fn close_classification_session() {
@@ -255,14 +255,14 @@ unsafe fn close_classification_session() {
         #[cfg(not(test))]
         {
             ExWaitForRundownProtectionRelease(addr_of_mut!(CLASSIFICATION_RUNDOWN));
-            crate::HvDisconnect();
+            crate::FwxDisconnect();
         }
         #[cfg(test)]
         {
             device::tests::calls::ExWaitForRundownProtectionRelease(addr_of_mut!(
                 CLASSIFICATION_RUNDOWN
             ));
-            device::tests::calls::HvDisconnect();
+            device::tests::calls::FwxDisconnect();
         }
     }
 }
@@ -279,11 +279,11 @@ unsafe fn open_classification_session() {
         }
         #[cfg(not(test))]
         {
-            crate::HvConnect();
+            crate::FwxConnect();
         }
         #[cfg(test)]
         {
-            device::tests::calls::HvConnect();
+            device::tests::calls::FwxConnect();
         }
     }
 }
@@ -315,7 +315,7 @@ fn request_cache_cleanup() {
 unsafe extern "C" fn cache_worker(_: PDEVICE_OBJECT, _: PVOID) {
     unsafe {
         if !is_stopping() {
-            crate::HvCleanCaches();
+            crate::FwxCleanCaches();
         }
         CACHE_SCHEDULED.store(0, Ordering::SeqCst);
         ExReleaseRundownProtection(addr_of_mut!(CACHE_RUNDOWN));
@@ -347,7 +347,7 @@ unsafe fn update_timer(
 }
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
-extern "C" fn hv_publish_state(ready: u32, online: u32, pending: u32, cached: u32) {
+extern "C" fn fwx_publish_state(ready: u32, online: u32, pending: u32, cached: u32) {
     unsafe {
         // Caller holds POLICY_LOCK; timer state has that same owner.
         if READ_READY.load(Ordering::SeqCst) != ready as i32 {
@@ -376,7 +376,7 @@ extern "C" fn hv_publish_state(ready: u32, online: u32, pending: u32, cached: u3
 #[cfg(not(test))]
 unsafe extern "C" fn pending_dpc(_: *mut KDPC, _: PVOID, _: PVOID, _: PVOID) {
     if !is_stopping() {
-        crate::HvDrain();
+        crate::FwxDrain();
     }
 }
 #[cfg(not(test))]
@@ -394,7 +394,7 @@ fn pool_allocation_failure_bugchecks_instead_of_returning_null() {
 }
 
 #[cfg(test)]
-pub(crate) fn hv_bugcheck() -> ! {
+pub(crate) fn fwx_bugcheck() -> ! {
     panic!("kernel invariant violated")
 }
 #[cfg(test)]

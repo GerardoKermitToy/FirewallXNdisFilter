@@ -5,7 +5,7 @@ param([string]$DriverPath)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $resource = Get-Content -Raw -LiteralPath (Join-Path $root 'driver\version.rc')
-$inf = Get-Content -Raw -LiteralPath (Join-Path $root 'install\HyperVXNdisFilter.inf')
+$inf = Get-Content -Raw -LiteralPath (Join-Path $root 'install\FirewallXNdisFilter.inf')
 $script:passed = 0
 
 function Assert-Version {
@@ -27,9 +27,9 @@ $strings = @{
     CompanyName = [regex]::Match($inf, '(?m)^Provider="([^"]+)"').Groups[1].Value
     FileDescription = [regex]::Match($inf, '(?m)^Description="([^"]+)"').Groups[1].Value
     FileVersion = $version
-    InternalName = 'HyperVXNdisFilter'
-    OriginalFilename = 'HyperVXNdisFilter.sys'
-    ProductName = 'HyperVXNdisFilter'
+    InternalName = 'FirewallXNdisFilter'
+    OriginalFilename = 'FirewallXNdisFilter.sys'
+    ProductName = 'FirewallXNdisFilter'
     ProductVersion = $version
 }
 foreach ($name in $strings.Keys) {

@@ -5,7 +5,7 @@
 #include <iterator>
 #include <stdexcept>
 
-using namespace hyperv_xndis_filter::setup;
+using namespace firewallx_ndis_filter::setup;
 namespace {
 
 void Require(bool value, const char* message) {
@@ -49,7 +49,7 @@ int wmain(int argc, wchar_t** argv) {
             Replace(Replace(original, "%Provider%=Models,NTamd64.10.0...25341", "%Provider%=Models"),
                     "[Models.NTamd64.10.0...25341]", "[Models]"),
             Replace(original, "%Provider%=Models,NTamd64.10.0...25341", "%Provider%=Models,NTamd64.10.0...25341,NTamd64") +
-                "\n[Models.NTamd64]\n%Description%=Install, hyperv_xndis_filter\n",
+                "\n[Models.NTamd64]\n%Description%=Install, firewallx_ndis_filter\n",
             Replace(original, "Install", "OwnInstall"),
         };
         for (const auto* suffix : {".NT", ".NTamd64", ".NTx86", ".NTia64", ".NTarm", ".NTarm64"}) {
@@ -58,7 +58,7 @@ int wmain(int argc, wchar_t** argv) {
                                        "[Install.Services]", "[" + install + ".Services]");
             accepted.push_back(owned);
             accepted.push_back(original + "\n[" + install + "]\nNetCfgInstanceId={6E76EAD1-7BCB-49C4-9547-D3E6B3488F71}\n[" +
-                               install + ".Services]\nAddService=HyperVXNdisFilter,,Service\n");
+                               install + ".Services]\nAddService=FirewallXNdisFilter,,Service\n");
         }
         for (const auto& text : accepted) {
             Write(fixture, text);
@@ -67,24 +67,28 @@ int wmain(int argc, wchar_t** argv) {
         std::vector<std::string> rejected{
             Replace(original, "Class=NetService", "Class=Net"),
             Replace(original, "4D36E974-E325-11CE-BFC1-08002BE10318", "4D36E972-E325-11CE-BFC1-08002BE10318"),
-            Replace(original, "CatalogFile=HyperVXNdisFilter.cat", "CatalogFile=Unrelated.cat"),
-            Replace(original, "hyperv_xndis_filter", "another_component"),
+            Replace(original, "CatalogFile=FirewallXNdisFilter.cat", "CatalogFile=Unrelated.cat"),
+            Replace(original, "CatalogFile=FirewallXNdisFilter.cat", "CatalogFile=HyperVXNdisFilter.cat"),
+            Replace(original, "firewallx_ndis_filter", "another_component"),
+            Replace(original, "firewallx_ndis_filter", "hyperv_xndis_filter"),
+            Replace(original, "AddService=FirewallXNdisFilter,,Service", "AddService=HyperVXNdisFilter,,Service"),
+            Replace(original, "ServiceBinary=%13%\\FirewallXNdisFilter.sys", "ServiceBinary=%13%\\HyperVXNdisFilter.sys"),
             Replace(original, "6E76EAD1-7BCB-49C4-9547-D3E6B3488F71", "00000001-0002-0003-0405-060708090A0B"),
-            Replace(original, "AddService=HyperVXNdisFilter,,Service", "AddService=OtherFilter,,Service"),
-            Replace(original, "AddService=HyperVXNdisFilter,,Service", "AddService=HyperVXNdisFilter,,OtherService"),
+            Replace(original, "AddService=FirewallXNdisFilter,,Service", "AddService=OtherFilter,,Service"),
+            Replace(original, "AddService=FirewallXNdisFilter,,Service", "AddService=FirewallXNdisFilter,,OtherService"),
             Replace(original, "ServiceType=1", "ServiceType=2"),
-            Replace(original, "ServiceBinary=%13%\\HyperVXNdisFilter.sys", "ServiceBinary=%13%\\OtherFilter.sys"),
-            Replace(original, "ServiceBinary=%13%\\HyperVXNdisFilter.sys", "ServiceBinary=%13%\\OtherHyperVXNdisFilter.sys"),
-            Replace(original, "%Description%=Install, hyperv_xndis_filter", "%Description%=Install, hyperv_xndis_filter, another_component"),
-            Replace(original, "%Description%=Install, hyperv_xndis_filter", "%Description%=Install, hyperv_xndis_filter\n%Description%=Install, another_component"),
+            Replace(original, "ServiceBinary=%13%\\FirewallXNdisFilter.sys", "ServiceBinary=%13%\\OtherFilter.sys"),
+            Replace(original, "ServiceBinary=%13%\\FirewallXNdisFilter.sys", "ServiceBinary=%13%\\OtherFirewallXNdisFilter.sys"),
+            Replace(original, "%Description%=Install, firewallx_ndis_filter", "%Description%=Install, firewallx_ndis_filter, another_component"),
+            Replace(original, "%Description%=Install, firewallx_ndis_filter", "%Description%=Install, firewallx_ndis_filter\n%Description%=Install, another_component"),
             Replace(original, "%Provider%=Models,NTamd64.10.0...25341", "%Provider%=Models,NTamd64.10.0...25341\nOther=OtherModels,NTamd64") +
                 "\n[OtherModels.NTamd64]\nOther=Install, another_component\n",
             Replace(original, "%Provider%=Models,NTamd64.10.0...25341", "%Provider%=Models,NTamd64.10.0...25341,NTamd64") +
                 "\n[Models.NTamd64]\nOther=Install, another_component\n",
-            Replace(original, "AddService=HyperVXNdisFilter,,Service", "AddService=HyperVXNdisFilter,,Service\nAddService=OtherFilter,,Service"),
-            Replace(original, "AddService=HyperVXNdisFilter,,Service", "AddService=HyperVXNdisFilter,,Service\nInclude=other.inf\nNeeds=Other.Services"),
+            Replace(original, "AddService=FirewallXNdisFilter,,Service", "AddService=FirewallXNdisFilter,,Service\nAddService=OtherFilter,,Service"),
+            Replace(original, "AddService=FirewallXNdisFilter,,Service", "AddService=FirewallXNdisFilter,,Service\nInclude=other.inf\nNeeds=Other.Services"),
             Replace(original, "Class=NetService", "Class=NetService\nClass=Net"),
-            Replace(original, "ServiceBinary=%13%\\HyperVXNdisFilter.sys", "ServiceBinary=%13%\\HyperVXNdisFilter.sys\nServiceBinary=%13%\\OtherFilter.sys"),
+            Replace(original, "ServiceBinary=%13%\\FirewallXNdisFilter.sys", "ServiceBinary=%13%\\FirewallXNdisFilter.sys\nServiceBinary=%13%\\OtherFilter.sys"),
             Replace(original, "NetCfgInstanceId=", "NetCfgInstanceId=\"{6E76EAD1-7BCB-49C4-9547-D3E6B3488F71}\"\nNetCfgInstanceId="),
             Replace(original, "[Install.Services]", "[Wrong.Services]"),
             Replace(original, "[Models.NTamd64.10.0...25341]", "[MissingModel]"),
@@ -109,7 +113,7 @@ int wmain(int argc, wchar_t** argv) {
         for (const auto* name : {L"oem0.inf", L"oem123.inf", L"OEM12.INF"}) {
             Require(IsPublishedInfName(name), "valid OEM basename rejected");
         }
-        for (const std::wstring name : {std::wstring{}, std::wstring(L"oem.inf"), std::wstring(L"HyperVXNdisFilter.inf"),
+        for (const std::wstring name : {std::wstring{}, std::wstring(L"oem.inf"), std::wstring(L"FirewallXNdisFilter.inf"),
                 std::wstring(L"oem-1.inf"), std::wstring(L"oem1.inf.bak"), std::wstring(L"../oem1.inf"),
                 std::wstring(L"C:\\Windows\\INF\\oem1.inf"), std::wstring(L"oem1.inf\\x"), std::wstring(L"oem1\0.inf", 9)}) {
             Require(!IsPublishedInfName(name), "path or malformed OEM basename accepted");

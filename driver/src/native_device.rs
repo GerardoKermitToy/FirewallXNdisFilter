@@ -8,8 +8,8 @@ use crate::wdk as api;
 #[cfg(test)]
 #[path = "native_device_tests.rs"]
 pub(super) mod tests;
-use crate::device_control::HvDeviceControl;
-use hyperv_protocol::{IOCTL_ADAPTER_INFO, IOCTL_SHUTDOWN};
+use crate::device_control::FwxDeviceControl;
+use firewallx_protocol::{IOCTL_ADAPTER_INFO, IOCTL_SHUTDOWN};
 #[cfg(test)]
 use tests::calls as api;
 #[cfg(test)]
@@ -44,11 +44,11 @@ unsafe extern "C" fn read_insert(_: PIO_CSQ, irp: PIRP, _: PVOID) -> i32 {
             || READ_CLIENT != (*stack(irp)).FileObject
             || READ_ONLINE.load(Ordering::SeqCst) == 0
         {
-            return HV_WDK_STATUS_DEVICE_NOT_CONNECTED;
+            return FWX_WDK_STATUS_DEVICE_NOT_CONNECTED;
         }
         list_insert_tail(addr_of_mut!(READ_IRPS), irp_link(irp));
         READ_PENDING.store(1, Ordering::SeqCst);
-        HV_WDK_STATUS_SUCCESS
+        FWX_WDK_STATUS_SUCCESS
     }
 }
 unsafe extern "C" fn read_remove(_: PIO_CSQ, irp: PIRP) {
@@ -91,7 +91,7 @@ unsafe extern "C" fn read_release(_: PIO_CSQ, irql: KIRQL) {
 }
 unsafe extern "C" fn read_cancelled(_: PIO_CSQ, irp: PIRP) {
     unsafe {
-        complete_read(irp, HV_WDK_STATUS_CANCELLED, 0);
+        complete_read(irp, FWX_WDK_STATUS_CANCELLED, 0);
     }
 }
 unsafe fn set_read_client(file: PFILE_OBJECT) {
@@ -108,7 +108,7 @@ pub(super) unsafe fn cancel_reads(file: PFILE_OBJECT) {
             if irp.is_null() {
                 break;
             }
-            complete_read(irp, HV_WDK_STATUS_CANCELLED, 0);
+            complete_read(irp, FWX_WDK_STATUS_CANCELLED, 0);
         }
     }
 }
@@ -151,16 +151,16 @@ unsafe extern "C" fn read_worker(_: PDEVICE_OBJECT, _: PVOID) {
             if irp.is_null() {
                 break;
             }
-            let mut status = HV_WDK_STATUS_SUCCESS;
+            let mut status = FWX_WDK_STATUS_SUCCESS;
             let mut bytes = 0;
             api::ExAcquireFastMutex(addr_of_mut!(IO_MUTEX));
             if is_stopping()
                 || READ_ONLINE.load(Ordering::SeqCst) == 0
                 || CLIENT != (*stack(irp)).FileObject
             {
-                status = HV_WDK_STATUS_CANCELLED;
+                status = FWX_WDK_STATUS_CANCELLED;
             } else {
-                bytes = policy::HvRead(
+                bytes = policy::FwxRead(
                     (*irp).AssociatedIrp.SystemBuffer.cast(),
                     (*stack(irp)).Parameters.Read.Length,
                 );
@@ -185,7 +185,7 @@ unsafe extern "C" fn read_worker(_: PDEVICE_OBJECT, _: PVOID) {
 unsafe extern "C" fn dispatch(_: PDEVICE_OBJECT, irp: PIRP) -> i32 {
     unsafe {
         let stack = stack(irp);
-        let mut status = HV_WDK_STATUS_SUCCESS;
+        let mut status = FWX_WDK_STATUS_SUCCESS;
         let mut transferred: usize = 0;
         let mut queue_read = false;
         let mut cancel = false;
@@ -193,9 +193,9 @@ unsafe extern "C" fn dispatch(_: PDEVICE_OBJECT, irp: PIRP) -> i32 {
         match (*stack).MajorFunction as u32 {
             IRP_MJ_CREATE => {
                 if is_stopping() {
-                    status = HV_WDK_STATUS_DELETE_PENDING;
+                    status = FWX_WDK_STATUS_DELETE_PENDING;
                 } else if !CLIENT.is_null() {
-                    status = HV_WDK_STATUS_SHARING_VIOLATION;
+                    status = FWX_WDK_STATUS_SHARING_VIOLATION;
                 } else {
                     CLIENT = (*stack).FileObject;
                     set_read_client(CLIENT);
@@ -213,24 +213,24 @@ unsafe extern "C" fn dispatch(_: PDEVICE_OBJECT, irp: PIRP) -> i32 {
             IRP_MJ_CLOSE => (),
             major => {
                 if is_stopping() || CLIENT != (*stack).FileObject {
-                    status = HV_WDK_STATUS_DEVICE_NOT_CONNECTED;
+                    status = FWX_WDK_STATUS_DEVICE_NOT_CONNECTED;
                 } else {
                     match major {
                         IRP_MJ_READ => {
                             let len = (*stack).Parameters.Read.Length;
                             if len != 0 && (*irp).AssociatedIrp.SystemBuffer.is_null() {
-                                status = HV_WDK_STATUS_INVALID_PARAMETER;
+                                status = FWX_WDK_STATUS_INVALID_PARAMETER;
                             } else if len != 0 {
                                 if api::ExAcquireRundownProtection(addr_of_mut!(READ_RUNDOWN)) == 0
                                 {
-                                    status = HV_WDK_STATUS_DEVICE_NOT_CONNECTED;
+                                    status = FWX_WDK_STATUS_DEVICE_NOT_CONNECTED;
                                 } else {
                                     queue_read = true;
                                 }
                             }
                         }
                         IRP_MJ_WRITE => {
-                            status = policy::HvWrite(
+                            status = policy::FwxWrite(
                                 (*irp).AssociatedIrp.SystemBuffer.cast(),
                                 (*stack).Parameters.Write.Length,
                             );
@@ -244,7 +244,7 @@ unsafe extern "C" fn dispatch(_: PDEVICE_OBJECT, irp: PIRP) -> i32 {
                         IRP_MJ_DEVICE_CONTROL => {
                             let request = (*stack).Parameters.DeviceIoControl;
                             let mut bytes = 0;
-                            status = HvDeviceControl(
+                            status = FwxDeviceControl(
                                 request.IoControlCode,
                                 request.InputBufferLength,
                                 (*irp).AssociatedIrp.SystemBuffer.cast(),
@@ -266,7 +266,7 @@ unsafe extern "C" fn dispatch(_: PDEVICE_OBJECT, irp: PIRP) -> i32 {
                                 }
                             }
                         }
-                        _ => status = HV_WDK_STATUS_INVALID_DEVICE_REQUEST,
+                        _ => status = FWX_WDK_STATUS_INVALID_DEVICE_REQUEST,
                     }
                 }
             }
@@ -280,10 +280,10 @@ unsafe extern "C" fn dispatch(_: PDEVICE_OBJECT, irp: PIRP) -> i32 {
             status = api::IoCsqInsertIrpEx(addr_of_mut!(READ_CSQ), irp, null_mut(), null_mut());
             if !nt_success(status) {
                 complete_read(irp, status, 0);
-                return HV_WDK_STATUS_PENDING;
+                return FWX_WDK_STATUS_PENDING;
             }
             schedule_read();
-            return HV_WDK_STATUS_PENDING;
+            return FWX_WDK_STATUS_PENDING;
         }
         (*irp).IoStatus.__bindgen_anon_1.Status = status;
         (*irp).IoStatus.Information = transferred as u64;
@@ -324,11 +324,11 @@ pub(super) unsafe fn initialize_io() -> i32 {
     }
 }
 
-static mut DEVICE_NAME: UNICODE_STRING = wide!("\\Device\\HyperVXNdisFilter");
-static mut LINK_NAME: UNICODE_STRING = wide!("\\DosDevices\\HyperVXNdisFilter");
+static mut DEVICE_NAME: UNICODE_STRING = wide!("\\Device\\FirewallXNdisFilter");
+static mut LINK_NAME: UNICODE_STRING = wide!("\\DosDevices\\FirewallXNdisFilter");
 #[unsafe(no_mangle)]
 #[cfg(not(test))]
-unsafe extern "C" fn hv_initialize(driver: PDRIVER_OBJECT, registry: PUNICODE_STRING) -> i32 {
+unsafe extern "C" fn fwx_initialize(driver: PDRIVER_OBJECT, registry: PUNICODE_STRING) -> i32 {
     unsafe {
         let mut status = initialize_io();
         if !nt_success(status) {
@@ -359,7 +359,7 @@ unsafe extern "C" fn hv_initialize(driver: PDRIVER_OBJECT, registry: PUNICODE_ST
         FILTER_NDIS_VERSION = ndis::ndis_version(NdisGetVersion());
         let mut characteristics: NDIS_FILTER_DRIVER_CHARACTERISTICS = zeroed();
         if !ndis::configure_characteristics(&mut characteristics, FILTER_NDIS_VERSION) {
-            status = HV_WDK_NDIS_BAD_VERSION;
+            status = FWX_WDK_NDIS_BAD_VERSION;
         } else {
             status = NdisFRegisterFilterDriver(
                 driver,
@@ -367,11 +367,11 @@ unsafe extern "C" fn hv_initialize(driver: PDRIVER_OBJECT, registry: PUNICODE_ST
                 &mut characteristics,
                 addr_of_mut!(DRIVER_HANDLE),
             );
-            if status == HV_WDK_NDIS_SUCCESS {
+            if status == FWX_WDK_NDIS_SUCCESS {
                 let mut attributes: NDIS_DEVICE_OBJECT_ATTRIBUTES = zeroed();
                 attributes.Header.Type = NDIS_OBJECT_TYPE_DEVICE_OBJECT_ATTRIBUTES as u8;
                 attributes.Header.Revision = NDIS_DEVICE_OBJECT_ATTRIBUTES_REVISION_1 as u8;
-                attributes.Header.Size = HV_WDK_DEVICE_ATTRIBUTES_SIZE as u16;
+                attributes.Header.Size = FWX_WDK_DEVICE_ATTRIBUTES_SIZE as u16;
                 attributes.DeviceName = addr_of_mut!(DEVICE_NAME);
                 attributes.SymbolicName = addr_of_mut!(LINK_NAME);
                 attributes.MajorFunctions = dispatch_table.as_mut_ptr();
@@ -384,7 +384,7 @@ unsafe extern "C" fn hv_initialize(driver: PDRIVER_OBJECT, registry: PUNICODE_ST
                 );
             }
         }
-        if status != HV_WDK_NDIS_SUCCESS {
+        if status != FWX_WDK_NDIS_SUCCESS {
             unload(driver);
             return status;
         }
@@ -395,7 +395,7 @@ unsafe extern "C" fn hv_initialize(driver: PDRIVER_OBJECT, registry: PUNICODE_ST
         schedule_read();
         (*CONTROL_DEVICE).Flags &= !DO_DEVICE_INITIALIZING;
         registry::signal_driver_ready();
-        HV_WDK_STATUS_SUCCESS
+        FWX_WDK_STATUS_SUCCESS
     }
 }
 #[cfg(not(test))]

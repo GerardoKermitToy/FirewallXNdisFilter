@@ -1,6 +1,6 @@
-# HyperVXNdisFilter
+# FirewallXNdisFilter
 
-HyperVXNdisFilter is an experimental Windows network filter written in Rust, with a C++ monitor and client APIs. It uses an **NDIS Lightweight Filter (LWF)** on compatible host Ethernet adapters, both physical and virtual; it is not a Hyper-V switch extension and does not use WFP.
+FirewallXNdisFilter is an experimental Windows network filter written in Rust, with a C++ monitor and client APIs. It uses an **NDIS Lightweight Filter (LWF)** on compatible host Ethernet adapters, both physical and virtual; it is not a Hyper-V switch extension and does not use WFP.
 
 Only traffic traversing an attached NDIS module can be inspected. Some adapters cannot accept an ordinary LWF; for example, Wintun/WireGuard adapters declaring `LowerRange=nolower` are not supported. Internal VM-to-VM traffic that never passes through an attached host adapter is also outside the filter's scope. The package and device API version is **0.3.3.0**: use a matching driver and client, as earlier event layouts are incompatible. Command byte 8 (`CleanEndedConnections`) is no longer supported; older controllers must stop sending it even though the event/API version is unchanged.
 
@@ -21,13 +21,13 @@ From Git Bash at the repository root, build a signed Release package and run the
 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/Build.ps1 -Test -PfxPath 'C:\path\to\driver-signing.pfx' -RootCertificate 'C:\path\to\root-ca.der'
 ```
 
-Adjust the certificate paths for your machine. Set `HYPERVXNDISFILTER_PFX_PASSWORD` or pass `-PfxPassword` when needed. The build requests an RFC 3161 timestamp from `http://timestamp.digicert.com` by default; use `-TimestampUrl` for another service. Only the timestamp hash is sent; the private key stays local. Signing does not by itself guarantee that Windows will accept the driver: review the target system's signing and security requirements independently. The build does not install the driver or change certificate stores or security settings.
+Adjust the certificate paths for your machine. Set `FIREWALLXNDISFILTER_PFX_PASSWORD` or pass `-PfxPassword` when needed. The build requests an RFC 3161 timestamp from `http://timestamp.digicert.com` by default; use `-TimestampUrl` for another service. Only the timestamp hash is sent; the private key stays local. Signing does not by itself guarantee that Windows will accept the driver: review the target system's signing and security requirements independently. The build does not install the driver or change certificate stores or security settings.
 
-The package in `dist/` contains `HyperVXNdisFilter.sys`, its INF and CAT, `HyperVXNdisFilterNotify.dll`, `hyperv_monitor.exe`, `Install.exe`, `Uninstall.exe`, and matching full PDBs. Keep these files together and do not mix package versions.
+The package in `dist/` contains `FirewallXNdisFilter.sys`, its INF and CAT, `FirewallXNdisFilterNotify.dll`, `firewallx_monitor.exe`, `Install.exe`, `Uninstall.exe`, and matching full PDBs. Keep these files together and do not mix package versions. If `dist/` contains artifacts from a previous product name, the build refuses to overwrite or mix them; preserve and move the old package before rebuilding.
 
 ## Install
 
-Use an elevated Administrator/SYSTEM console, stop any monitor, and keep local recovery access available. Windows may reconfigure networking during installation. If the driver is already installed, remove it first; the installer does not replace a live driver. For an installation under a previous product name, use that installation's matching removal tool.
+Use an elevated Administrator/SYSTEM console, stop any monitor, and keep local recovery access available. Windows may reconfigure networking during installation. If the driver is already installed, remove it first; the installer does not replace a live driver. In particular, an existing `HyperVXNdisFilter` installation must be removed with its matching old `Uninstall.exe`, not the new one. The filter and notify GUIDs are unchanged, so the new installer refuses a previously named component rather than attempting an in-place migration. The notify registration also refuses to overwrite or remove a server belonging to an older product name.
 
 ```bash
 ./dist/Install.exe
@@ -48,16 +48,16 @@ The previous `Set-Binding.ps1` ICS-only helper is retired and does not change bi
 Start with the default PermanentAccept policy:
 
 ```bash
-./dist/hyperv_monitor.exe --duration 15 --timestamps --memory-stats --out allow.log
+./dist/firewallx_monitor.exe --duration 15 --timestamps --memory-stats --out allow.log
 ```
 
 Omit `--duration` to run until **Ctrl+C**. To apply a blocking verdict only to a test remote endpoint:
 
 ```bash
-./dist/hyperv_monitor.exe --duration 10 --match 192.0.2.10:9000 --verdict permanent-block --out block.log
+./dist/firewallx_monitor.exe --duration 10 --match 192.0.2.10:9000 --verdict permanent-block --out block.log
 ```
 
-`--match` selects the remote endpoint reported by the driver in both directions; unmatched events receive PermanentAccept. `--filter-ip` only hides output and does not limit verdicts. A blocking verdict without `--match` applies to every event and can disrupt connectivity. Run `./dist/hyperv_monitor.exe --help` for the remaining options.
+`--match` selects the remote endpoint reported by the driver in both directions; unmatched events receive PermanentAccept. `--filter-ip` only hides output and does not limit verdicts. A blocking verdict without `--match` applies to every event and can disrupt connectivity. Run `./dist/firewallx_monitor.exe --help` for the remaining options.
 
 The monitor opens the existing control device; it does not install, load, bind, or start a temporary driver. Install and start the NDIS LWF before running it. `--duration` bounds monitoring, not driver installation or startup.
 
@@ -75,7 +75,9 @@ The uninstaller disarms and removes this filter and its identified driver packag
 
 ## API
 
-The reusable clients are [PortmasterKext.h](monitor/include/PortmasterKext.h) (`pmkext`, with [DriverProtocol.h](monitor/include/DriverProtocol.h) for the codec) and the independent C++20 [HyperVXNdisFilter.hpp](monitor/include/HyperVXNdisFilter.hpp) (`hypervxndisfilter::Client`). The driver-side wire definitions are in [protocol/src/lib.rs](protocol/src/lib.rs); adapter snapshots use [adapter_info.rs](driver/src/adapter_info.rs).
+The reusable clients are [PortmasterKext.h](monitor/include/PortmasterKext.h) (`pmkext`, with [DriverProtocol.h](monitor/include/DriverProtocol.h) for the codec) and the independent C++20 [FirewallXNdisFilter.hpp](monitor/include/FirewallXNdisFilter.hpp) (`firewallxndisfilter::Client`). The driver-side wire definitions are in [protocol/src/lib.rs](protocol/src/lib.rs); adapter snapshots use [adapter_info.rs](driver/src/adapter_info.rs).
+
+The rename changes the device and readiness-event names, NetCfg component ID, service, package filenames, and header-only include/namespace. Applications built for `HyperVXNdisFilter` must update those names and be rebuilt; there are no old-name aliases. The event and IOCTL wire format remains **0.3.3.0**, but the version number alone does not bridge these naming changes.
 
 The former `pmkext::Driver::RequestCleanEndedConnections` method and `Client::Command::CleanEndedConnections` value have been removed. Update and rebuild applications that used them; cache expiry cleanup is automatic.
 
@@ -101,7 +103,7 @@ This is experimental kernel code. Offline tests and an enabled binding do not pr
 
 ### Device session and IOCTLs
 
-Open **`\\.\HyperVXNdisFilter`** as Administrator/SYSTEM with `GENERIC_READ | GENERIC_WRITE`, `OPEN_EXISTING`, and exclusive sharing. The C++ client uses `FILE_FLAG_OVERLAPPED`; nonzero buffered reads wait for event bytes and are cancellable. Only **one controller** may hold the device. There is no named-pipe/winrpc transport.
+Open **`\\.\FirewallXNdisFilter`** as Administrator/SYSTEM with `GENERIC_READ | GENERIC_WRITE`, `OPEN_EXISTING`, and exclusive sharing. The C++ client uses `FILE_FLAG_OVERLAPPED`; nonzero buffered reads wait for event bytes and are cancellable. Only **one controller** may hold the device. There is no named-pipe/winrpc transport.
 
 Opening the device activates a policy session and resets its event queue, permanent cache, and bandwidth buckets. The client must verify the device version before relying on the protocol. `Driver::Open` only opens the session; the monitor separately checks the version.
 
@@ -174,13 +176,13 @@ Names longer than 255 UTF-16 code units are bounded explicitly, with the corresp
 
 ### Driver-start notification
 
-`Global\HyperVXNdisFilter.DriverReady` (kernel name `\BaseNamedObjects\HyperVXNdisFilter.DriverReady`) is a named manual-reset event, separate from the device byte stream and IOCTLs. New objects allow access only to Administrator/SYSTEM. At startup, after initializing the control device and timer, the driver creates/opens the event, signals it, and keeps its handle until unload; unload clears the event and closes the handle. This requires the updated SYS, not just the monitor. Event creation is best-effort if the global object directory is not yet available during early system boot; device initialization does not depend on notification success.
+`Global\FirewallXNdisFilter.DriverReady` (kernel name `\BaseNamedObjects\FirewallXNdisFilter.DriverReady`) is a named manual-reset event, separate from the device byte stream and IOCTLs. New objects allow access only to Administrator/SYSTEM. At startup, after initializing the control device and timer, the driver creates/opens the event, signals it, and keeps its handle until unload; unload clears the event and closes the handle. This requires the updated SYS, not just the monitor. Event creation is best-effort if the global object directory is not yet available during early system boot; device initialization does not depend on notification success.
 
 The header-only client uses reset-before-retry startup waiting on this event, without device polling. A signal is only a retry hint, not proof of NDIS attachment, device authorization or version compatibility. The console monitor opens an already available device; it does not wait on the readiness event, load a temporary driver or reconnect after an established session ends.
 
 ### C++ client methods
 
-Construct `Driver(std::wstring service_name = L"HyperVXNdisFilter")`; the argument selects the device basename, not a service to create. The class is non-copyable. Boolean methods report failures through `std::string& error`; sending a request does not imply a synchronous event response or confirmation that a verdict was applied.
+Construct `Driver(std::wstring service_name = L"FirewallXNdisFilter")`; the argument selects the device basename, not a service to create. The class is non-copyable. Boolean methods report failures through `std::string& error`; sending a request does not imply a synchronous event response or confirmation that a verdict was applied.
 
 | Method | Contract |
 |---|---|
@@ -203,13 +205,13 @@ A typical integration opens the device, checks its version, installs handlers, a
 
 ### Lightweight header-only client
 
-[HyperVXNdisFilter.hpp](monitor/include/HyperVXNdisFilter.hpp) provides the separate **`hypervxndisfilter::Client`** namespace/API. Include just that file in a Windows x64 **C++20** application; no `pmkext` sources, codec, or client library are needed. It uses Kernel32 and Advapi32 (MSVC links Advapi32 through the header's pragma; other toolchains must link it explicitly). A compiled example is [callback_client.cpp](monitor/examples/callback_client.cpp), built as `build/monitor/callback_client.exe`. The example opens a real device if explicitly run; offline tests never run it.
+[FirewallXNdisFilter.hpp](monitor/include/FirewallXNdisFilter.hpp) provides the separate **`firewallxndisfilter::Client`** namespace/API. Include just that file in a Windows x64 **C++20** application; no `pmkext` sources, codec, or client library are needed. It uses Kernel32 and Advapi32 (MSVC links Advapi32 through the header's pragma; other toolchains must link it explicitly). A compiled example is [callback_client.cpp](monitor/examples/callback_client.cpp), built as `build/monitor/callback_client.exe`. The example opens a real device if explicitly run; offline tests never run it.
 
 `Run` uses one caller-owned thread: it blocks on overlapped read completion, Stop, or an optional runtime deadline. There is no automatic statistics timer or verdict. The receive buffer grows fallibly for large bandwidth groups. Connection headers, payloads, bandwidth arrays and log-message views borrow that buffer and expire when the callback returns; copy data that must outlive the callback. Bandwidth callbacks run once per nonempty group record, not once per tuple.
 
 | Method | Contract (`DWORD`: 0 is success, otherwise a Win32 error) |
 |---|---|
-| `Open()` | Consumes a pending Stop with `ERROR_OPERATION_ABORTED` before device access; otherwise tries the existing exclusive Administrator/SYSTEM device. An exclusive-device `ERROR_SHARING_VIOLATION` is returned immediately on any attempt; the caller may retry after the other controller releases its handle. After any other open failure, creates/opens the protected `Global\HyperVXNdisFilter.DriverReady` event, resets it before retrying, then waits **indefinitely**, without device polling or a startup timeout. A signal only requests a retry. `Stop()` cancels this wait with `ERROR_OPERATION_ABORTED`. Never installs/loads the driver. Requires version `{0,3,3,0}` after opening; version/I/O errors are returned rather than treated as startup signals. |
+| `Open()` | Consumes a pending Stop with `ERROR_OPERATION_ABORTED` before device access; otherwise tries the existing exclusive Administrator/SYSTEM device. An exclusive-device `ERROR_SHARING_VIOLATION` is returned immediately on any attempt; the caller may retry after the other controller releases its handle. After any other open failure, creates/opens the protected `Global\FirewallXNdisFilter.DriverReady` event, resets it before retrying, then waits **indefinitely**, without device polling or a startup timeout. A signal only requests a retry. `Stop()` cancels this wait with `ERROR_OPERATION_ABORTED`. Never installs/loads the driver. Requires version `{0,3,3,0}` after opening; version/I/O errors are returned rather than treated as startup signals. |
 | `Run(const Callbacks&, DWORD duration_ms = INFINITE)` | Blocking callback dispatch on the calling thread. A positive duration limits monitoring only, **not Open's unlimited startup wait**; zero is invalid. Stop/runtime expiry returns success after cancelling/reaping the outstanding read. Unexpected zero-byte reads are an error, not a retry loop. Callback exceptions propagate after pending I/O is reaped. |
 | `Stop()` | Thread-safe local stop, usable during Open/Run; wakes the wait. A stop requested while closed cancels the next Open once with `ERROR_OPERATION_ABORTED` before touching the device; a successful Close clears a pending stop. Does not itself shut down policy, close handles or unload the LWF. |
 | `Close()` | Returns `ERROR_BUSY` during Run. Otherwise closes handles; device cleanup disconnects policy and releases pending packets through fallback. Join Run and all other callers before Close/destruction. |
@@ -395,4 +397,4 @@ Empty/truncated writes are rejected with `STATUS_INVALID_PARAMETER`; unsupported
 
 ## License
 
-Copyright (c) 2026 HyperVXNdisFilter contributors. Licensed under **GNU General Public License version 3 only** (`GPL-3.0-only`); see [LICENSE](LICENSE). The adapted monitor retains its original GPLv3 license and source-provenance notices; see [monitor/README.md](monitor/README.md) and [monitor/LICENSE](monitor/LICENSE).
+Copyright (c) 2026 FirewallXNdisFilter contributors. Licensed under **GNU General Public License version 3 only** (`GPL-3.0-only`); see [LICENSE](LICENSE). The adapted monitor retains its original GPLv3 license and source-provenance notices; see [monitor/README.md](monitor/README.md) and [monitor/LICENSE](monitor/LICENSE).

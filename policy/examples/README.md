@@ -118,7 +118,7 @@ unit, panic abort) plus the driver's `no-redzone` flag.
 The benchmark generator and container adapters also have offline regression tests (including disjoint datasets, the exact 90/10 mix, TTL behavior, and forced hash collisions):
 
 ```bash
-env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo test --release -p hyperv-policy --example cache_lookup_bench --locked
+env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo test --release -p firewallx-policy --example cache_lookup_bench --locked
 ```
 
 ## Interpretation and limits
@@ -162,11 +162,11 @@ original `indexed_pages_incremental` page-directory prototype remains a separate
 reference, not the integrated driver implementation.
 
 ```bash
-env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo test --release -p hyperv-policy --example bandwidth_stats_bench --locked -- --test-threads=1
+env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo test --release -p firewallx-policy --example bandwidth_stats_bench --locked -- --test-threads=1
 ```
 
 ```bash
-env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo run --release -p hyperv-policy --example bandwidth_stats_bench --locked -- --records 1000000 --flows 250000 --rounds 5 --scenario realistic --out build/bandwidth-bench
+env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo run --release -p firewallx-policy --example bandwidth_stats_bench --locked -- --records 1000000 --flows 250000 --rounds 5 --scenario realistic --out build/bandwidth-bench
 ```
 
 The default realistic dataset contains one million admitted TCP/UDP observations

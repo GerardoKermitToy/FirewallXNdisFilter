@@ -82,7 +82,7 @@ BOOL CancelIoEx(HANDLE, LPOVERLAPPED);
 #define WriteFile testio::WriteFile
 #define GetOverlappedResult testio::GetOverlappedResult
 #define CancelIoEx testio::CancelIoEx
-#include "HyperVXNdisFilter.hpp"
+#include "FirewallXNdisFilter.hpp"
 #undef AcquireSRWLockExclusive
 #undef CreateEventW
 #undef CreateFileW
@@ -94,7 +94,7 @@ BOOL CancelIoEx(HANDLE, LPOVERLAPPED);
 #undef CancelIoEx
 
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); return false; } } while (false)
-using Client = hypervxndisfilter::Client;
+using Client = firewallxndisfilter::Client;
 using Bytes = std::vector<uint8_t>;
 
 namespace testio {
@@ -150,8 +150,8 @@ void Reset() {
     if (!state.operations.empty()) throw std::runtime_error("unreaped fake I/O");
     state.pending = nullptr;
     state.queued.clear(); state.written.clear(); state.open_errors.clear(); state.offset = 0;
-    state.adapter_info.assign(HV_ADAPTER_INFO_HEADER_SIZE, 0);
-    HvEncodeAdapterInfoHeader(state.adapter_info.data(), 0, 0);
+    state.adapter_info.assign(FWX_ADAPTER_INFO_HEADER_SIZE, 0);
+    FwxEncodeAdapterInfoHeader(state.adapter_info.data(), 0, 0);
     state.adapter_info_error = ERROR_SUCCESS;
     state.adapter_replies.clear(); state.adapter_capacities.clear();
     state.adapter_reply_index = 0; state.legacy_adapter_info = false;
@@ -183,7 +183,7 @@ void Inject(Bytes bytes) {
 HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manual, BOOL initial, LPCWSTR name) {
     if (!name) return ::CreateEventW(sa, manual, initial, nullptr);
     std::lock_guard lock(state.mutex);
-    if (std::wcscmp(name, L"Global\\HyperVXNdisFilter.DriverReady")) {
+    if (std::wcscmp(name, L"Global\\FirewallXNdisFilter.DriverReady")) {
         ::SetLastError(ERROR_INVALID_NAME); return nullptr;
     }
     SECURITY_DESCRIPTOR_CONTROL control = 0;
@@ -199,7 +199,7 @@ HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manual, BOOL initial, LPCWSTR
 }
 HANDLE CreateFileW(LPCWSTR path, DWORD access, DWORD sharing, LPSECURITY_ATTRIBUTES, DWORD mode, DWORD flags, HANDLE) {
     std::lock_guard lock(state.mutex);
-    if (std::wcscmp(path, L"\\\\.\\HyperVXNdisFilter") || access != (GENERIC_READ | GENERIC_WRITE) ||
+    if (std::wcscmp(path, L"\\\\.\\FirewallXNdisFilter") || access != (GENERIC_READ | GENERIC_WRITE) ||
         sharing || mode != OPEN_EXISTING || !(flags & FILE_FLAG_OVERLAPPED)) {
         ::SetLastError(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE;
     }
@@ -224,7 +224,7 @@ BOOL DeviceIoControl(HANDLE, DWORD code, LPVOID input, DWORD input_size, LPVOID 
     if (input || input_size) { ::SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
     if (code == 0x9c40e00cu) {
         ++state.adapter_queries;
-        if (!output || capacity < HV_ADAPTER_INFO_HEADER_SIZE || !ov) {
+        if (!output || capacity < FWX_ADAPTER_INFO_HEADER_SIZE || !ov) {
             ::SetLastError(ERROR_INVALID_PARAMETER); return FALSE;
         }
         state.adapter_capacities.push_back(capacity);
@@ -236,7 +236,7 @@ BOOL DeviceIoControl(HANDLE, DWORD code, LPVOID input, DWORD input_size, LPVOID 
         DWORD size = reply && reply->reported != UINT32_MAX ? reply->reported : static_cast<DWORD>(bytes.size());
         if (!reply && capacity < bytes.size()) {
             if (state.legacy_adapter_info) { ::SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
-            size = HV_ADAPTER_INFO_HEADER_SIZE; error = ERROR_MORE_DATA;
+            size = FWX_ADAPTER_INFO_HEADER_SIZE; error = ERROR_MORE_DATA;
         }
         if (error && error != ERROR_MORE_DATA && !(reply && reply->pending)) {
             ::SetLastError(error); return FALSE;
@@ -329,14 +329,14 @@ namespace {
 void Put(Bytes& bytes, size_t offset, uint64_t value, unsigned count) {
     for (unsigned i = 0; i < count; ++i) bytes[offset + i] = static_cast<uint8_t>(value >> (i * 8));
 }
-void SetAdapterName(uint16_t (&out)[HV_ADAPTER_INFO_NAME_CAPACITY], uint32_t& length, std::wstring_view name) {
-    if (name.size() >= HV_ADAPTER_INFO_NAME_CAPACITY) throw std::runtime_error("oversized fixture name");
+void SetAdapterName(uint16_t (&out)[FWX_ADAPTER_INFO_NAME_CAPACITY], uint32_t& length, std::wstring_view name) {
+    if (name.size() >= FWX_ADAPTER_INFO_NAME_CAPACITY) throw std::runtime_error("oversized fixture name");
     std::fill(std::begin(out), std::end(out), uint16_t{0});
     length = static_cast<uint32_t>(name.size());
     for (size_t i = 0; i < name.size(); ++i) out[i] = static_cast<uint16_t>(name[i]);
 }
-HV_ADAPTER_INFO AdapterFixture(uint32_t seed, uint32_t flags) {
-    HV_ADAPTER_INFO a{};
+FWX_ADAPTER_INFO AdapterFixture(uint32_t seed, uint32_t flags) {
+    FWX_ADAPTER_INFO a{};
     a.ModuleId = 0xfedcba9876543200ull + seed;
     a.InterfaceIndex = 0x80000010u + seed;
     a.FilterInterfaceIndex = 0x90000020u + seed;
@@ -368,7 +368,7 @@ HV_ADAPTER_INFO AdapterFixture(uint32_t seed, uint32_t flags) {
     a.RestartFlags = 0xe0000900u + seed;
     a.AttachFlags = 0xe0000a00u + seed;
     a.ConnectorPresent = seed % 2;
-    a.MacAddressLength = seed % 2 ? HV_ADAPTER_INFO_MAC_CAPACITY : 6;
+    a.MacAddressLength = seed % 2 ? FWX_ADAPTER_INFO_MAC_CAPACITY : 6;
     for (size_t i = 0; i < sizeof(a.MacAddress); ++i) a.MacAddress[i] = static_cast<uint8_t>(i * 7 + seed);
     a.MacAddress[5] = 0;
     a.AutoNegotiationFlags = 0xe0000b00u + seed;
@@ -379,15 +379,15 @@ HV_ADAPTER_INFO AdapterFixture(uint32_t seed, uint32_t flags) {
     SetAdapterName(a.FilterModuleName, a.FilterModuleNameLength, L"filter-Ж-日-name-" + std::to_wstring(seed));
     return a;
 }
-Bytes AdapterResponse(std::span<const HV_ADAPTER_INFO> adapters = {}) {
-    if (adapters.size() > HV_ADAPTER_INFO_MAX_ADAPTERS) throw std::runtime_error("oversized fixture snapshot");
+Bytes AdapterResponse(std::span<const FWX_ADAPTER_INFO> adapters = {}) {
+    if (adapters.size() > FWX_ADAPTER_INFO_MAX_ADAPTERS) throw std::runtime_error("oversized fixture snapshot");
     const auto count = static_cast<uint32_t>(adapters.size());
     uint32_t running = 0;
-    for (const auto& adapter : adapters) if (adapter.Flags & HV_ADAPTER_RUNNING) ++running;
-    Bytes bytes(HvAdapterInfoSize(count));
-    HvEncodeAdapterInfoHeader(bytes.data(), count, running);
+    for (const auto& adapter : adapters) if (adapter.Flags & FWX_ADAPTER_RUNNING) ++running;
+    Bytes bytes(FwxAdapterInfoSize(count));
+    FwxEncodeAdapterInfoHeader(bytes.data(), count, running);
     for (size_t i = 0; i < adapters.size(); ++i)
-        HvEncodeAdapterInfo(bytes.data() + HV_ADAPTER_INFO_HEADER_SIZE + i * HV_ADAPTER_INFO_ENTRY_SIZE, &adapters[i]);
+        FwxEncodeAdapterInfo(bytes.data() + FWX_ADAPTER_INFO_HEADER_SIZE + i * FWX_ADAPTER_INFO_ENTRY_SIZE, &adapters[i]);
     return bytes;
 }
 bool NameMatches(std::wstring_view actual, const uint16_t* expected, uint32_t length) {
@@ -395,7 +395,7 @@ bool NameMatches(std::wstring_view actual, const uint16_t* expected, uint32_t le
     for (size_t i = 0; i < actual.size(); ++i) CHECK(actual[i] == static_cast<wchar_t>(expected[i]));
     return true;
 }
-bool MatchesAdapter(const Client::AdapterInfo& a, const HV_ADAPTER_INFO& b) {
+bool MatchesAdapter(const Client::AdapterInfo& a, const FWX_ADAPTER_INFO& b) {
 #define FIELD(name, source) CHECK(a.name == b.source)
     FIELD(module_id, ModuleId);
     FIELD(interface_index, InterfaceIndex);
@@ -441,47 +441,47 @@ bool MatchesAdapter(const Client::AdapterInfo& a, const HV_ADAPTER_INFO& b) {
     CHECK(NameMatches(a.filter_module_name, b.FilterModuleName, b.FilterModuleNameLength));
     return true;
 }
-bool MatchesSnapshot(const Client::AdapterSnapshot& snapshot, std::span<const HV_ADAPTER_INFO> expected) {
+bool MatchesSnapshot(const Client::AdapterSnapshot& snapshot, std::span<const FWX_ADAPTER_INFO> expected) {
     CHECK(snapshot.adapters.size() == expected.size());
     uint32_t running = 0;
     for (size_t i = 0; i < expected.size(); ++i) {
         CHECK(MatchesAdapter(snapshot.adapters[i], expected[i]));
-        if (expected[i].Flags & HV_ADAPTER_RUNNING) ++running;
+        if (expected[i].Flags & FWX_ADAPTER_RUNNING) ++running;
     }
     CHECK(snapshot.running_count == running);
     return true;
 }
 bool TestAdapterInfoCodec() {
-    static_assert(Client::AdapterInfoVersion == HV_ADAPTER_INFO_VERSION);
-    static_assert(Client::AdapterInfoHeaderSize == HV_ADAPTER_INFO_HEADER_SIZE);
-    static_assert(Client::AdapterInfoEntrySize == HV_ADAPTER_INFO_ENTRY_SIZE);
-    static_assert(Client::MaxAdapters == HV_ADAPTER_INFO_MAX_ADAPTERS);
-    static_assert(Client::AdapterNameCapacity == HV_ADAPTER_INFO_NAME_CAPACITY);
-    static_assert(Client::AdapterMacCapacity == HV_ADAPTER_INFO_MAC_CAPACITY);
-    static_assert(Client::MaxAdapterInfoSize == HV_ADAPTER_INFO_MAX_SIZE && Client::MaxAdapterInfoSize == 4294966736u);
+    static_assert(Client::AdapterInfoVersion == FWX_ADAPTER_INFO_VERSION);
+    static_assert(Client::AdapterInfoHeaderSize == FWX_ADAPTER_INFO_HEADER_SIZE);
+    static_assert(Client::AdapterInfoEntrySize == FWX_ADAPTER_INFO_ENTRY_SIZE);
+    static_assert(Client::MaxAdapters == FWX_ADAPTER_INFO_MAX_ADAPTERS);
+    static_assert(Client::AdapterNameCapacity == FWX_ADAPTER_INFO_NAME_CAPACITY);
+    static_assert(Client::AdapterMacCapacity == FWX_ADAPTER_INFO_MAC_CAPACITY);
+    static_assert(Client::MaxAdapterInfoSize == FWX_ADAPTER_INFO_MAX_SIZE && Client::MaxAdapterInfoSize == 4294966736u);
     static_assert(Client::InitialAdapterInfoSize == 56336);
     static_assert(Client::MaxAdapters == 2440322u);
     static_assert(static_cast<uint64_t>(Client::MaxAdapterInfoSize) + Client::AdapterInfoEntrySize > UINT32_MAX);
-    static_assert(Client::AdapterRunning == HV_ADAPTER_RUNNING && Client::AdapterGeneralValid == HV_ADAPTER_GENERAL_VALID);
-    static_assert(Client::AdapterConnectorValid == HV_ADAPTER_CONNECTOR_VALID);
-    static_assert(Client::AdapterInstanceNameTruncated == HV_ADAPTER_INSTANCE_NAME_TRUNCATED);
-    static_assert(Client::AdapterBaseNameTruncated == HV_ADAPTER_BASE_NAME_TRUNCATED);
-    static_assert(Client::AdapterFilterNameTruncated == HV_ADAPTER_FILTER_NAME_TRUNCATED);
-    static_assert(Client::AdapterLinkStateValid == HV_ADAPTER_LINK_STATE_VALID && Client::AdapterPauseValid == HV_ADAPTER_PAUSE_VALID);
-    static_assert(Client::AdapterKnownFlags == HV_ADAPTER_INFO_KNOWN_FLAGS);
+    static_assert(Client::AdapterRunning == FWX_ADAPTER_RUNNING && Client::AdapterGeneralValid == FWX_ADAPTER_GENERAL_VALID);
+    static_assert(Client::AdapterConnectorValid == FWX_ADAPTER_CONNECTOR_VALID);
+    static_assert(Client::AdapterInstanceNameTruncated == FWX_ADAPTER_INSTANCE_NAME_TRUNCATED);
+    static_assert(Client::AdapterBaseNameTruncated == FWX_ADAPTER_BASE_NAME_TRUNCATED);
+    static_assert(Client::AdapterFilterNameTruncated == FWX_ADAPTER_FILTER_NAME_TRUNCATED);
+    static_assert(Client::AdapterLinkStateValid == FWX_ADAPTER_LINK_STATE_VALID && Client::AdapterPauseValid == FWX_ADAPTER_PAUSE_VALID);
+    static_assert(Client::AdapterKnownFlags == FWX_ADAPTER_INFO_KNOWN_FLAGS);
     static_assert(Client::RequiredVersion == std::array<uint8_t, 4>{0, 3, 3, 0}); // Additive, not an event-wire change.
-    std::vector<HV_ADAPTER_INFO> fixtures{
-        AdapterFixture(1, HV_ADAPTER_INFO_KNOWN_FLAGS),
-        AdapterFixture(2, HV_ADAPTER_INFO_KNOWN_FLAGS & ~HV_ADAPTER_RUNNING),
+    std::vector<FWX_ADAPTER_INFO> fixtures{
+        AdapterFixture(1, FWX_ADAPTER_INFO_KNOWN_FLAGS),
+        AdapterFixture(2, FWX_ADAPTER_INFO_KNOWN_FLAGS & ~FWX_ADAPTER_RUNNING),
         {}};
     fixtures[2].ModuleId = 3; // Initially attached, no optional attributes yet.
     fixtures[2].InterfaceIndex = 19;
-    const std::wstring longest(HV_ADAPTER_INFO_NAME_CAPACITY - 1, L'中');
+    const std::wstring longest(FWX_ADAPTER_INFO_NAME_CAPACITY - 1, L'中');
     SetAdapterName(fixtures[1].InstanceName, fixtures[1].InstanceNameLength, longest);
     SetAdapterName(fixtures[1].BaseName, fixtures[1].BaseNameLength, longest);
     SetAdapterName(fixtures[1].FilterModuleName, fixtures[1].FilterModuleNameLength, longest);
     const auto response = AdapterResponse(fixtures);
-    CHECK(response.size() == HV_ADAPTER_INFO_HEADER_SIZE + fixtures.size() * HV_ADAPTER_INFO_ENTRY_SIZE);
+    CHECK(response.size() == FWX_ADAPTER_INFO_HEADER_SIZE + fixtures.size() * FWX_ADAPTER_INFO_ENTRY_SIZE);
     Client::AdapterSnapshot snapshot;
     for (size_t shift = 0; shift < 8; ++shift) {
         Bytes storage(shift + response.size());
@@ -493,21 +493,21 @@ bool TestAdapterInfoCodec() {
     }
     CHECK(Client::DecodeAdapterInfo(AdapterResponse(), snapshot) == ERROR_SUCCESS);
     CHECK(snapshot.running_count == 0 && snapshot.adapters.empty());
-    std::vector<HV_ADAPTER_INFO> many;
+    std::vector<FWX_ADAPTER_INFO> many;
     for (uint32_t i = 0; i < 97; ++i)
-        many.push_back(AdapterFixture(i, i % 2 ? 0 : HV_ADAPTER_RUNNING));
+        many.push_back(AdapterFixture(i, i % 2 ? 0 : FWX_ADAPTER_RUNNING));
     many.back() = fixtures[1];
     const auto full = AdapterResponse(many);
-    CHECK(full.size() == HvAdapterInfoSize(97) && full.size() > Client::InitialAdapterInfoSize);
+    CHECK(full.size() == FwxAdapterInfoSize(97) && full.size() > Client::InitialAdapterInfoSize);
     CHECK(Client::DecodeAdapterInfo(full, snapshot) == ERROR_SUCCESS);
     CHECK(MatchesSnapshot(snapshot, many) && snapshot.running_count == 48);
     return true;
 }
 bool TestAdapterInfoMalformed() {
-    const std::vector<HV_ADAPTER_INFO> fixtures{
-        AdapterFixture(1, HV_ADAPTER_INFO_KNOWN_FLAGS), AdapterFixture(2, HV_ADAPTER_PAUSE_VALID)};
+    const std::vector<FWX_ADAPTER_INFO> fixtures{
+        AdapterFixture(1, FWX_ADAPTER_INFO_KNOWN_FLAGS), AdapterFixture(2, FWX_ADAPTER_PAUSE_VALID)};
     const auto good = AdapterResponse(fixtures);
-    const std::vector<HV_ADAPTER_INFO> kept{AdapterFixture(99, HV_ADAPTER_RUNNING)};
+    const std::vector<FWX_ADAPTER_INFO> kept{AdapterFixture(99, FWX_ADAPTER_RUNNING)};
     Client::AdapterSnapshot snapshot;
     CHECK(Client::DecodeAdapterInfo(AdapterResponse(kept), snapshot) == ERROR_SUCCESS);
     const auto* original = snapshot.adapters.data();
@@ -529,7 +529,7 @@ bool TestAdapterInfoMalformed() {
     for (uint32_t value : {0u, 1u, 33u, 0xffffffffu}) CHECK(reject32(8, value));
     for (uint32_t value : {0u, 2u, 3u, 0xffffffffu}) CHECK(reject32(12, value));
     for (size_t i = 0; i < fixtures.size(); ++i) { // Also reject after an earlier entry has already decoded.
-        const size_t entry = HV_ADAPTER_INFO_HEADER_SIZE + i * HV_ADAPTER_INFO_ENTRY_SIZE;
+        const size_t entry = FWX_ADAPTER_INFO_HEADER_SIZE + i * FWX_ADAPTER_INFO_ENTRY_SIZE;
         CHECK(reject32(entry + 20, fixtures[i].Flags | 0x100u));
         CHECK(reject32(entry + 20, fixtures[i].Flags | 0x80000000u));
         for (uint32_t value : {2u, 0xffffffffu}) CHECK(reject32(entry + 160, value));
@@ -548,8 +548,8 @@ bool TestAdapterInfoMalformed() {
 }
 bool TestAdapterInfoQuery() {
     testio::Reset();
-    const std::vector<HV_ADAPTER_INFO> fixtures{
-        AdapterFixture(7, HV_ADAPTER_INFO_KNOWN_FLAGS), AdapterFixture(8, HV_ADAPTER_PAUSE_VALID)};
+    const std::vector<FWX_ADAPTER_INFO> fixtures{
+        AdapterFixture(7, FWX_ADAPTER_INFO_KNOWN_FLAGS), AdapterFixture(8, FWX_ADAPTER_PAUSE_VALID)};
     const auto good = AdapterResponse(fixtures);
     Client::AdapterSnapshot snapshot;
     CHECK(Client::DecodeAdapterInfo(good, snapshot) == ERROR_SUCCESS);
@@ -579,12 +579,12 @@ bool TestAdapterInfoQuery() {
         malformed.push_back(good); Put(malformed.back(), offset, value, 4);
     };
     add_bad32(0, 2); add_bad32(4, 1761); add_bad32(8, 33); add_bad32(12, 0);
-    add_bad32(HV_ADAPTER_INFO_HEADER_SIZE + 20, 0x100);
-    add_bad32(HV_ADAPTER_INFO_HEADER_SIZE + 160, 2);
-    add_bad32(HV_ADAPTER_INFO_HEADER_SIZE + 164, 33);
-    add_bad32(HV_ADAPTER_INFO_HEADER_SIZE + 200, 256);
+    add_bad32(FWX_ADAPTER_INFO_HEADER_SIZE + 20, 0x100);
+    add_bad32(FWX_ADAPTER_INFO_HEADER_SIZE + 160, 2);
+    add_bad32(FWX_ADAPTER_INFO_HEADER_SIZE + 164, 33);
+    add_bad32(FWX_ADAPTER_INFO_HEADER_SIZE + 200, 256);
     malformed.push_back(good);
-    Put(malformed.back(), HV_ADAPTER_INFO_HEADER_SIZE + 224 + 2 * fixtures[0].InstanceNameLength, 1, 2);
+    Put(malformed.back(), FWX_ADAPTER_INFO_HEADER_SIZE + 224 + 2 * fixtures[0].InstanceNameLength, 1, 2);
     for (auto& response : malformed) {
         testio::state.adapter_info = std::move(response);
         CHECK(client.GetAdapterInfo(snapshot) == ERROR_INVALID_DATA && unchanged());
@@ -598,14 +598,14 @@ bool TestAdapterInfoGrowth() {
     testio::Reset();
     auto& state = testio::state;
     const auto header = [](uint32_t count, uint32_t running = 0) {
-        Bytes bytes(HV_ADAPTER_INFO_HEADER_SIZE);
-        HvEncodeAdapterInfoHeader(bytes.data(), count, running);
+        Bytes bytes(FWX_ADAPTER_INFO_HEADER_SIZE);
+        FwxEncodeAdapterInfoHeader(bytes.data(), count, running);
         return bytes;
     };
-    const std::vector<HV_ADAPTER_INFO> kept{AdapterFixture(99, HV_ADAPTER_RUNNING)};
+    const std::vector<FWX_ADAPTER_INFO> kept{AdapterFixture(99, FWX_ADAPTER_RUNNING)};
     const auto small = AdapterResponse(kept);
-    std::vector<HV_ADAPTER_INFO> many;
-    for (uint32_t i = 0; i < 97; ++i) many.push_back(AdapterFixture(i, i % 2 ? 0 : HV_ADAPTER_RUNNING));
+    std::vector<FWX_ADAPTER_INFO> many;
+    for (uint32_t i = 0; i < 97; ++i) many.push_back(AdapterFixture(i, i % 2 ? 0 : FWX_ADAPTER_RUNNING));
     const auto full = AdapterResponse(many);
     Client client;
     CHECK(client.Open() == ERROR_SUCCESS);
@@ -615,13 +615,13 @@ bool TestAdapterInfoGrowth() {
     CHECK(state.adapter_capacities == std::vector<DWORD>{56336}); // Earlier schema-1 SYS compatibility.
     state.legacy_adapter_info = false; state.adapter_info = full; state.adapter_capacities.clear();
     CHECK(client.GetAdapterInfo(snapshot) == ERROR_SUCCESS && MatchesSnapshot(snapshot, many));
-    CHECK(state.adapter_capacities == std::vector<DWORD>({56336u, HvAdapterInfoSize(97)}));
+    CHECK(state.adapter_capacities == std::vector<DWORD>({56336u, FwxAdapterInfoSize(97)}));
     CHECK(state.operations.empty());
 
     state.adapter_replies = {{header(40), ERROR_MORE_DATA}, {header(97), ERROR_MORE_DATA, 16, true}, {full}};
     state.adapter_reply_index = 0; state.adapter_capacities.clear();
     CHECK(client.GetAdapterInfo(snapshot) == ERROR_SUCCESS && MatchesSnapshot(snapshot, many));
-    CHECK(state.adapter_capacities == std::vector<DWORD>({56336u, HvAdapterInfoSize(40), HvAdapterInfoSize(97)}));
+    CHECK(state.adapter_capacities == std::vector<DWORD>({56336u, FwxAdapterInfoSize(40), FwxAdapterInfoSize(97)}));
     state.adapter_replies = {{header(97), ERROR_MORE_DATA}, {small}}; state.adapter_reply_index = 0;
     CHECK(client.GetAdapterInfo(snapshot) == ERROR_SUCCESS && MatchesSnapshot(snapshot, kept)); // Detach during retry.
     const auto* original = snapshot.adapters.data();
@@ -663,7 +663,7 @@ bool TestAdapterInfoGrowth() {
         CHECK(client.GetAdapterInfo(snapshot) == ERROR_NOT_ENOUGH_MEMORY && fail.Triggered() && unchanged());
     }
     CHECK(state.adapter_capacities.size() == 1); // Failed only after reaping the growth header.
-    state.adapter_info = AdapterResponse(std::span<const HV_ADAPTER_INFO>(many).first(2));
+    state.adapter_info = AdapterResponse(std::span<const FWX_ADAPTER_INFO>(many).first(2));
     {
         static_assert(2 * sizeof(Client::AdapterInfo) < 4096); // Below MSVC's large-allocation alignment threshold.
         allocation::FailSize fail(2 * sizeof(Client::AdapterInfo));
@@ -674,9 +674,9 @@ bool TestAdapterInfoGrowth() {
 }
 
 bool TestAdapterInfoAllocationFailures() {
-    const std::vector<HV_ADAPTER_INFO> kept{AdapterFixture(99, HV_ADAPTER_RUNNING)};
-    const std::vector<HV_ADAPTER_INFO> fixtures{
-        AdapterFixture(1, HV_ADAPTER_INFO_KNOWN_FLAGS), AdapterFixture(2, HV_ADAPTER_PAUSE_VALID)};
+    const std::vector<FWX_ADAPTER_INFO> kept{AdapterFixture(99, FWX_ADAPTER_RUNNING)};
+    const std::vector<FWX_ADAPTER_INFO> fixtures{
+        AdapterFixture(1, FWX_ADAPTER_INFO_KNOWN_FLAGS), AdapterFixture(2, FWX_ADAPTER_PAUSE_VALID)};
     const auto good = AdapterResponse(fixtures);
     Client::AdapterSnapshot snapshot;
     CHECK(Client::DecodeAdapterInfo(AdapterResponse(kept), snapshot) == ERROR_SUCCESS);
@@ -1001,8 +1001,8 @@ bool TestLogAndBandwidth() {
 }
 bool TestIdleAndStop() {
     testio::Reset();
-    const std::vector<HV_ADAPTER_INFO> adapters{
-        AdapterFixture(1, HV_ADAPTER_INFO_KNOWN_FLAGS), AdapterFixture(2, HV_ADAPTER_PAUSE_VALID)};
+    const std::vector<FWX_ADAPTER_INFO> adapters{
+        AdapterFixture(1, FWX_ADAPTER_INFO_KNOWN_FLAGS), AdapterFixture(2, FWX_ADAPTER_PAUSE_VALID)};
     testio::state.adapter_info = AdapterResponse(adapters);
     Client client;
     CHECK(client.Open() == ERROR_SUCCESS);

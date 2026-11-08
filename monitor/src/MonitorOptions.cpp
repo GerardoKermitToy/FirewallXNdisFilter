@@ -142,7 +142,7 @@ bool ParseOptions(int argc, const wchar_t* const* argv, Options& opt, std::strin
             else if (verdict == L"drop") opt.alt_verdict = Verdict::Drop;
             else if (verdict == L"permanent-drop") opt.alt_verdict = Verdict::PermanentDrop;
             else if (verdict.starts_with(L"redirect")) {
-                error = "redirect verdicts are not supported by HyperVXNdisFilter";
+                error = "redirect verdicts are not supported by FirewallXNdisFilter";
                 return false;
             } else {
                 error = "unknown verdict; use accept, permanent-accept, block, permanent-block, drop or permanent-drop";
@@ -201,9 +201,9 @@ bool AlternateMatches(const Options& opt, const Connection& c) {
 
 void PrintUsage(FILE* out) {
     std::fprintf(out,
-        "Usage: hyperv_monitor.exe [--duration SECONDS] [options]\n"
-        "       hyperv_monitor.exe --help\n\n"
-        "Opens \\\\.\\HyperVXNdisFilter; fails if the device is absent.\n"
+        "Usage: firewallx_monitor.exe [--duration SECONDS] [options]\n"
+        "       firewallx_monitor.exe --help\n\n"
+        "Opens \\\\.\\FirewallXNdisFilter; fails if the device is absent.\n"
         "Requires elevated admin/SYSTEM; no driver loading or installation.\n\n"
         "Collection:\n"
         "  --duration N     optional positive seconds; otherwise run until Ctrl+C.\n"
@@ -252,11 +252,11 @@ void PrintUsage(FILE* out) {
         "  Block/drop for all events can interrupt transit traffic and connectivity.\n"
         "  Positional .sys paths and PID-suspension options are rejected.\n\n"
         "Examples:\n"
-        "  hyperv_monitor.exe\n"
-        "  hyperv_monitor.exe --duration 10 --only-logs\n"
-        "  hyperv_monitor.exe --duration 30 --out run.log --timestamps --payload\n"
-        "  hyperv_monitor.exe --duration 30 --filter-protocol 17\n"
-        "  hyperv_monitor.exe --duration 30 --verdict block --match 192.0.2.10:53\n");
+        "  firewallx_monitor.exe\n"
+        "  firewallx_monitor.exe --duration 10 --only-logs\n"
+        "  firewallx_monitor.exe --duration 30 --out run.log --timestamps --payload\n"
+        "  firewallx_monitor.exe --duration 30 --filter-protocol 17\n"
+        "  firewallx_monitor.exe --duration 30 --verdict block --match 192.0.2.10:53\n");
 }
 
 } // namespace pmkext::monitor

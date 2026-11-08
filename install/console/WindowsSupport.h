@@ -5,7 +5,7 @@
 #include <array>
 #include <utility>
 
-namespace hyperv_xndis_filter::setup {
+namespace firewallx_ndis_filter::setup {
 using Microsoft::WRL::ComPtr;
 
 // RegFlushKey requires KEY_QUERY_VALUE, including on write-only operations.
@@ -77,7 +77,7 @@ bool IsPublishedInfName(const std::wstring& name);
 std::vector<std::wstring> ReadWindowsDriverPackages();
 Change RemoveWindowsDriverPackage(const std::wstring& published_inf);
 inline constexpr std::array<const wchar_t*, 4> kPackageFiles = {
-    L"HyperVXNdisFilter.inf", kDriverFileName, L"HyperVXNdisFilterNotify.dll", L"HyperVXNdisFilter.cat"
+    L"FirewallXNdisFilter.inf", kDriverFileName, L"FirewallXNdisFilterNotify.dll", L"FirewallXNdisFilter.cat"
 };
 std::vector<Handle> LockPackageFiles(const std::filesystem::path& package);
 std::vector<Handle> LockAndVerifyPackage(const std::filesystem::path& package);
@@ -85,4 +85,4 @@ std::vector<Handle> LockMatchingPackage(const std::filesystem::path& package, co
 std::vector<Handle> LockMatchingWindowsDriverPackages(const std::vector<Handle>& expected);
 std::vector<Handle> StageVerifiedWindowsDriverPackage(const std::filesystem::path& package, const std::vector<Handle>& expected);
 
-} // namespace hyperv_xndis_filter::setup
+} // namespace firewallx_ndis_filter::setup

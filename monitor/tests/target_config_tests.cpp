@@ -8,7 +8,7 @@
 #define CHECK(expression) do { if (!(expression)) { \
     std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #expression); return 1; } } while (false)
 
-using namespace hyperv_xndis_filter;
+using namespace firewallx_ndis_filter;
 namespace {
 struct FakeRegistry {
     DWORD version = kBindingConfigVersion;

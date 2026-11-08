@@ -5,7 +5,7 @@
 #include <fstream>
 #include <stdexcept>
 
-using namespace hyperv_xndis_filter::setup;
+using namespace firewallx_ndis_filter::setup;
 namespace {
 
 void Require(bool value, const char* message) {

@@ -99,12 +99,12 @@ impl Default for State {
             session_open: true,
             oid_open: true,
             rundown_count: BTreeMap::new(),
-            oid_status: HV_WDK_NDIS_SUCCESS as NDIS_STATUS,
+            oid_status: FWX_WDK_NDIS_SUCCESS as NDIS_STATUS,
             clones: BTreeSet::new(),
             last_clone: 0,
             attach_ok: true,
             restart_ok: true,
-            attributes_status: HV_WDK_NDIS_SUCCESS as NDIS_STATUS,
+            attributes_status: FWX_WDK_NDIS_SUCCESS as NDIS_STATUS,
             next_index: 100,
             detach_on_pause: false,
             pause_after_forward: false,
@@ -216,7 +216,7 @@ unsafe fn attach_one() -> *mut Adapter {
         p.BaseMiniportNetLuid.Value = u64::from(p.BaseMiniportIfIndex);
         assert_eq!(
             filter_attach(0x303usize as NDIS_HANDLE, null_mut(), &mut p),
-            HV_WDK_NDIS_SUCCESS as NDIS_STATUS
+            FWX_WDK_NDIS_SUCCESS as NDIS_STATUS
         );
         state(|s| s.adapter as *mut Adapter)
     }
@@ -368,7 +368,7 @@ pub(super) mod calls {
             return null_mut();
         }
         let layout = Layout::from_size_align(bytes as usize, 16).unwrap();
-        let pointer = if flags & HV_WDK_POOL_FLAG_UNINITIALIZED as u64 == 0 {
+        let pointer = if flags & FWX_WDK_POOL_FLAG_UNINITIALIZED as u64 == 0 {
             unsafe { alloc_zeroed(layout) }
         } else {
             unsafe { alloc(layout) }
@@ -411,7 +411,7 @@ pub(super) mod calls {
         p: *const NET_BUFFER_LIST_POOL_PARAMETERS,
     ) -> NDIS_HANDLE {
         unsafe {
-            assert_eq!((*p).Header.Size, HV_WDK_NBL_POOL_SIZE as u16);
+            assert_eq!((*p).Header.Size, FWX_WDK_NBL_POOL_SIZE as u16);
             assert_eq!((*p).PoolTag, TAG);
         }
         if fail() {
@@ -431,7 +431,7 @@ pub(super) mod calls {
         p: *const NET_BUFFER_POOL_PARAMETERS,
     ) -> NDIS_HANDLE {
         unsafe {
-            assert_eq!((*p).Header.Size, HV_WDK_NB_POOL_SIZE as u16);
+            assert_eq!((*p).Header.Size, FWX_WDK_NB_POOL_SIZE as u16);
             assert_eq!((*p).PoolTag, TAG);
         }
         if fail() {
@@ -452,7 +452,7 @@ pub(super) mod calls {
         p: PNDIS_FILTER_ATTRIBUTES,
     ) -> NDIS_STATUS {
         unsafe {
-            assert_eq!((*p).Header.Size, HV_WDK_FILTER_ATTRIBUTES_SIZE as u16);
+            assert_eq!((*p).Header.Size, FWX_WDK_FILTER_ATTRIBUTES_SIZE as u16);
         }
         state(|s| {
             s.adapter = a as usize;
@@ -466,7 +466,7 @@ pub(super) mod calls {
         let mut parameters = NDIS_FILTER_PAUSE_PARAMETERS::default();
         assert_eq!(
             unsafe { filter_pause(a as NDIS_HANDLE, &mut parameters) },
-            HV_WDK_NDIS_PENDING as NDIS_STATUS
+            FWX_WDK_NDIS_PENDING as NDIS_STATUS
         );
     }
     pub(crate) unsafe fn NdisFSendNetBufferLists(
@@ -600,7 +600,7 @@ pub(super) mod calls {
     ) -> NDIS_STATUS {
         assert_eq!(tag, TAG);
         if fail() {
-            return HV_WDK_NDIS_RESOURCES as NDIS_STATUS;
+            return FWX_WDK_NDIS_RESOURCES as NDIS_STATUS;
         }
         let clone = Box::into_raw(Box::new(unsafe { *r }));
         state(|s| {
@@ -610,7 +610,7 @@ pub(super) mod calls {
         unsafe {
             *out = clone;
         }
-        HV_WDK_NDIS_SUCCESS as NDIS_STATUS
+        FWX_WDK_NDIS_SUCCESS as NDIS_STATUS
     }
     pub(crate) unsafe fn NdisFreeCloneOidRequest(_: NDIS_HANDLE, r: PNDIS_OID_REQUEST) {
         state(|s| {
@@ -645,25 +645,25 @@ pub(super) mod calls {
         _: PNET_PNP_EVENT_NOTIFICATION,
     ) -> NDIS_STATUS {
         state(|s| s.events.push(Event::Pnp));
-        HV_WDK_NDIS_SUCCESS as NDIS_STATUS
+        FWX_WDK_NDIS_SUCCESS as NDIS_STATUS
     }
 
-    pub(crate) fn HvAttach(index: u32) -> u32 {
+    pub(crate) fn FwxAttach(index: u32) -> u32 {
         state(|s| {
             s.events.push(Event::Attach(index));
             u32::from(s.attach_ok)
         })
     }
-    pub(crate) fn HvRestart(_: u32) -> u32 {
+    pub(crate) fn FwxRestart(_: u32) -> u32 {
         state(|s| u32::from(s.restart_ok))
     }
-    pub(crate) fn HvRollbackAttach(index: u32) {
+    pub(crate) fn FwxRollbackAttach(index: u32) {
         state(|s| s.events.push(Event::RollbackAttach(index)));
     }
-    pub(crate) fn HvDetach(index: u32) {
+    pub(crate) fn FwxDetach(index: u32) {
         state(|s| s.events.push(Event::Detach(index)));
     }
-    pub(crate) fn HvInvalidate(index: u32, pause: u32) {
+    pub(crate) fn FwxInvalidate(index: u32, pause: u32) {
         assert_eq!(pause, 1);
         state(|s| {
             assert!(s.rw_depth > 0);
@@ -671,7 +671,7 @@ pub(super) mod calls {
             s.invalidated.insert(index);
         });
     }
-    pub(crate) fn HvDrain() {
+    pub(crate) fn FwxDrain() {
         assert_unlocked();
         let pending = state(|s| {
             s.events.push(Event::Drain);
@@ -694,23 +694,23 @@ pub(super) mod calls {
         });
         for n in pending {
             unsafe {
-                hv_finish(n, 1);
+                fwx_finish(n, 1);
             }
         }
     }
-    pub(crate) fn HvPausedDrop(_index: u32) {
+    pub(crate) fn FwxPausedDrop(_index: u32) {
         state(|s| s.paused_drops += 1);
     }
-    pub(crate) fn HvResourceDrop(_index: u32) {
+    pub(crate) fn FwxResourceDrop(_index: u32) {
         state(|s| s.resource_drops += 1);
     }
-    pub(crate) fn HvInvalidLso(index: u32) {
+    pub(crate) fn FwxInvalidLso(index: u32) {
         state(|s| s.invalid_lso_warnings.push(index));
     }
-    pub(crate) fn HvSendFailure(index: u32, status: i32) {
+    pub(crate) fn FwxSendFailure(index: u32, status: i32) {
         state(|s| s.send_failure_warnings.push((index, status)));
     }
-    pub(crate) fn HvClassify(
+    pub(crate) fn FwxClassify(
         nbl: usize,
         index: u32,
         direction: u32,
@@ -728,8 +728,8 @@ pub(super) mod calls {
             state(|s| s.publishing = false);
         }
         if !guard.is_null() {
-            let cancelled = unsafe { hv_send_guard_lock(guard) != 0 };
-            unsafe { hv_send_guard_unlock(guard) };
+            let cancelled = unsafe { fwx_send_guard_lock(guard) != 0 };
+            unsafe { fwx_send_guard_unlock(guard) };
             if cancelled {
                 return FINISH_CANCEL as i32;
             }
@@ -754,14 +754,14 @@ pub(super) mod calls {
             // This CPU does not own the classifier's RW-lock acquisition.
             state(|s| s.publishing = true);
             unsafe {
-                hv_finish(nbl, finish);
+                fwx_finish(nbl, finish);
             }
             state(|s| s.publishing = false);
             assert!(result < 0);
         }
         result
     }
-    pub(crate) fn HvCancel(index: u32, cancel: usize) {
+    pub(crate) fn FwxCancel(index: u32, cancel: usize) {
         let claimed = state(|s| {
             s.events.push(Event::Cancel(index, cancel));
             let mut claimed = Vec::new();
@@ -786,7 +786,7 @@ pub(super) mod calls {
         });
         for n in claimed {
             unsafe {
-                hv_finish(n, 2);
+                fwx_finish(n, 2);
             }
         }
     }
@@ -820,9 +820,9 @@ fn supported_ndis_versions_and_characteristics_use_runtime_revision_and_optional
         assert_eq!(
             c.Header.Size,
             if version >= NDIS_RUNTIME_VERSION_680 {
-                HV_WDK_FILTER_REV3_SIZE as u16
+                FWX_WDK_FILTER_REV3_SIZE as u16
             } else {
-                HV_WDK_FILTER_REV2_SIZE as u16
+                FWX_WDK_FILTER_REV2_SIZE as u16
             }
         );
         assert!(
@@ -862,7 +862,7 @@ fn supported_ndis_versions_and_characteristics_use_runtime_revision_and_optional
     );
     assert_eq!(
         nbl_info_count(NDIS_RUNTIME_VERSION_689),
-        HV_WDK_NBL_INFO_COUNT as u32
+        FWX_WDK_NBL_INFO_COUNT as u32
     );
     let mut c: NDIS_FILTER_DRIVER_CHARACTERISTICS = unsafe { zeroed() };
     assert!(!configure_characteristics(&mut c, 0));
@@ -919,9 +919,9 @@ fn send_inline_completion_preserves_flags_and_drops_context_before_upper_ownersh
 #[test]
 fn failed_lower_send_is_reported_without_changing_completion_status() {
     for (status, report) in [
-        (HV_WDK_NDIS_SUCCESS as NDIS_STATUS, false),
-        (HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS, false),
-        (HV_WDK_NDIS_RESOURCES as NDIS_STATUS, true),
+        (FWX_WDK_NDIS_SUCCESS as NDIS_STATUS, false),
+        (FWX_WDK_NDIS_SEND_ABORTED as NDIS_STATUS, false),
+        (FWX_WDK_NDIS_RESOURCES as NDIS_STATUS, true),
     ] {
         let f = Fixture::new();
         let mut a = f.adapter();
@@ -980,7 +980,7 @@ fn locally_dropped_lso_uses_completion_metadata() {
             }
             assert_eq!(
                 source.nbl.__bindgen_anon_2.Status,
-                HV_WDK_NDIS_SUCCESS as NDIS_STATUS
+                FWX_WDK_NDIS_SUCCESS as NDIS_STATUS
             );
         }
     }
@@ -996,7 +996,7 @@ fn locally_dropped_lso_uses_completion_metadata() {
         send((&mut *a as *mut Adapter).cast(), &mut *malformed.nbl, 0, 0);
         assert_eq!(
             malformed.nbl.__bindgen_anon_2.Status,
-            HV_WDK_NDIS_RESOURCES as NDIS_STATUS
+            FWX_WDK_NDIS_RESOURCES as NDIS_STATUS
         );
         assert!(malformed.nbl.NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize].is_null());
         assert_eq!(state(|s| s.invalid_lso_warnings.clone()), [77]);
@@ -1040,9 +1040,9 @@ fn paused_lso_sends_return_completion_metadata_with_or_without_cancellation() {
                 assert_eq!(
                     second.nbl.__bindgen_anon_2.Status,
                     if cancelled {
-                        HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+                        FWX_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
                     } else {
-                        HV_WDK_NDIS_PAUSED as NDIS_STATUS
+                        FWX_WDK_NDIS_PAUSED as NDIS_STATUS
                     }
                 );
                 info.__bindgen_anon_1.Value =
@@ -1075,7 +1075,7 @@ fn paused_malformed_lso_keeps_pause_status_and_clears_transmit_metadata() {
         send((&mut *a as *mut Adapter).cast(), &mut *source.nbl, 0, 0);
         assert_eq!(
             source.nbl.__bindgen_anon_2.Status,
-            HV_WDK_NDIS_PAUSED as NDIS_STATUS
+            FWX_WDK_NDIS_PAUSED as NDIS_STATUS
         );
         assert!(source.nbl.NetBufferListInfo[TcpLargeSendNetBufferListInfo as usize].is_null());
         assert_eq!(state(|s| s.invalid_lso_warnings.clone()), [77]);
@@ -1131,7 +1131,7 @@ fn cancellation_after_publication_can_free_nbl_before_classify_returns() {
     }
     state(|s| {
         assert_eq!(s.events.iter().filter(|event| matches!(event,
-            Event::Complete(_, status, _) if *status == HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+            Event::Complete(_, status, _) if *status == FWX_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
         )).count(), 1);
         assert!(
             !s.events
@@ -1207,7 +1207,7 @@ fn resources_receive_uses_private_deep_copy_and_never_returns_original_or_privat
             (*copied_mdl).MappedSystemVa,
             source.data.as_mut_ptr().cast()
         );
-        hv_finish(copied as usize, 0);
+        fwx_finish(copied as usize, 0);
         assert_eq!(a.active, 0);
         stop(&mut *a);
     }
@@ -1262,7 +1262,7 @@ fn paused_callbacks_complete_sends_return_owned_receives_and_leave_resource_chai
         send((&mut *a as *mut Adapter).cast(), &mut *send_nbl, 0, 0);
         assert_eq!(
             send_nbl.__bindgen_anon_2.Status,
-            HV_WDK_NDIS_PAUSED as NDIS_STATUS
+            FWX_WDK_NDIS_PAUSED as NDIS_STATUS
         );
         receive((&mut *a as *mut Adapter).cast(), &mut *receive_nbl, 0, 1, 0);
         packet::set_next_nbl(&mut *resources, &mut *tail);
@@ -1311,9 +1311,9 @@ fn pause_between_send_chain_members_reports_pause_or_cancellation() {
             s.cancel_after_pause = cancelled.then_some(cancel);
         });
         let expected = if cancelled {
-            HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+            FWX_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
         } else {
-            HV_WDK_NDIS_PAUSED as NDIS_STATUS
+            FWX_WDK_NDIS_PAUSED as NDIS_STATUS
         };
         unsafe {
             second.NetBufferListInfo[NetBufferListCancelId as usize] = cancel as PVOID;
@@ -1478,7 +1478,7 @@ fn pause_invalidates_pending_under_write_lock_and_finishes_only_after_unlock() {
         };
         assert_eq!(
             filter_pause((&mut *a as *mut Adapter).cast(), &mut p),
-            HV_WDK_NDIS_SUCCESS as NDIS_STATUS
+            FWX_WDK_NDIS_SUCCESS as NDIS_STATUS
         );
         assert_eq!(
             (a.active, a.info.pause_reason, a.info.pause_flags),
@@ -1521,7 +1521,7 @@ fn last_send_completion_can_synchronously_pause_complete_and_detach_adapter() {
         let mut pause = NDIS_FILTER_PAUSE_PARAMETERS::default();
         assert_eq!(
             filter_pause(a.cast(), &mut pause),
-            HV_WDK_NDIS_PENDING as NDIS_STATUS
+            FWX_WDK_NDIS_PENDING as NDIS_STATUS
         );
         assert_eq!((*a).pause_pending, 1);
         send_complete(a.cast(), &mut *nbl, 0);
@@ -1601,11 +1601,11 @@ fn cancel_during_classification_aborts_current_and_matching_chain_members() {
         send((&mut *a as *mut Adapter).cast(), &mut *first, 0, 0);
         assert_eq!(
             first.__bindgen_anon_2.Status,
-            HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+            FWX_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
         );
         assert_eq!(
             last.__bindgen_anon_2.Status,
-            HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+            FWX_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
         );
         assert!(first.Context.is_null());
         assert!(last.Context.is_null());
@@ -1621,14 +1621,14 @@ fn cancel_during_classification_aborts_current_and_matching_chain_members() {
         assert!(pending.contains(&((&mut *other as *mut NET_BUFFER_LIST) as usize)));
         assert!(pending.contains(&((&mut *reused as *mut NET_BUFFER_LIST) as usize)));
         for nbl in pending {
-            hv_finish(nbl, 0);
+            fwx_finish(nbl, 0);
         }
         assert_eq!(a.active, 0);
         stop(&mut *a);
     }
     state(|s| {
         let aborted = s.events.iter().filter(|event| {
-            matches!(event, Event::Complete(_, status, _) if *status == HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS)
+            matches!(event, Event::Complete(_, status, _) if *status == FWX_WDK_NDIS_SEND_ABORTED as NDIS_STATUS)
         }).count();
         assert_eq!(aborted, 2);
         assert!(s.events.contains(&Event::LowerCancel(cancel)));
@@ -1662,7 +1662,7 @@ fn cancellation_can_free_current_and_unprocessed_nbls_inline() {
     }
     state(|s| {
         assert_eq!(s.events.iter().filter(|event| matches!(event,
-            Event::Complete(_, status, _) if *status == HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+            Event::Complete(_, status, _) if *status == FWX_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
         )).count(), 2);
         assert!(
             !s.events
@@ -1688,12 +1688,12 @@ fn cancel_send_is_interface_scoped_and_does_not_claim_receive_with_equal_numeric
         cancel_send((&mut *a as *mut Adapter).cast(), 0xabcusize as PVOID);
         assert_eq!(
             send_nbl.__bindgen_anon_2.Status,
-            HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+            FWX_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
         );
         assert!(send_nbl.Context.is_null());
         assert!(!receive_nbl.Context.is_null());
         state(|s| s.pending.clear());
-        hv_finish((&mut *receive_nbl as *mut NET_BUFFER_LIST) as usize, 1);
+        fwx_finish((&mut *receive_nbl as *mut NET_BUFFER_LIST) as usize, 1);
         assert_eq!(a.active, 0);
         stop(&mut *a);
     }
@@ -1712,7 +1712,7 @@ fn oid_sync_pending_and_closed_rundown_preserve_single_completion() {
     unsafe {
         assert_eq!(
             oid((&mut *a as *mut Adapter).cast(), &mut request),
-            HV_WDK_NDIS_SUCCESS as NDIS_STATUS
+            FWX_WDK_NDIS_SUCCESS as NDIS_STATUS
         );
         state(|s| {
             assert!(
@@ -1721,10 +1721,10 @@ fn oid_sync_pending_and_closed_rundown_preserve_single_completion() {
                     .all(|e| !matches!(e, Event::OidComplete(_, _)))
             )
         });
-        state(|s| s.oid_status = HV_WDK_NDIS_PENDING as NDIS_STATUS);
+        state(|s| s.oid_status = FWX_WDK_NDIS_PENDING as NDIS_STATUS);
         assert_eq!(
             oid((&mut *a as *mut Adapter).cast(), &mut request),
-            HV_WDK_NDIS_PENDING as NDIS_STATUS
+            FWX_WDK_NDIS_PENDING as NDIS_STATUS
         );
         let clone = state(|s| s.last_clone as PNDIS_OID_REQUEST);
         (*clone).DATA.QUERY_INFORMATION.BytesWritten = 123;
@@ -1732,7 +1732,7 @@ fn oid_sync_pending_and_closed_rundown_preserve_single_completion() {
         oid_complete(
             (&mut *a as *mut Adapter).cast(),
             clone,
-            HV_WDK_NDIS_FAILURE as NDIS_STATUS,
+            FWX_WDK_NDIS_FAILURE as NDIS_STATUS,
         );
         assert_eq!(
             (
@@ -1744,7 +1744,7 @@ fn oid_sync_pending_and_closed_rundown_preserve_single_completion() {
         state(|s| s.oid_open = false);
         assert_eq!(
             oid((&mut *a as *mut Adapter).cast(), &mut request),
-            HV_WDK_NDIS_CLOSING as NDIS_STATUS
+            FWX_WDK_NDIS_CLOSING as NDIS_STATUS
         );
         cancel_oid((&mut *a as *mut Adapter).cast(), 99usize as PVOID);
     }
@@ -1804,13 +1804,13 @@ fn attach_rejects_gate_or_media_and_unwinds_nonallocation_failures() {
         registry::TARGET_ALLOWED.store(false, Ordering::SeqCst);
         assert_eq!(
             filter_attach(null_mut(), null_mut(), &mut p),
-            HV_WDK_NDIS_NOT_SUPPORTED as NDIS_STATUS
+            FWX_WDK_NDIS_NOT_SUPPORTED as NDIS_STATUS
         );
         registry::TARGET_ALLOWED.store(true, Ordering::SeqCst);
         p.MiniportMediaType = NdisMediumNative802_11;
         assert_eq!(
             filter_attach(null_mut(), null_mut(), &mut p),
-            HV_WDK_NDIS_NOT_SUPPORTED as NDIS_STATUS
+            FWX_WDK_NDIS_NOT_SUPPORTED as NDIS_STATUS
         );
         state(|s| assert_eq!(s.allocation_attempts, 0));
         p.MiniportMediaType = NdisMedium802_3;
@@ -1820,15 +1820,15 @@ fn attach_rejects_gate_or_media_and_unwinds_nonallocation_failures() {
         });
         assert_eq!(
             filter_attach(null_mut(), null_mut(), &mut p),
-            HV_WDK_NDIS_RESOURCES as NDIS_STATUS
+            FWX_WDK_NDIS_RESOURCES as NDIS_STATUS
         );
         state(|s| {
             s.attach_ok = true;
-            s.attributes_status = HV_WDK_NDIS_FAILURE as NDIS_STATUS;
+            s.attributes_status = FWX_WDK_NDIS_FAILURE as NDIS_STATUS;
         });
         assert_eq!(
             filter_attach(null_mut(), null_mut(), &mut p),
-            HV_WDK_NDIS_FAILURE as NDIS_STATUS
+            FWX_WDK_NDIS_FAILURE as NDIS_STATUS
         );
     }
     state(|s| {
@@ -1849,7 +1849,7 @@ fn adapter_snapshot_has_no_32_adapter_ceiling_and_header_only_reply_never_stages
         let mut transferred = 999;
         assert_eq!(
             query_adapter_info(header.as_mut_ptr(), header.len() as u32, &mut transferred),
-            HV_WDK_STATUS_BUFFER_OVERFLOW as NTSTATUS
+            FWX_WDK_STATUS_BUFFER_OVERFLOW as NTSTATUS
         );
         assert_eq!(transferred, wire::ADAPTER_INFO_HEADER_SIZE);
         assert_eq!(u32::from_le_bytes(header[8..12].try_into().unwrap()), 35);
@@ -1858,7 +1858,7 @@ fn adapter_snapshot_has_no_32_adapter_ceiling_and_header_only_reply_never_stages
         let mut out = vec![0; size];
         assert_eq!(
             query_adapter_info(out.as_mut_ptr(), out.len() as u32, &mut transferred),
-            HV_WDK_STATUS_SUCCESS as NTSTATUS
+            FWX_WDK_STATUS_SUCCESS as NTSTATUS
         );
         assert_eq!(transferred, size);
         assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 35);
@@ -1878,16 +1878,16 @@ fn snapshot_errors_do_not_invent_partial_success_or_allocate_arithmetic_maximum(
     unsafe {
         assert_eq!(
             query_adapter_info(out.as_mut_ptr(), 15, &mut transferred),
-            HV_WDK_STATUS_BUFFER_TOO_SMALL as NTSTATUS
+            FWX_WDK_STATUS_BUFFER_TOO_SMALL as NTSTATUS
         );
         assert_eq!(
             query_adapter_info(null_mut(), 16, &mut transferred),
-            HV_WDK_STATUS_INVALID_PARAMETER as NTSTATUS
+            FWX_WDK_STATUS_INVALID_PARAMETER as NTSTATUS
         );
         ADAPTER_COUNT = wire::ADAPTER_INFO_MAX_ADAPTERS as u64 + 1;
         assert_eq!(
             query_adapter_info(out.as_mut_ptr(), out.len() as u32, &mut transferred),
-            HV_WDK_STATUS_INTEGER_OVERFLOW as NTSTATUS
+            FWX_WDK_STATUS_INTEGER_OVERFLOW as NTSTATUS
         );
         ADAPTER_COUNT = 0;
         attach_one();
@@ -1896,7 +1896,7 @@ fn snapshot_errors_do_not_invent_partial_success_or_allocate_arithmetic_maximum(
         });
         assert_eq!(
             query_adapter_info(out.as_mut_ptr(), out.len() as u32, &mut transferred),
-            HV_WDK_STATUS_RETRY as NTSTATUS
+            FWX_WDK_STATUS_RETRY as NTSTATUS
         );
         assert_eq!(transferred, 123);
         detach_all();
@@ -1915,7 +1915,7 @@ fn attach_snapshot_copies_counted_names_guid_mac_and_revision_gated_connector() 
     };
     let mut p = NDIS_FILTER_ATTACH_PARAMETERS::default();
     p.Header.Revision = NDIS_FILTER_ATTACH_PARAMETERS_REVISION_4 as u8;
-    p.Header.Size = HV_WDK_ATTACH_REV4_SIZE as u16;
+    p.Header.Size = FWX_WDK_ATTACH_REV4_SIZE as u16;
     p.BaseMiniportIfIndex = 88;
     p.BaseMiniportInstanceName = &mut counted;
     p.BaseMiniportIfConnectorPresent = 1;
@@ -1962,11 +1962,11 @@ fn restart_attribute_validation_and_link_status_capture_use_real_wdk_headers() {
     unsafe {
         let attribute = storage.cast::<NDIS_RESTART_ATTRIBUTES>();
         (*attribute).Oid = OID_GEN_MINIPORT_RESTART_ATTRIBUTES;
-        (*attribute).DataLength = HV_WDK_RESTART_GENERAL_SIZE as u32;
+        (*attribute).DataLength = FWX_WDK_RESTART_GENERAL_SIZE as u32;
         let general = addr_of_mut!((*attribute).Data).cast::<NDIS_RESTART_GENERAL_ATTRIBUTES>();
         (*general).Header.Type = NDIS_OBJECT_TYPE_RESTART_GENERAL_ATTRIBUTES as u8;
         (*general).Header.Revision = NDIS_RESTART_GENERAL_ATTRIBUTES_REVISION_1 as u8;
-        (*general).Header.Size = HV_WDK_RESTART_GENERAL_SIZE as u16;
+        (*general).Header.Size = FWX_WDK_RESTART_GENERAL_SIZE as u16;
         (*general).MtuSize = 1500;
         (*general).MaxXmitLinkSpeed = 10_000;
         let mut p = NDIS_FILTER_RESTART_PARAMETERS {
@@ -1975,7 +1975,7 @@ fn restart_attribute_validation_and_link_status_capture_use_real_wdk_headers() {
         };
         assert_eq!(
             filter_restart((&mut *a as *mut Adapter).cast(), &mut p),
-            HV_WDK_NDIS_SUCCESS as NDIS_STATUS
+            FWX_WDK_NDIS_SUCCESS as NDIS_STATUS
         );
         assert_eq!(a.info.mtu, 1500);
         assert_ne!(a.info.flags & wire::ADAPTER_GENERAL_VALID, 0);
@@ -1989,7 +1989,7 @@ fn restart_attribute_validation_and_link_status_capture_use_real_wdk_headers() {
             Header: NDIS_OBJECT_HEADER {
                 Type: NDIS_OBJECT_TYPE_DEFAULT as u8,
                 Revision: NDIS_LINK_STATE_REVISION_1 as u8,
-                Size: HV_WDK_LINK_STATE_SIZE as u16,
+                Size: FWX_WDK_LINK_STATE_SIZE as u16,
             },
             XmitLinkSpeed: 12345,
             RcvLinkSpeed: 67890,
@@ -2002,9 +2002,9 @@ fn restart_attribute_validation_and_link_status_capture_use_real_wdk_headers() {
             size_of::<NDIS_LINK_STATE>(),
         );
         let mut indication = NDIS_STATUS_INDICATION {
-            StatusCode: HV_WDK_NDIS_LINK_STATE as NDIS_STATUS,
+            StatusCode: FWX_WDK_NDIS_LINK_STATE as NDIS_STATUS,
             StatusBuffer: unaligned.as_mut_ptr().add(1).cast(),
-            StatusBufferSize: HV_WDK_LINK_STATE_SIZE as u32,
+            StatusBufferSize: FWX_WDK_LINK_STATE_SIZE as u32,
             ..NDIS_STATUS_INDICATION::default()
         };
         status((&mut *a as *mut Adapter).cast(), &mut indication);
@@ -2021,7 +2021,7 @@ fn restart_attribute_validation_and_link_status_capture_use_real_wdk_headers() {
                 (&mut *a as *mut Adapter).cast(),
                 &mut NET_PNP_EVENT_NOTIFICATION::default()
             ),
-            HV_WDK_NDIS_SUCCESS as NDIS_STATUS
+            FWX_WDK_NDIS_SUCCESS as NDIS_STATUS
         );
     }
     state(|s| {

@@ -11,14 +11,14 @@ fn main() {
 #[cfg(feature = "native-wdk")]
 fn generate_wdk(output: &std::path::Path) {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let root = if env::var("CARGO_PKG_NAME").unwrap() == "hyperv-native-tests" {
+    let root = if env::var("CARGO_PKG_NAME").unwrap() == "firewallx-native-tests" {
         manifest.join("../../../driver")
     } else {
         manifest
     };
     println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
-    println!("cargo:rerun-if-env-changed=HYPERVXNDISFILTER_SDK_VERSION");
-    let sdk = env::var("HYPERVXNDISFILTER_SDK_VERSION").unwrap_or_else(|_| "10.0.28000.0".into());
+    println!("cargo:rerun-if-env-changed=FIREWALLXNDISFILTER_SDK_VERSION");
+    let sdk = env::var("FIREWALLXNDISFILTER_SDK_VERSION").unwrap_or_else(|_| "10.0.28000.0".into());
     // These settings affect only this Windows build-script process. They are not
     // driver globals or persisted machine configuration.
     unsafe { env::set_var("Version_Number", sdk) };

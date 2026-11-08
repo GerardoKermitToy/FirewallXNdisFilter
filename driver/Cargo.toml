@@ -1,12 +1,12 @@
 [package]
-name = "hyperv-driver"
+name = "firewallx-driver"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 license = "GPL-3.0-only"
 
 [lib]
-name = "hyperv_driver"
+name = "firewallx_driver"
 crate-type = ["staticlib"]
 test = false
 doctest = false
@@ -15,8 +15,8 @@ doctest = false
 native-wdk = ["dep:bindgen"]
 
 [dependencies]
-hyperv-protocol = { path = "../protocol" }
-hyperv-policy = { path = "../policy" }
+firewallx-protocol = { path = "../protocol" }
+firewallx-policy = { path = "../policy" }
 likely_stable.workspace = true
 
 [build-dependencies]

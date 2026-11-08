@@ -2,7 +2,7 @@
 #include "TargetConfig.h"
 #include "NetCfgTrace.h"
 
-namespace hyperv_xndis_filter {
+namespace firewallx_ndis_filter {
 
 HRESULT EvaluateBindingPath(DWORD flags, INetCfgBindingPath* path, const std::vector<GUID>& adapters) {
     TraceNetCfg("QueryBindingPath", S_OK, flags);

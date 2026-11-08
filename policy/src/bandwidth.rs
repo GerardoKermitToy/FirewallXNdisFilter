@@ -9,7 +9,7 @@ use core::{
     mem::{self, MaybeUninit},
     ptr::{self, NonNull},
 };
-use hyperv_protocol::{Connection, Direction};
+use firewallx_protocol::{Connection, Direction};
 use likely_stable::unlikely;
 
 const PAGE_ENTRIES: usize = 128;

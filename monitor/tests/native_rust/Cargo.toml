@@ -1,5 +1,5 @@
 [package]
-name = "hyperv-native-tests"
+name = "firewallx-native-tests"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
@@ -15,7 +15,7 @@ default = ["native-wdk"]
 native-wdk = []
 
 [dependencies]
-hyperv-protocol = { path = "../../../protocol" }
+firewallx-protocol = { path = "../../../protocol" }
 likely_stable.workspace = true
 
 [build-dependencies]

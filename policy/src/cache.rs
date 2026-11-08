@@ -1,6 +1,6 @@
 use alloc::alloc::{alloc, dealloc};
 use core::{alloc::Layout, mem, ptr};
-use hyperv_protocol::Connection;
+use firewallx_protocol::Connection;
 use likely_stable::unlikely;
 
 const INITIAL_CAPACITY: usize = 128;

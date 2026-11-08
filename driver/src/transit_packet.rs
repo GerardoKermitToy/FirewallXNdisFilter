@@ -3,7 +3,7 @@
 //! Each NB must first pass the ordinary bounded Ethernet/IP parser. A single
 //! NBL cannot carry different policy decisions for a local and a transit NB.
 
-use hyperv_policy::packet::Packet;
+use firewallx_policy::packet::Packet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IpScope {
@@ -112,7 +112,7 @@ impl PacketBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperv_policy::packet::{self, ParseError};
+    use firewallx_policy::packet::{self, ParseError};
 
     fn ipv4() -> Vec<u8> {
         let mut frame = vec![0u8; 14 + 20 + 8];

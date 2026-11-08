@@ -8,7 +8,7 @@ use crate::{
     adapter_info::{self, AdapterInfoAction},
     native_packet as packet,
 };
-use hyperv_protocol as wire;
+use firewallx_protocol as wire;
 use likely_stable::unlikely;
 
 #[cfg(not(test))]
@@ -43,7 +43,7 @@ pub(super) struct SendBatch {
 // PolicyLock while holding the adapter lock, so publication and cancellation
 // are serialized without completing NBLs under either lock.
 #[unsafe(no_mangle)]
-unsafe extern "C" fn hv_send_guard_lock(guard: *mut core::ffi::c_void) -> u32 {
+unsafe extern "C" fn fwx_send_guard_lock(guard: *mut core::ffi::c_void) -> u32 {
     unsafe {
         let batch = guard.cast::<SendBatch>();
         ndis_lock(addr_of_mut!((*(*batch).adapter).lock));
@@ -52,7 +52,7 @@ unsafe extern "C" fn hv_send_guard_lock(guard: *mut core::ffi::c_void) -> u32 {
 }
 
 #[unsafe(no_mangle)]
-unsafe extern "C" fn hv_send_guard_unlock(guard: *mut core::ffi::c_void) {
+unsafe extern "C" fn fwx_send_guard_unlock(guard: *mut core::ffi::c_void) {
     unsafe {
         let batch = guard.cast::<SendBatch>();
         ndis_unlock(addr_of_mut!((*(*batch).adapter).lock));
@@ -85,7 +85,7 @@ pub(super) fn ndis_version(runtime: u32) -> u32 {
 /// The OOB array ends at a different named SDK slot on older runtimes.
 pub(super) fn nbl_info_count(version: u32) -> u32 {
     if version >= NDIS_RUNTIME_VERSION_680 {
-        HV_WDK_NBL_INFO_COUNT as u32
+        FWX_WDK_NBL_INFO_COUNT as u32
     } else if version >= NDIS_RUNTIME_VERSION_650 {
         GftFlowEntryId as u32 + 1
     } else {
@@ -105,18 +105,18 @@ pub(super) fn configure_characteristics(
     c.Header.Type = NDIS_OBJECT_TYPE_FILTER_DRIVER_CHARACTERISTICS as u8;
     if version >= NDIS_RUNTIME_VERSION_680 {
         c.Header.Revision = NDIS_FILTER_CHARACTERISTICS_REVISION_3 as u8;
-        c.Header.Size = HV_WDK_FILTER_REV3_SIZE as u16;
+        c.Header.Size = FWX_WDK_FILTER_REV3_SIZE as u16;
     } else {
         c.Header.Revision = NDIS_FILTER_CHARACTERISTICS_REVISION_2 as u8;
-        c.Header.Size = HV_WDK_FILTER_REV2_SIZE as u16;
+        c.Header.Size = FWX_WDK_FILTER_REV2_SIZE as u16;
     }
     c.MajorNdisVersion = (version >> 16) as u8;
     c.MinorNdisVersion = version as u8;
     c.MajorDriverVersion = 0;
     c.MinorDriverVersion = 3;
-    c.FriendlyName = wide!("HyperVXNdisFilter Rust Host Adapter LWF");
+    c.FriendlyName = wide!("FirewallXNdisFilter Rust Host Adapter LWF");
     c.UniqueName = wide!("{6E76EAD1-7BCB-49C4-9547-D3E6B3488F71}");
-    c.ServiceName = wide!("HyperVXNdisFilter");
+    c.ServiceName = wide!("FirewallXNdisFilter");
     c.AttachHandler = Some(filter_attach);
     c.DetachHandler = Some(filter_detach);
     c.RestartHandler = Some(filter_restart);
@@ -153,7 +153,7 @@ unsafe fn return_flags() -> u32 {
 /// Caller holds the adapter admission lock. Overflow must not lose ownership.
 unsafe fn retain_active_locked(a: *mut Adapter) {
     unsafe {
-        (*a).active = (*a).active.checked_add(1).unwrap_or_else(|| hv_bugcheck());
+        (*a).active = (*a).active.checked_add(1).unwrap_or_else(|| fwx_bugcheck());
     }
 }
 
@@ -166,7 +166,7 @@ unsafe fn release_active(a: *mut Adapter, count: u64) {
         (*a).active = (*a)
             .active
             .checked_sub(count)
-            .unwrap_or_else(|| hv_bugcheck());
+            .unwrap_or_else(|| fwx_bugcheck());
         let complete = (*a).active == 0 && (*a).pause_pending != 0;
         if complete {
             (*a).pause_pending = 0;
@@ -185,7 +185,7 @@ unsafe fn set_filter_running(a: *mut Adapter, running: bool) {
         let delta = i64::from(running) - i64::from((*a).running != 0);
         let old = FILTERED_DEVICE_COUNT.load(Ordering::SeqCst);
         if old < 0 || old.checked_add(delta).is_none_or(|n| n < 0) {
-            hv_bugcheck();
+            fwx_bugcheck();
         }
         (*a).running = u8::from(running);
         FILTERED_DEVICE_COUNT.fetch_add(delta, Ordering::SeqCst);
@@ -335,12 +335,12 @@ unsafe fn complete_local_lso(nbl: PNET_BUFFER_LIST) -> bool {
 /// Finish one claimed NBL. Publishing a pending NBL transfers its ownership to
 /// policy; the classifier must not inspect it after that publication.
 #[unsafe(no_mangle)]
-pub(super) unsafe extern "C" fn hv_finish(nbl_address: usize, finish: u32) {
+pub(super) unsafe extern "C" fn fwx_finish(nbl_address: usize, finish: u32) {
     unsafe {
         let nbl = nbl_address as PNET_BUFFER_LIST;
         let context = packet::packet_context(nbl);
         if (*context).owner != packet::OWNER_NDIS {
-            hv_bugcheck();
+            fwx_bugcheck();
         }
         let a = (*context).adapter.cast::<Adapter>();
         ndis_lock(addr_of_mut!((*a).lock));
@@ -376,14 +376,14 @@ pub(super) unsafe extern "C" fn hv_finish(nbl_address: usize, finish: u32) {
         if send {
             let lso_complete = complete_local_lso(nbl);
             if !lso_complete {
-                policy::HvInvalidLso((*a).interface_index);
+                policy::FwxInvalidLso((*a).interface_index);
             }
             (*nbl).__bindgen_anon_2.Status = if finish == FINISH_CANCEL {
-                HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+                FWX_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
             } else if !lso_complete {
-                HV_WDK_NDIS_RESOURCES as NDIS_STATUS
+                FWX_WDK_NDIS_RESOURCES as NDIS_STATUS
             } else {
-                HV_WDK_NDIS_SUCCESS as NDIS_STATUS
+                FWX_WDK_NDIS_SUCCESS as NDIS_STATUS
             };
             api::NdisFSendNetBufferListsComplete((*a).filter, nbl, send_complete_flags());
         } else if copied {
@@ -408,24 +408,24 @@ unsafe fn register_send_batch(a: *mut Adapter, batch: *mut SendBatch) {
 unsafe fn unregister_send_batch(a: *mut Adapter, batch: *mut SendBatch) {
     unsafe {
         if !(*batch).remaining.is_null() || (*batch).current {
-            hv_bugcheck();
+            fwx_bugcheck();
         }
         let previous = (*batch).previous;
         let next = (*batch).next;
         if previous.is_null() {
             if (*a).send_batches != batch {
-                hv_bugcheck();
+                fwx_bugcheck();
             }
             (*a).send_batches = next;
         } else {
             if (*previous).next != batch {
-                hv_bugcheck();
+                fwx_bugcheck();
             }
             (*previous).next = next;
         }
         if !next.is_null() {
             if (*next).previous != batch {
-                hv_bugcheck();
+                fwx_bugcheck();
             }
             (*next).previous = previous;
         }
@@ -493,7 +493,7 @@ unsafe fn classify_chain(
                     } else {
                         0
                     };
-                    result = policy::HvClassify(
+                    result = policy::FwxClassify(
                         nbl as usize,
                         (*a).interface_index,
                         direction,
@@ -516,20 +516,22 @@ unsafe fn classify_chain(
             match nbl {
                 Err(reason) => {
                     match reason {
-                        PacketCreateError::Paused => policy::HvPausedDrop((*a).interface_index),
-                        PacketCreateError::Resource => policy::HvResourceDrop((*a).interface_index),
+                        PacketCreateError::Paused => policy::FwxPausedDrop((*a).interface_index),
+                        PacketCreateError::Resource => {
+                            policy::FwxResourceDrop((*a).interface_index)
+                        }
                     }
                     if direction == SEND {
                         // Preserve cancellation/pause status even if LSO metadata is malformed.
                         if !complete_local_lso(original) {
-                            policy::HvInvalidLso((*a).interface_index);
+                            policy::FwxInvalidLso((*a).interface_index);
                         }
                         (*original).__bindgen_anon_2.Status = if cancelled {
-                            HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+                            FWX_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
                         } else if reason == PacketCreateError::Paused {
-                            HV_WDK_NDIS_PAUSED as NDIS_STATUS
+                            FWX_WDK_NDIS_PAUSED as NDIS_STATUS
                         } else {
-                            HV_WDK_NDIS_RESOURCES as NDIS_STATUS
+                            FWX_WDK_NDIS_RESOURCES as NDIS_STATUS
                         };
                         api::NdisFSendNetBufferListsComplete(
                             (*a).filter,
@@ -546,7 +548,7 @@ unsafe fn classify_chain(
                     } else {
                         result as u32
                     };
-                    hv_finish(nbl as usize, finish);
+                    fwx_finish(nbl as usize, finish);
                 }
                 Ok(_) => {} // Policy owns the NBL; it may already have been freed.
             }
@@ -616,13 +618,13 @@ pub(super) unsafe extern "C" fn send_complete(
                 || (*owned).forwarded == 0
                 || (*owned).direction != SEND
             {
-                hv_bugcheck();
+                fwx_bugcheck();
             }
             let status = (*nbl).__bindgen_anon_2.Status;
-            if status != HV_WDK_NDIS_SUCCESS as NDIS_STATUS
-                && status != HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+            if status != FWX_WDK_NDIS_SUCCESS as NDIS_STATUS
+                && status != FWX_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
             {
-                policy::HvSendFailure((*a).interface_index, status);
+                policy::FwxSendFailure((*a).interface_index, status);
             }
             packet::free_packet_context(nbl);
             api::NdisFSendNetBufferListsComplete((*a).filter, nbl, flags);
@@ -672,15 +674,15 @@ pub(super) unsafe extern "C" fn cancel_send(context: NDIS_HANDLE, cancel: PVOID)
             batch = (*batch).next;
         }
         ndis_unlock(addr_of_mut!((*a).lock));
-        policy::HvCancel((*a).interface_index, cancel as usize);
+        policy::FwxCancel((*a).interface_index, cancel as usize);
         while !cancelled.is_null() {
             let nbl = cancelled;
             cancelled = packet::next_nbl(nbl);
             packet::set_next_nbl(nbl, null_mut());
             if !complete_local_lso(nbl) {
-                policy::HvInvalidLso((*a).interface_index);
+                policy::FwxInvalidLso((*a).interface_index);
             }
-            (*nbl).__bindgen_anon_2.Status = HV_WDK_NDIS_SEND_ABORTED as NDIS_STATUS;
+            (*nbl).__bindgen_anon_2.Status = FWX_WDK_NDIS_SEND_ABORTED as NDIS_STATUS;
             api::NdisFSendNetBufferListsComplete((*a).filter, nbl, send_complete_flags());
         }
         api::NdisFCancelSendNetBufferLists((*a).filter, cancel);
@@ -733,7 +735,7 @@ pub(super) unsafe extern "C" fn return_receive(
                 || (*owned).forwarded == 0
                 || (*owned).direction != RECEIVE
             {
-                hv_bugcheck();
+                fwx_bugcheck();
             }
             let copied = (*owned).copied != 0;
             packet::free_packet_context(nbl);
@@ -752,10 +754,10 @@ unsafe fn invalidate(a: *mut Adapter) {
     unsafe {
         let mut state: LOCK_STATE_EX = zeroed();
         api::NdisAcquireRWLockWrite((*a).classification_lock, &mut state, 0);
-        policy::HvInvalidate((*a).interface_index, 1);
+        policy::FwxInvalidate((*a).interface_index, 1);
         api::NdisReleaseRWLock((*a).classification_lock, &mut state);
         // NDIS completion and bulk retired-cache free happen outside both locks.
-        policy::HvDrain();
+        policy::FwxDrain();
     }
 }
 
@@ -803,7 +805,7 @@ pub(super) unsafe extern "C" fn oid(
     unsafe {
         let a = context.cast::<Adapter>();
         if api::ExAcquireRundownProtection(addr_of_mut!((*a).oid_rundown)) == 0 {
-            return HV_WDK_NDIS_CLOSING as NDIS_STATUS;
+            return FWX_WDK_NDIS_CLOSING as NDIS_STATUS;
         }
         let mut clone = null_mut();
         api::NdisAllocateCloneOidRequest((*a).filter, request, TAG, &mut clone);
@@ -811,7 +813,7 @@ pub(super) unsafe extern "C" fn oid(
             .cast::<PNDIS_OID_REQUEST>()
             .write_unaligned(request);
         let status = api::NdisFOidRequest((*a).filter, clone);
-        if status != HV_WDK_NDIS_PENDING as NDIS_STATUS {
+        if status != FWX_WDK_NDIS_PENDING as NDIS_STATUS {
             oid_free_clone(a, clone);
             api::ExReleaseRundownProtection(addr_of_mut!((*a).oid_rundown));
         }
@@ -855,7 +857,7 @@ unsafe fn copy_adapter_name(
         } else {
             ((*name).Buffer.cast_const(), u32::from((*name).Length) / 2)
         };
-        adapter_info::HvCopyAdapterName(out, source, length, flags, truncated)
+        adapter_info::FwxCopyAdapterName(out, source, length, flags, truncated)
     }
 }
 
@@ -893,7 +895,7 @@ unsafe fn capture_attach_info(
             mac_length,
         );
         if (*p).Header.Revision >= NDIS_FILTER_ATTACH_PARAMETERS_REVISION_4 as u8
-            && (*p).Header.Size >= HV_WDK_ATTACH_REV4_SIZE as u16
+            && (*p).Header.Size >= FWX_WDK_ATTACH_REV4_SIZE as u16
         {
             (*info).flags |= wire::ADAPTER_CONNECTOR_VALID;
             (*info).connector_present = u32::from((*p).BaseMiniportIfConnectorPresent != 0);
@@ -932,20 +934,20 @@ unsafe fn capture_restart_info(a: *mut Adapter, p: PNDIS_FILTER_RESTART_PARAMETE
         let mut attribute = (*p).RestartAttributes;
         while !attribute.is_null() {
             if (*attribute).Oid == OID_GEN_MINIPORT_RESTART_ATTRIBUTES
-                && (*attribute).DataLength >= HV_WDK_RESTART_GENERAL_SIZE as u32
+                && (*attribute).DataLength >= FWX_WDK_RESTART_GENERAL_SIZE as u32
             {
                 let candidate =
                     addr_of!((*attribute).Data).cast::<NDIS_RESTART_GENERAL_ATTRIBUTES>();
                 let header = addr_of!((*candidate).Header).read_unaligned();
                 if header.Type == NDIS_OBJECT_TYPE_RESTART_GENERAL_ATTRIBUTES as u8
                     && header.Revision >= NDIS_RESTART_GENERAL_ATTRIBUTES_REVISION_1 as u8
-                    && header.Size >= HV_WDK_RESTART_GENERAL_SIZE as u16
+                    && header.Size >= FWX_WDK_RESTART_GENERAL_SIZE as u16
                     && u32::from(header.Size) <= (*attribute).DataLength
                 {
                     ptr::copy_nonoverlapping(
                         candidate.cast::<u8>(),
                         addr_of_mut!(general).cast::<u8>(),
-                        HV_WDK_RESTART_GENERAL_SIZE as usize,
+                        FWX_WDK_RESTART_GENERAL_SIZE as usize,
                     );
                     have_general = true;
                     break;
@@ -959,7 +961,7 @@ unsafe fn capture_restart_info(a: *mut Adapter, p: PNDIS_FILTER_RESTART_PARAMETE
         (*info).physical_medium = physical;
         (*info).lower_interface_index = lower_index;
         (*info).lower_interface_luid = lower_luid;
-        adapter_info::HvClearGeneralAttributes(info);
+        adapter_info::FwxClearGeneralAttributes(info);
         if have_general {
             (*info).flags |= wire::ADAPTER_GENERAL_VALID;
             (*info).mtu = general.MtuSize;
@@ -987,39 +989,39 @@ pub(super) unsafe fn query_adapter_info(
 ) -> NTSTATUS {
     unsafe {
         if capacity < wire::ADAPTER_INFO_HEADER_SIZE as u32 {
-            return HV_WDK_STATUS_BUFFER_TOO_SMALL as NTSTATUS;
+            return FWX_WDK_STATUS_BUFFER_TOO_SMALL as NTSTATUS;
         }
         if out.is_null() {
-            return HV_WDK_STATUS_INVALID_PARAMETER as NTSTATUS;
+            return FWX_WDK_STATUS_INVALID_PARAMETER as NTSTATUS;
         }
         let mut snapshot: *mut AdapterInfo = null_mut();
         let mut allocated_count = 0;
-        let mut status = HV_WDK_STATUS_RETRY as NTSTATUS;
+        let mut status = FWX_WDK_STATUS_RETRY as NTSTATUS;
         for _ in 0..MAX_STAGING_ATTEMPTS {
             let mut size = 0;
             let irql = spin_lock(addr_of_mut!(ADAPTER_INFO_LOCK));
-            let action = adapter_info::HvPlanAdapterInfo(
+            let action = adapter_info::FwxPlanAdapterInfo(
                 ADAPTER_COUNT,
                 capacity,
                 allocated_count,
                 &mut size,
             );
             if matches!(action, AdapterInfoAction::CountOverflow) {
-                status = HV_WDK_STATUS_INTEGER_OVERFLOW as NTSTATUS;
+                status = FWX_WDK_STATUS_INTEGER_OVERFLOW as NTSTATUS;
                 spin_unlock(addr_of_mut!(ADAPTER_INFO_LOCK), irql);
                 break;
             }
             let mut count = ADAPTER_COUNT as u32;
             let running = FILTERED_DEVICE_COUNT.load(Ordering::SeqCst);
             if running < 0 || running as u64 > ADAPTER_COUNT || size == 0 {
-                hv_bugcheck();
+                fwx_bugcheck();
             }
             match action {
                 AdapterInfoAction::HeaderOnly => {
                     // METHOD_BUFFERED warning replies contain the sizing header.
-                    adapter_info::HvEncodeAdapterInfoHeader(out, count, running as u32);
+                    adapter_info::FwxEncodeAdapterInfoHeader(out, count, running as u32);
                     *transferred = wire::ADAPTER_INFO_HEADER_SIZE;
-                    status = HV_WDK_STATUS_BUFFER_OVERFLOW as NTSTATUS;
+                    status = FWX_WDK_STATUS_BUFFER_OVERFLOW as NTSTATUS;
                     spin_unlock(addr_of_mut!(ADAPTER_INFO_LOCK), irql);
                     break;
                 }
@@ -1030,11 +1032,11 @@ pub(super) unsafe fn query_adapter_info(
                         snapshot = null_mut();
                     }
                     let Some(bytes) = (count as usize).checked_mul(size_of::<AdapterInfo>()) else {
-                        status = HV_WDK_STATUS_INTEGER_OVERFLOW as NTSTATUS;
+                        status = FWX_WDK_STATUS_INTEGER_OVERFLOW as NTSTATUS;
                         break;
                     };
                     snapshot = pool_allocation(api::ExAllocatePool2(
-                        (HV_WDK_POOL_FLAG_NON_PAGED | HV_WDK_POOL_FLAG_UNINITIALIZED) as u64,
+                        (FWX_WDK_POOL_FLAG_NON_PAGED | FWX_WDK_POOL_FLAG_UNINITIALIZED) as u64,
                         bytes as u64,
                         INFO_TAG,
                     ))
@@ -1043,7 +1045,7 @@ pub(super) unsafe fn query_adapter_info(
                     continue;
                 }
                 AdapterInfoAction::Encode => {}
-                AdapterInfoAction::TooSmall | AdapterInfoAction::CountOverflow => hv_bugcheck(),
+                AdapterInfoAction::TooSmall | AdapterInfoAction::CountOverflow => fwx_bugcheck(),
             }
             // One lock protects list lifetime, metadata and running_count. Never
             // allocate, encode every field or take an adapter lock under it.
@@ -1052,7 +1054,7 @@ pub(super) unsafe fn query_adapter_info(
             let mut entry = (*head).Flink;
             while entry != head {
                 if u64::from(count) >= ADAPTER_COUNT {
-                    hv_bugcheck();
+                    fwx_bugcheck();
                 }
                 let a = entry
                     .cast::<u8>()
@@ -1063,18 +1065,18 @@ pub(super) unsafe fn query_adapter_info(
                 entry = (*entry).Flink;
             }
             if u64::from(count) != ADAPTER_COUNT {
-                hv_bugcheck();
+                fwx_bugcheck();
             }
             spin_unlock(addr_of_mut!(ADAPTER_INFO_LOCK), irql);
-            adapter_info::HvEncodeAdapterInfoHeader(out, count, running as u32);
+            adapter_info::FwxEncodeAdapterInfoHeader(out, count, running as u32);
             for i in 0..count as usize {
-                adapter_info::HvEncodeAdapterInfo(
+                adapter_info::FwxEncodeAdapterInfo(
                     out.add(wire::ADAPTER_INFO_HEADER_SIZE + i * wire::ADAPTER_INFO_ENTRY_SIZE),
                     snapshot.add(i),
                 );
             }
             *transferred = size as usize;
-            status = HV_WDK_STATUS_SUCCESS as NTSTATUS;
+            status = FWX_WDK_STATUS_SUCCESS as NTSTATUS;
             break;
         }
         if !snapshot.is_null() {
@@ -1087,15 +1089,15 @@ pub(super) unsafe fn query_adapter_info(
 pub(super) unsafe extern "C" fn status(context: NDIS_HANDLE, status: PNDIS_STATUS_INDICATION) {
     unsafe {
         let a = context.cast::<Adapter>();
-        if (*status).StatusCode == HV_WDK_NDIS_LINK_STATE as NDIS_STATUS
+        if (*status).StatusCode == FWX_WDK_NDIS_LINK_STATE as NDIS_STATUS
             && !(*status).StatusBuffer.is_null()
-            && (*status).StatusBufferSize >= HV_WDK_LINK_STATE_SIZE as u32
+            && (*status).StatusBufferSize >= FWX_WDK_LINK_STATE_SIZE as u32
         {
             let link = (*status).StatusBuffer.cast::<NDIS_LINK_STATE>();
             let header = addr_of!((*link).Header).read_unaligned();
             if header.Type == NDIS_OBJECT_TYPE_DEFAULT as u8
                 && header.Revision >= NDIS_LINK_STATE_REVISION_1 as u8
-                && header.Size >= HV_WDK_LINK_STATE_SIZE as u16
+                && header.Size >= FWX_WDK_LINK_STATE_SIZE as u16
                 && u32::from(header.Size) <= (*status).StatusBufferSize
             {
                 // Copy borrowed link fields before locking; no NDIS pointers are
@@ -1145,10 +1147,10 @@ pub(super) unsafe extern "C" fn filter_attach(
         let mut guid: GUID = zeroed();
         // Only armed, identity-valid Ethernet miniports may attach.
         if (*p).MiniportMediaType != NdisMedium802_3 || !registry::target_adapter(p, &mut guid) {
-            return HV_WDK_NDIS_NOT_SUPPORTED as NDIS_STATUS;
+            return FWX_WDK_NDIS_NOT_SUPPORTED as NDIS_STATUS;
         }
         let a = pool_allocation(api::ExAllocatePool2(
-            HV_WDK_POOL_FLAG_NON_PAGED as u64,
+            FWX_WDK_POOL_FLAG_NON_PAGED as u64,
             size_of::<Adapter>() as u64,
             TAG,
         ))
@@ -1164,38 +1166,38 @@ pub(super) unsafe extern "C" fn filter_attach(
         let mut nbl_pool: NET_BUFFER_LIST_POOL_PARAMETERS = zeroed();
         nbl_pool.Header.Type = NDIS_OBJECT_TYPE_DEFAULT as u8;
         nbl_pool.Header.Revision = NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1 as u8;
-        nbl_pool.Header.Size = HV_WDK_NBL_POOL_SIZE as u16;
+        nbl_pool.Header.Size = FWX_WDK_NBL_POOL_SIZE as u16;
         nbl_pool.ProtocolId = NDIS_PROTOCOL_ID_DEFAULT as u8;
         nbl_pool.PoolTag = TAG;
         (*a).nbl_pool = api::NdisAllocateNetBufferListPool(filter, &nbl_pool);
         let mut nb_pool: NET_BUFFER_POOL_PARAMETERS = zeroed();
         nb_pool.Header.Type = NDIS_OBJECT_TYPE_DEFAULT as u8;
         nb_pool.Header.Revision = NET_BUFFER_POOL_PARAMETERS_REVISION_1 as u8;
-        nb_pool.Header.Size = HV_WDK_NB_POOL_SIZE as u16;
+        nb_pool.Header.Size = FWX_WDK_NB_POOL_SIZE as u16;
         nb_pool.PoolTag = TAG;
         (*a).nb_pool = api::NdisAllocateNetBufferPool(filter, &nb_pool);
-        let attached = policy::HvAttach((*a).interface_index);
-        policy::HvDrain();
+        let attached = policy::FwxAttach((*a).interface_index);
+        policy::FwxDrain();
         if attached == 0 {
             free_adapter(a);
-            return HV_WDK_NDIS_RESOURCES as NDIS_STATUS;
+            return FWX_WDK_NDIS_RESOURCES as NDIS_STATUS;
         }
         let mut attributes: NDIS_FILTER_ATTRIBUTES = zeroed();
         attributes.Header.Type = NDIS_OBJECT_TYPE_FILTER_ATTRIBUTES as u8;
         attributes.Header.Revision = NDIS_FILTER_ATTRIBUTES_REVISION_1 as u8;
-        attributes.Header.Size = HV_WDK_FILTER_ATTRIBUTES_SIZE as u16;
+        attributes.Header.Size = FWX_WDK_FILTER_ATTRIBUTES_SIZE as u16;
         let status = api::NdisFSetAttributes(filter, a.cast(), &mut attributes);
-        if status == HV_WDK_NDIS_SUCCESS as NDIS_STATUS {
+        if status == FWX_WDK_NDIS_SUCCESS as NDIS_STATUS {
             let irql = spin_lock(addr_of_mut!(ADAPTER_INFO_LOCK));
             ADAPTER_COUNT = ADAPTER_COUNT
                 .checked_add(1)
-                .unwrap_or_else(|| hv_bugcheck());
+                .unwrap_or_else(|| fwx_bugcheck());
             list_insert_tail(addr_of_mut!(ADAPTERS), addr_of_mut!((*a).adapter_link));
             spin_unlock(addr_of_mut!(ADAPTER_INFO_LOCK), irql);
             return status;
         }
-        policy::HvRollbackAttach((*a).interface_index);
-        policy::HvDrain();
+        policy::FwxRollbackAttach((*a).interface_index);
+        policy::FwxDrain();
         free_adapter(a);
         status
     }
@@ -1207,12 +1209,12 @@ pub(super) unsafe extern "C" fn filter_restart(
 ) -> NDIS_STATUS {
     unsafe {
         let a = context.cast::<Adapter>();
-        if policy::HvRestart((*a).interface_index) == 0 {
-            return HV_WDK_NDIS_FAILURE as NDIS_STATUS;
+        if policy::FwxRestart((*a).interface_index) == 0 {
+            return FWX_WDK_NDIS_FAILURE as NDIS_STATUS;
         }
         capture_restart_info(a, p);
         set_filter_running(a, true);
-        HV_WDK_NDIS_SUCCESS as NDIS_STATUS
+        FWX_WDK_NDIS_SUCCESS as NDIS_STATUS
     }
 }
 
@@ -1231,10 +1233,10 @@ pub(super) unsafe extern "C" fn filter_pause(
         invalidate(a);
         ndis_lock(addr_of_mut!((*a).lock));
         let status = if (*a).active == 0 {
-            HV_WDK_NDIS_SUCCESS as NDIS_STATUS
+            FWX_WDK_NDIS_SUCCESS as NDIS_STATUS
         } else {
             (*a).pause_pending = 1;
-            HV_WDK_NDIS_PENDING as NDIS_STATUS
+            FWX_WDK_NDIS_PENDING as NDIS_STATUS
         };
         ndis_unlock(addr_of_mut!((*a).lock));
         status
@@ -1245,17 +1247,17 @@ pub(super) unsafe extern "C" fn filter_detach(context: NDIS_HANDLE) {
     unsafe {
         let a = context.cast::<Adapter>();
         if (*a).running != 0 || (*a).active != 0 {
-            hv_bugcheck();
+            fwx_bugcheck();
         }
         let irql = spin_lock(addr_of_mut!(ADAPTER_INFO_LOCK));
         list_remove(addr_of_mut!((*a).adapter_link));
         ADAPTER_COUNT = ADAPTER_COUNT
             .checked_sub(1)
-            .unwrap_or_else(|| hv_bugcheck());
+            .unwrap_or_else(|| fwx_bugcheck());
         spin_unlock(addr_of_mut!(ADAPTER_INFO_LOCK), irql);
         api::ExWaitForRundownProtectionRelease(addr_of_mut!((*a).oid_rundown));
-        policy::HvDetach((*a).interface_index);
-        policy::HvDrain();
+        policy::FwxDetach((*a).interface_index);
+        policy::FwxDrain();
         free_adapter(a);
     }
 }

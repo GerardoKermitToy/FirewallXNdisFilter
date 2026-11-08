@@ -1,8 +1,8 @@
-use hyperv_policy::{
+use firewallx_policy::{
     engine::{Engine, Finish, Submission, allocate_record},
     packet::{self, NdisPath, Packet},
 };
-use hyperv_protocol::{Direction, Verdict, connection_header_len};
+use firewallx_protocol::{Direction, Verdict, connection_header_len};
 
 fn sandbox_request(protocol: u8) -> Vec<u8> {
     let size = if protocol == 1 { 60u16 } else { 52 };

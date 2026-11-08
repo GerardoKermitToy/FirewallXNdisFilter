@@ -181,7 +181,7 @@ bool ValidateCommands(const uint8_t* bytes, size_t length, std::string& error) {
             case CommandType::Verdict: command_size = kVerdictCommandSize; break;
             case CommandType::UpdateV4:
             case CommandType::UpdateV6:
-                error = "UpdateV4/UpdateV6 commands are not supported by HyperVXNdisFilter";
+                error = "UpdateV4/UpdateV6 commands are not supported by FirewallXNdisFilter";
                 return false;
             default:
                 error = "unknown command byte " + std::to_string(bytes[offset]);
@@ -192,7 +192,7 @@ bool ValidateCommands(const uint8_t* bytes, size_t length, std::string& error) {
             return false;
         }
         if (command_size > 1 && !IsSupportedVerdict(bytes[offset + command_size - 1])) {
-            error = "unsupported verdict: HyperVXNdisFilter accepts only bytes 2..7 (no redirects)";
+            error = "unsupported verdict: FirewallXNdisFilter accepts only bytes 2..7 (no redirects)";
             return false;
         }
         offset += command_size;
@@ -204,7 +204,7 @@ bool ValidateCommands(const uint8_t* bytes, size_t length, std::string& error) {
 bool EncodeVerdict(uint64_t id, Verdict verdict,
                    std::array<uint8_t, kVerdictCommandSize>& out, std::string& error) {
     if (!IsSupportedVerdict(static_cast<uint8_t>(verdict))) {
-        error = "unsupported verdict: HyperVXNdisFilter accepts only bytes 2..7 (no redirects)";
+        error = "unsupported verdict: FirewallXNdisFilter accepts only bytes 2..7 (no redirects)";
         return false;
     }
     out[0] = static_cast<uint8_t>(CommandType::Verdict);
@@ -265,7 +265,7 @@ bool DispatchRecord(const uint8_t* bytes, size_t length, const Handlers& handler
             c.payload_layer = p[offset++];
             c.payload_size = ReadU32(p + offset); offset += 4;
             if (c.direction > 1 || c.payload_layer != 3) {
-                error = "invalid HyperVXNdisFilter Connection metadata (expected outbound/inbound, IP payload)";
+                error = "invalid FirewallXNdisFilter Connection metadata (expected outbound/inbound, IP payload)";
                 return false;
             }
             if (c.payload_size > kMaxPayloadSize) {
@@ -302,7 +302,7 @@ bool DispatchRecord(const uint8_t* bytes, size_t length, const Handlers& handler
             e.local_port = ReadU16(p + offset); offset += 2;
             e.remote_port = ReadU16(p + offset);
             if (e.process_id != 0 || e.direction > 1) {
-                error = "invalid HyperVXNdisFilter ConnectionEnd metadata";
+                error = "invalid FirewallXNdisFilter ConnectionEnd metadata";
                 return false;
             }
             if (handlers.on_connection_end) handlers.on_connection_end(e);

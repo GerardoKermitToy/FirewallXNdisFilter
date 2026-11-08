@@ -18,7 +18,6 @@ mod native_local_address;
 mod native_packet;
 mod packet_snapshot;
 mod send_guard;
-mod target_config;
 mod transit_packet;
 #[cfg(feature = "native-wdk")]
 mod wdk;
@@ -30,7 +29,7 @@ use core::{
     ffi::c_void,
     panic::PanicInfo,
 };
-use hyperv_policy::{
+use firewallx_policy::{
     cache::{CLEANUP_SLOTS_PER_BATCH, CacheAllocator, CacheWork},
     engine::{
         Action, BandwidthTable, BandwidthWork, Engine, Finish, Submission, VerdictError,
@@ -38,7 +37,7 @@ use hyperv_policy::{
     },
     packet::{self, NdisPath, Packet, SNAPSHOT},
 };
-use hyperv_protocol::{self as wire, Command};
+use firewallx_protocol::{self as wire, Command};
 use likely_stable::unlikely;
 use packet_snapshot::{ParserScratch, Snapshot, SnapshotError};
 use send_guard::with_send_guard;
@@ -49,22 +48,22 @@ const INVALID_PARAMETER: i32 = 0xc000000du32 as i32;
 const NOT_SUPPORTED: i32 = 0xc00000bbu32 as i32;
 
 #[unsafe(no_mangle)]
-pub static HV_API_VERSION: [u8; 4] = wire::VERSION;
+pub static FWX_API_VERSION: [u8; 4] = wire::VERSION;
 
 unsafe extern "C" {
-    fn hv_initialize(driver: Handle, registry: Handle) -> i32;
-    fn hv_lock() -> usize;
-    fn hv_unlock(irql: usize);
-    fn hv_publish_state(ready: u32, online: u32, pending: u32, cached: u32);
-    fn hv_now() -> u64;
-    fn hv_allocate(size: usize) -> *mut u8;
-    fn hv_free(data: *mut u8, size: usize);
-    fn hv_cache_allocate(size: usize) -> *mut u8;
-    fn hv_cache_free(data: *mut u8, size: usize);
-    fn hv_finish(nbl: usize, finish: u32);
-    fn hv_first_nb(nbl: usize) -> Handle;
-    fn hv_next_nb(nb: Handle) -> Handle;
-    fn hv_snapshot(
+    fn fwx_initialize(driver: Handle, registry: Handle) -> i32;
+    fn fwx_lock() -> usize;
+    fn fwx_unlock(irql: usize);
+    fn fwx_publish_state(ready: u32, online: u32, pending: u32, cached: u32);
+    fn fwx_now() -> u64;
+    fn fwx_allocate(size: usize) -> *mut u8;
+    fn fwx_free(data: *mut u8, size: usize);
+    fn fwx_cache_allocate(size: usize) -> *mut u8;
+    fn fwx_cache_free(data: *mut u8, size: usize);
+    fn fwx_finish(nbl: usize, finish: u32);
+    fn fwx_first_nb(nbl: usize) -> Handle;
+    fn fwx_next_nb(nb: Handle) -> Handle;
+    fn fwx_snapshot(
         nb: Handle,
         nbl: usize,
         out: *mut u8,
@@ -74,7 +73,7 @@ unsafe extern "C" {
         frame_len: *mut u32,
         offload: *mut u32,
     ) -> u32;
-    fn hv_snapshot_view(
+    fn fwx_snapshot_view(
         nb: Handle,
         nbl: usize,
         storage: *mut u8,
@@ -84,7 +83,7 @@ unsafe extern "C" {
         frame_len: *mut u32,
         offload: *mut u32,
     ) -> *const u8;
-    fn hv_bugcheck() -> !;
+    fn fwx_bugcheck() -> !;
 }
 struct NonPagedAllocator;
 // SAFETY: the shim returns nonpaged pool aligned to at least 16 bytes and
@@ -94,10 +93,10 @@ unsafe impl GlobalAlloc for NonPagedAllocator {
         if unlikely(layout.align() > 16) {
             return core::ptr::null_mut();
         }
-        unsafe { hv_allocate(layout.size()) }
+        unsafe { fwx_allocate(layout.size()) }
     }
     unsafe fn dealloc(&self, data: *mut u8, layout: Layout) {
-        unsafe { hv_free(data, layout.size()) }
+        unsafe { fwx_free(data, layout.size()) }
     }
 }
 #[global_allocator]
@@ -108,10 +107,10 @@ struct State(UnsafeCell<Engine>);
 // published. Every engine access is under it; no references escape with_state.
 unsafe impl Sync for State {}
 unsafe fn cache_allocate(size: usize) -> *mut u8 {
-    unsafe { hv_cache_allocate(size) }
+    unsafe { fwx_cache_allocate(size) }
 }
 unsafe fn cache_free(data: *mut u8, size: usize) {
-    unsafe { hv_cache_free(data, size) }
+    unsafe { fwx_cache_free(data, size) }
 }
 // SAFETY: matching nonpaged pool functions; buffers are freed unlocked.
 const CACHE_ALLOCATOR: CacheAllocator = unsafe { CacheAllocator::new(cache_allocate, cache_free) };
@@ -121,18 +120,18 @@ static STATE: State = State(UnsafeCell::new(Engine::with_cache_allocator(
 fn with_state<R>(f: impl FnOnce(&mut Engine) -> R) -> R {
     // SAFETY: no recursion into this lock; no NDIS forwarding/completion while held.
     unsafe {
-        let irql = hv_lock();
+        let irql = fwx_lock();
         let engine = &mut *STATE.0.get();
         let result = f(engine);
         // Publish read readiness and O(1) maintenance candidates while locked.
         // Only level transitions arm/cancel timers; no NDIS calls occur here.
-        hv_publish_state(
+        fwx_publish_state(
             engine.has_events() as u32,
             engine.is_online() as u32,
             (engine.pending_count() != 0) as u32,
             (engine.cache_candidates() != 0) as u32,
         );
-        hv_unlock(irql);
+        fwx_unlock(irql);
         result
     }
 }
@@ -140,7 +139,7 @@ fn with_state<R>(f: impl FnOnce(&mut Engine) -> R) -> R {
 // causes synchronous unlocked preparation and a retry of accounting alone.
 fn with_bandwidth<R>(f: impl FnOnce(&mut Engine, &mut BandwidthWork, u64) -> R) -> R {
     let mut work = BandwidthWork::defer_missing();
-    let result = with_state(|engine| f(engine, &mut work, unsafe { hv_now() }));
+    let result = with_state(|engine| f(engine, &mut work, unsafe { fwx_now() }));
     if let Some(deferred) = work.take_deferred() {
         let mut plan = deferred.plan();
         loop {
@@ -168,7 +167,7 @@ fn finish_code(finish: Finish) -> i32 {
 fn finish(a: Action) {
     // SAFETY: claiming a pending entry transfers its one owned NBL. The native Rust
     // layer retains its NDIS module until finish.
-    unsafe { hv_finish(a.nbl, finish_value(a.finish)) }
+    unsafe { fwx_finish(a.nbl, finish_value(a.finish)) }
 }
 // Old per-interface cache banks move out one at a time, keeping the kernel
 // stack fixed-size. No cache pool allocation/free occurs under PolicyLock.
@@ -213,34 +212,34 @@ fn report_bandwidth() {
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DriverEntry(driver: Handle, registry: Handle) -> i32 {
     // SAFETY: opaque WDK-owned objects, validated and used by the ABI shim only.
-    unsafe { hv_initialize(driver, registry) }
+    unsafe { fwx_initialize(driver, registry) }
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvConfigure(timeout: u32, cache_ttl: u32, fail_closed: u32) {
+pub extern "C" fn FwxConfigure(timeout: u32, cache_ttl: u32, fail_closed: u32) {
     with_state(|e| e.configure(timeout, cache_ttl, fail_closed != 0));
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvAttach(interface_index: u32) -> u32 {
+pub extern "C" fn FwxAttach(interface_index: u32) -> u32 {
     with_state(|e| e.attach(interface_index) as u32)
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvRollbackAttach(interface_index: u32) {
+pub extern "C" fn FwxRollbackAttach(interface_index: u32) {
     with_state(|e| e.rollback_attach(interface_index));
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvRestart(interface_index: u32) -> u32 {
+pub extern "C" fn FwxRestart(interface_index: u32) -> u32 {
     with_state(|e| e.restart(interface_index) as u32)
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvInvalidate(interface_index: u32, pause: u32) {
+pub extern "C" fn FwxInvalidate(interface_index: u32, pause: u32) {
     with_state(|e| e.invalidate(interface_index, pause != 0));
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvDetach(interface_index: u32) {
+pub extern "C" fn FwxDetach(interface_index: u32) {
     with_state(|e| e.detach(interface_index));
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvDrain() {
+pub extern "C" fn FwxDrain() {
     reclaim_retired();
     drain();
 }
@@ -248,7 +247,7 @@ fn clean_caches() {
     // Fixed cutoff and bounds finish a full pass without chasing new insertions.
     // Migration only moves entries still live at a later time, so concurrent
     // growth cannot hide an entry expired at this cutoff in its new table.
-    let now = unsafe { hv_now() };
+    let now = unsafe { fwx_now() };
     let limit = with_state(|e| e.cache_cleanup_limit());
     let mut after = 0;
     while let Some((index, slots)) = with_state(|e| e.next_cache_candidate(after, limit)) {
@@ -264,11 +263,11 @@ fn clean_caches() {
     }
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvCleanCaches() {
+pub extern "C" fn FwxCleanCaches() {
     clean_caches();
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvConnect() {
+pub extern "C" fn FwxConnect() {
     #[cfg(feature = "native-wdk")]
     let available = native_local_address::available();
     with_state(|e| {
@@ -298,13 +297,13 @@ pub(crate) fn local_address_status(available: bool) {
     });
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvDisconnect() {
+pub extern "C" fn FwxDisconnect() {
     with_state(|e| e.disconnect());
     reclaim_retired();
     drain();
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvCancel(interface_index: u32, cancel: usize) {
+pub extern "C" fn FwxCancel(interface_index: u32, cancel: usize) {
     loop {
         let a = with_state(|e| e.cancel(interface_index, cancel));
         if let Some(a) = a {
@@ -324,10 +323,10 @@ fn capture_packet(nb: Handle, nbl: usize, packet: &Packet) -> Result<Option<Vec<
         return Ok(None);
     };
     let (mut copied, mut trusted, mut frame_len, mut offload) = (0, 0, 0, 0);
-    // SAFETY: the C caller owns this NB until HvClassify returns or publishes its
+    // SAFETY: the C caller owns this NB until FwxClassify returns or publishes its
     // pending NBL. The destination is an exclusively owned nonpaged allocation.
     let ok = unsafe {
-        hv_snapshot(
+        fwx_snapshot(
             nb,
             nbl,
             data[layout.frame_start..].as_mut_ptr(),
@@ -349,7 +348,7 @@ fn capture_packet(nb: Handle, nbl: usize, packet: &Packet) -> Result<Option<Vec<
 // Return -1 when policy owns the nbl; otherwise the caller finishes it after
 // releasing the per-module classification lock. Ownership stays in the native Rust layer.
 #[unsafe(no_mangle)]
-pub extern "C" fn HvClassify(
+pub extern "C" fn FwxClassify(
     nbl: usize,
     interface_index: u32,
     path: u32,
@@ -372,7 +371,7 @@ fn classify(
     send_guard: Handle,
 ) -> i32 {
     let mut batch = transit_packet::PacketBatch::new();
-    let mut nb = unsafe { hv_first_nb(nbl) };
+    let mut nb = unsafe { fwx_first_nb(nbl) };
     if unlikely(nb.is_null()) {
         with_state(|e| e.malformed(interface_index, "NBL contains no network buffers"));
         return 1;
@@ -385,7 +384,7 @@ fn classify(
             |storage| {
                 let mut view = Snapshot::default();
                 view.data = unsafe {
-                    hv_snapshot_view(
+                    fwx_snapshot_view(
                         nb,
                         nbl,
                         storage,
@@ -478,7 +477,7 @@ fn classify(
                 return 1;
             }
         }
-        nb = unsafe { hv_next_nb(nb) };
+        nb = unsafe { fwx_next_nb(nb) };
     }
     let decision = match batch.finish() {
         Ok(decision) => decision,
@@ -559,7 +558,7 @@ fn classify(
         Err(action) => return finish_code(action.finish),
     };
     let mut record = if wants_event {
-        match capture_packet(unsafe { hv_first_nb(nbl) }, nbl, &packet) {
+        match capture_packet(unsafe { fwx_first_nb(nbl) }, nbl, &packet) {
             Ok(record) => record,
             Err(()) => {
                 with_state(|e| {
@@ -596,11 +595,11 @@ fn classify(
     }
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvPausedDrop(interface_index: u32) {
+pub extern "C" fn FwxPausedDrop(interface_index: u32) {
     with_state(|e| e.paused_drop(interface_index));
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvResourceDrop(interface_index: u32) {
+pub extern "C" fn FwxResourceDrop(interface_index: u32) {
     with_state(|e| {
         e.resource_drop(
             interface_index,
@@ -609,11 +608,11 @@ pub extern "C" fn HvResourceDrop(interface_index: u32) {
     });
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvInvalidLso(interface_index: u32) {
+pub extern "C" fn FwxInvalidLso(interface_index: u32) {
     with_state(|e| e.packet_warning(interface_index, "invalid TCP LSO completion metadata"));
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvSendFailure(interface_index: u32, status: i32) {
+pub extern "C" fn FwxSendFailure(interface_index: u32, status: i32) {
     with_state(|e| e.send_failure(interface_index, status));
 }
 
@@ -623,7 +622,7 @@ pub extern "C" fn HvSendFailure(interface_index: u32, status: i32) {
 /// `out` is an exclusively writable nonpaged system buffer of at least `len`
 /// bytes, valid for the entire call, supplied by the buffered IRP shim.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn HvRead(out: *mut u8, len: u32) -> u32 {
+pub unsafe extern "C" fn FwxRead(out: *mut u8, len: u32) -> u32 {
     if unlikely(out.is_null() || len == 0) {
         return 0;
     }
@@ -645,7 +644,7 @@ pub unsafe extern "C" fn HvRead(out: *mut u8, len: u32) -> u32 {
 /// `data` is a readable nonpaged system buffer of at least `len` bytes, immutable
 /// for the call and serialized with client cleanup by the native Rust layer's I/O mutex.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn HvWrite(data: *const u8, len: u32) -> i32 {
+pub unsafe extern "C" fn FwxWrite(data: *const u8, len: u32) -> i32 {
     if unlikely(data.is_null() || len == 0) {
         return INVALID_PARAMETER;
     }
@@ -670,7 +669,7 @@ pub unsafe extern "C" fn HvWrite(data: *const u8, len: u32) -> i32 {
             Command::Verdict { id, verdict } => loop {
                 // Expiry and topology changes may win the race. A stale ID is a
                 // harmless no-op (never a cache write), as on asynchronous kext I/O.
-                let plan = with_state(|e| e.cache_plan(id, verdict, unsafe { hv_now() }));
+                let plan = with_state(|e| e.cache_plan(id, verdict, unsafe { fwx_now() }));
                 let mut work = CacheWork::prepare(plan);
                 let result = with_bandwidth(|e, bandwidth, now| {
                     e.verdict_with_work(id, verdict, now, &mut work, bandwidth)
@@ -702,7 +701,7 @@ pub unsafe extern "C" fn HvWrite(data: *const u8, len: u32) -> i32 {
 }
 #[panic_handler]
 fn panic(_: &PanicInfo<'_>) -> ! {
-    unsafe { hv_bugcheck() }
+    unsafe { fwx_bugcheck() }
 }
 // MSVC's kernel CRT archive supplies the actual memory primitives.
 #[unsafe(no_mangle)]

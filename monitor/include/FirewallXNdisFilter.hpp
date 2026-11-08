@@ -21,7 +21,7 @@
 #include <string_view>
 #include <vector>
 
-namespace hypervxndisfilter {
+namespace firewallxndisfilter {
 
 // One caller-owned Run() thread, no polling thread or per-packet allocations.
 // Callbacks run inline. Views expire on callback return; copy only what you keep.
@@ -484,7 +484,7 @@ private:
     }
     DWORD OpenDevice() {
         auto try_open = [&]() {
-            device_ = CreateFileW(L"\\\\.\\HyperVXNdisFilter", GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+            device_ = CreateFileW(L"\\\\.\\FirewallXNdisFilter", GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                                    OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
             return device_ == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
         };
@@ -495,7 +495,7 @@ private:
                 L"D:P(A;;GA;;;SY)(A;;GA;;;BA)", SDDL_REVISION_1, &sd, nullptr)) return GetLastError();
         SECURITY_ATTRIBUTES sa{sizeof(sa), sd, FALSE};
         struct Event { HANDLE h; ~Event() { if (h) CloseHandle(h); } } ready{
-            CreateEventW(&sa, TRUE, FALSE, L"Global\\HyperVXNdisFilter.DriverReady")};
+            CreateEventW(&sa, TRUE, FALSE, L"Global\\FirewallXNdisFilter.DriverReady")};
         const DWORD create_error = ready.h ? ERROR_SUCCESS : GetLastError();
         LocalFree(sd);
         if (create_error) return create_error;
@@ -570,4 +570,4 @@ private:
     std::atomic<bool> stopping_{false}, running_{false};
 };
 
-} // namespace hypervxndisfilter
+} // namespace firewallxndisfilter

@@ -6,10 +6,10 @@
 #include <cwchar>
 #include <iterator>
 
-namespace hyperv_xndis_filter::setup {
+namespace firewallx_ndis_filter::setup {
 namespace {
 
-constexpr wchar_t kOriginalInf[] = L"HyperVXNdisFilter.inf";
+constexpr wchar_t kOriginalInf[] = L"FirewallXNdisFilter.inf";
 
 std::filesystem::path InfDirectory() {
     std::vector<wchar_t> windows(32768);
@@ -161,4 +161,4 @@ Change RemoveWindowsDriverPackage(const std::wstring& published_inf) {
     return reboot ? Change::RebootRequired : Change::Complete;
 }
 
-} // namespace hyperv_xndis_filter::setup
+} // namespace firewallx_ndis_filter::setup

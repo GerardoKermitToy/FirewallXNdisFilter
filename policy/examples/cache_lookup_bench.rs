@@ -1,7 +1,7 @@
 //! Offline, single-threaded cache lookup benchmark. Never opens the driver.
 extern crate alloc;
 
-use hyperv_protocol::{Connection, Direction};
+use firewallx_protocol::{Connection, Direction};
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     collections::{BTreeMap, HashMap},

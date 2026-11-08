@@ -4,12 +4,12 @@
 #include <cwchar>
 #include <string_view>
 
-namespace hyperv_xndis_filter::setup {
+namespace firewallx_ndis_filter::setup {
 namespace {
 
 void RequireFresh(System& system) {
     if (system.HasService() || system.HasComponent()) {
-        throw Error{L"HyperVXNdisFilter is already installed or removal is pending. Stop the monitor and run Uninstall.exe first; a live driver is never replaced."};
+        throw Error{L"FirewallXNdisFilter is already installed or removal is pending. Stop the monitor and run Uninstall.exe first; a live driver is never replaced."};
     }
 }
 
@@ -25,7 +25,7 @@ int NeedsReboot(System& system) {
 }
 
 int RemovalNeedsReboot(System& system) {
-    system.Print(L"Removal requires a reboot. Configuration remains disarmed. After reboot, run Uninstall.exe again to remove all remaining HyperVXNdisFilter Driver Store packages.\n");
+    system.Print(L"Removal requires a reboot. Configuration remains disarmed. After reboot, run Uninstall.exe again to remove all remaining FirewallXNdisFilter Driver Store packages.\n");
     return kRebootRequired;
 }
 
@@ -51,7 +51,7 @@ Change RemovePackages(System& system) {
     if (!failures.empty()) throw Error{L"Driver Store cleanup is incomplete; configuration remains disarmed.\n" + failures};
     if (reboot) return Change::RebootRequired;
     if (!remaining.empty()) {
-        throw Error{L"HyperVXNdisFilter packages remain in Driver Store after removal. Configuration is retained; run Uninstall.exe again."};
+        throw Error{L"FirewallXNdisFilter packages remain in Driver Store after removal. Configuration is retained; run Uninstall.exe again."};
     }
     return Change::Complete;
 }
@@ -75,7 +75,7 @@ int Enable(System& system, const Targets& targets) {
     RevalidateTargets(system, targets);
     system.VerifyConfiguration(targets);
     system.AllowRuntimeRecovery();
-    system.Print(L"HyperVXNdisFilter is enabled on the enumerated compatible Ethernet binding paths. New paths can be admitted if Windows enables them.\n");
+    system.Print(L"FirewallXNdisFilter is enabled on the enumerated compatible Ethernet binding paths. New paths can be admitted if Windows enables them.\n");
     return 0;
 }
 
@@ -88,7 +88,7 @@ void Rollback(System& system, bool attempted_install) noexcept {
         system.Print(L"WARNING: could not disarm configuration.\n");
     }
     if (!attempted_install) return;
-    system.Print(L"Installation failed; rolling back only this new HyperVXNdisFilter component.\n");
+    system.Print(L"Installation failed; rolling back only this new FirewallXNdisFilter component.\n");
     try {
         if (system.RemoveComponent() == Change::RebootRequired) {
             system.Print(L"Rollback requires a reboot; configuration is retained disarmed.\n");
@@ -142,9 +142,9 @@ std::wstring Usage(Action executable) {
         ? L"Usage: Uninstall.exe [--yes] [--what-if]\n       Uninstall.exe --help\n\n"
         : L"Usage: Install.exe [--package DIRECTORY] [--yes] [--what-if]\n       Install.exe --enable [--yes] [--what-if]\n       Install.exe --help\n\n";
     result += uninstall
-        ? L"Disarms and removes only the hyperv_xndis_filter NetCfg component, then\nremoves ALL identified HyperVXNdisFilter package versions from Driver Store.\nPackages in use require reboot and another Uninstall.exe run; no forced file\ndeletion is performed. No Default Switch, VM, HNS, NAT or unrelated driver is changed.\n"
+        ? L"Disarms and removes only the firewallx_ndis_filter NetCfg component, then\nremoves ALL identified FirewallXNdisFilter package versions from Driver Store.\nPackages in use require reboot and another Uninstall.exe run; no forced file\ndeletion is performed. No Default Switch, VM, HNS, NAT or unrelated driver is changed.\n"
         : L"Installs the optional Ethernet NDIS LWF and enables the present compatible\nNetCfg binding paths. Adapters without a standard Ethernet LWF path (including\nWireGuard) are not covered. The package defaults to this EXE's directory.\n--enable resumes the installed component using its currently available paths.\n";
-    result += L"\nRun from an elevated Administrator/SYSTEM console; stop hyperv_monitor first.\nConfirmation is required unless --yes is supplied. --what-if performs read-only\npreflight without a write lock, registry writes, package deletion or binding changes.\n--help and invalid arguments do not access WMI, NetCfg, registry or the driver.\n\nExit codes: 0 success/dry run, 1 failure, 2 invalid arguments,\n1223 cancelled, 3010 reboot required (configuration retained disarmed).\nThe programs never open the driver device or create an SCM service manually.\n";
+    result += L"\nRun from an elevated Administrator/SYSTEM console; stop firewallx_monitor first.\nConfirmation is required unless --yes is supplied. --what-if performs read-only\npreflight without a write lock, registry writes, package deletion or binding changes.\n--help and invalid arguments do not access WMI, NetCfg, registry or the driver.\n\nExit codes: 0 success/dry run, 1 failure, 2 invalid arguments,\n1223 cancelled, 3010 reboot required (configuration retained disarmed).\nThe programs never open the driver device or create an SCM service manually.\n";
     return result;
 }
 
@@ -171,12 +171,12 @@ void ValidateBindings(const std::vector<Binding>& bindings, const Targets& targe
                       bool all_disabled, bool require_enabled) {
     ValidateTargets(targets);
     for (const auto& binding : bindings) {
-        if (binding.adapter == GUID_NULL) throw Error{L"An ambiguous HyperVXNdisFilter binding path was found."};
+        if (binding.adapter == GUID_NULL) throw Error{L"An ambiguous FirewallXNdisFilter binding path was found."};
         const bool target = std::any_of(targets.begin(), targets.end(), [&](const Adapter& adapter) {
             return binding.adapter == adapter.guid;
         });
         if (binding.enabled && (all_disabled || !target)) {
-            throw Error{L"HyperVXNdisFilter has an unexpectedly enabled binding. No foreign adapter will be edited."};
+            throw Error{L"FirewallXNdisFilter has an unexpectedly enabled binding. No foreign adapter will be edited."};
         }
         if (target && require_enabled && !binding.enabled) {
             throw Error{L"An exact target binding did not enable. No other binding will be tried."};
@@ -186,7 +186,7 @@ void ValidateBindings(const std::vector<Binding>& bindings, const Targets& targe
     // have a path, and every one of its paths must reach the requested state.
     for (const auto& target : targets) {
         if (std::none_of(bindings.begin(), bindings.end(), [&](const Binding& binding) { return binding.adapter == target.guid; })) {
-            throw Error{L"No HyperVXNdisFilter binding exists on an exact configured host adapter."};
+            throw Error{L"No FirewallXNdisFilter binding exists on an exact configured host adapter."};
         }
     }
 }
@@ -201,7 +201,7 @@ int Execute(const Options& options, System& system) {
         system.ValidatePackage(options.package);
         system.Print(L"Compatible binding paths will be enumerated after installation while the filter is disarmed.\n");
     } else if (options.action == Action::Enable) {
-        if (!system.HasComponent()) throw Error{L"HyperVXNdisFilter is not installed. Run Install.exe without --enable first."};
+        if (!system.HasComponent()) throw Error{L"FirewallXNdisFilter is not installed. Run Install.exe without --enable first."};
         targets = system.ResolveTargets();
         ValidateTargets(targets);
         system.VerifyConfiguration(targets);
@@ -215,7 +215,7 @@ int Execute(const Options& options, System& system) {
     }
     if (options.action == Action::Uninstall) {
         const auto packages = system.ReadDriverPackages();
-        system.Print(L"HyperVXNdisFilter Driver Store packages (all versions): " + std::to_wstring(packages.size()) + L"\n");
+        system.Print(L"FirewallXNdisFilter Driver Store packages (all versions): " + std::to_wstring(packages.size()) + L"\n");
         for (const auto& package : packages) system.Print(L"  " + package + L"\n");
     }
     if (options.what_if) {
@@ -223,9 +223,9 @@ int Execute(const Options& options, System& system) {
         return 0;
     }
     const std::wstring operation = options.action == Action::Uninstall
-        ? L"Disarm and uninstall ONLY HyperVXNdisFilter, including ALL its Driver Store package versions"
-        : options.action == Action::Enable ? L"Enable all current compatible HyperVXNdisFilter binding paths"
-                                          : L"Install HyperVXNdisFilter and enable its compatible Ethernet binding paths";
+        ? L"Disarm and uninstall ONLY FirewallXNdisFilter, including ALL its Driver Store package versions"
+        : options.action == Action::Enable ? L"Enable all current compatible FirewallXNdisFilter binding paths"
+                                          : L"Install FirewallXNdisFilter and enable its compatible Ethernet binding paths";
     if (!options.yes && !system.Confirm(operation)) {
         system.Print(L"Cancelled. No system state was changed.\n");
         return ERROR_CANCELLED;
@@ -236,16 +236,16 @@ int Execute(const Options& options, System& system) {
         system.DisarmIfPresent();
         if (system.RemoveComponent() == Change::RebootRequired) return RemovalNeedsReboot(system);
         if (system.HasComponent() || system.HasService()) {
-            throw Error{L"HyperVXNdisFilter removal is incomplete. Configuration remains disarmed; reboot if requested and run Uninstall.exe again."};
+            throw Error{L"FirewallXNdisFilter removal is incomplete. Configuration remains disarmed; reboot if requested and run Uninstall.exe again."};
         }
         if (RemovePackages(system) == Change::RebootRequired) return RemovalNeedsReboot(system);
         system.DeleteConfiguration();
-        system.Print(L"HyperVXNdisFilter and all its Driver Store package versions removed. No other component, switch, VM, HNS or NAT setting was changed.\n");
+        system.Print(L"FirewallXNdisFilter and all its Driver Store package versions removed. No other component, switch, VM, HNS or NAT setting was changed.\n");
         return 0;
     }
     if (options.action == Action::Enable) {
         RevalidateTargets(system, targets);
-        if (!system.HasComponent()) throw Error{L"The installed HyperVXNdisFilter component disappeared."};
+        if (!system.HasComponent()) throw Error{L"The installed FirewallXNdisFilter component disappeared."};
         try {
             return Enable(system, targets);
         } catch (...) {
@@ -273,4 +273,4 @@ int Execute(const Options& options, System& system) {
     }
 }
 
-} // namespace hyperv_xndis_filter::setup
+} // namespace firewallx_ndis_filter::setup

@@ -1,4 +1,4 @@
-// HyperVXNdisFilter console monitor, adapted from kext_client on 2026-10-25 (see README.md/LICENSE).
+// FirewallXNdisFilter console monitor, adapted from kext_client on 2026-10-25 (see README.md/LICENSE).
 // Opens an existing driver device without changing driver service state.
 #include "PortmasterKext.h"
 #include "DriverProtocol.h"
@@ -59,7 +59,7 @@ public:
             return false;
         }
         SECURITY_ATTRIBUTES security{sizeof(security), descriptor, FALSE};
-        mutex_ = CreateMutexW(&security, TRUE, L"Global\\HyperVXNdisFilterMonitor.Singleton");
+        mutex_ = CreateMutexW(&security, TRUE, L"Global\\FirewallXNdisFilterMonitor.Singleton");
         const DWORD status = GetLastError();
         LocalFree(descriptor);
         if (mutex_ == nullptr) {
@@ -75,7 +75,7 @@ public:
             owned_ = true;
             return true;
         }
-        error = wait == WAIT_TIMEOUT ? "another hyperv_monitor instance is already running"
+        error = wait == WAIT_TIMEOUT ? "another firewallx_monitor instance is already running"
                                      : "singleton wait failed: error " + std::to_string(GetLastError());
         return false;
     }
@@ -134,7 +134,7 @@ public:
 
 int RunMonitor(const pmkext::monitor::Options& opt) {
     std::string error;
-    std::printf("Device name : HyperVXNdisFilter\n");
+    std::printf("Device name : FirewallXNdisFilter\n");
     pmkext::Driver driver;
     if (!driver.Open(error)) {
         std::fprintf(stderr, "ERROR: open device: %s\n", error.c_str());
@@ -169,7 +169,7 @@ int RunMonitor(const pmkext::monitor::Options& opt) {
     }
     std::printf("Driver version: %u.%u.%u.%u\n", version[0], version[1], version[2], version[3]);
     if (!pmkext::wire::IsCompatibleVersion(version)) {
-        std::fprintf(stderr, "ERROR: incompatible HyperVXNdisFilter driver version (expected 0.3.3.0); "
+        std::fprintf(stderr, "ERROR: incompatible FirewallXNdisFilter driver version (expected 0.3.3.0); "
                              "installed SYS uses a different wire layout\n");
         return 1;
     }

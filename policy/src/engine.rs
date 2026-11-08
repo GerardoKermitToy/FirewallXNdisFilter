@@ -6,7 +6,7 @@ use crate::{
 };
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
-use hyperv_protocol::{
+use firewallx_protocol::{
     BANDWIDTH_HEADER, BandwidthEntry, MAX_LOG_RECORD, MAX_PAYLOAD, MAX_RECORD, Verdict,
     bandwidth_entry_len, bandwidth_record_len, connection_header_len, encode_bandwidth_entry,
     encode_bandwidth_header, encode_connection_header, encode_log,
@@ -122,7 +122,7 @@ impl BandwidthTable {
         data: &mut [u8],
         offset: &mut usize,
         ipv6: bool,
-        connection: &hyperv_protocol::Connection,
+        connection: &firewallx_protocol::Connection,
         tx: u64,
         rx: u64,
     ) -> bool {
@@ -517,7 +517,7 @@ impl Engine {
         self.clear_events();
         self.clear_cache();
         self.clear_bandwidth();
-        self.log(3, "HyperVXNdisFilter: NDIS verdicts and traffic data; full IP packets, interface index, no PID, redirects, UpdateV4/V6 or synthetic END");
+        self.log(3, "FirewallXNdisFilter: NDIS verdicts and traffic data; full IP packets, interface index, no PID, redirects, UpdateV4/V6 or synthetic END");
     }
     // Complete actions using take_due() after dropping the lock.
     pub fn disconnect(&mut self) {
@@ -1416,7 +1416,7 @@ impl Engine {
             + self.retry_bandwidth.bytes();
         let _ = write!(
             text,
-            "HyperVXNdisFilter: fixed_bytes={} metadata_bytes={} event_bytes={} pending={} events={} bandwidth={} cached_v4={} cached_v6={} cache_bytes={} cache_alloc_fail={} rx={} allow={} drop={} queued={} cache_hits={} timeout={} overflow={} cancel={} invalidated={} malformed={} non_ip={}",
+            "FirewallXNdisFilter: fixed_bytes={} metadata_bytes={} event_bytes={} pending={} events={} bandwidth={} cached_v4={} cached_v6={} cache_bytes={} cache_alloc_fail={} rx={} allow={} drop={} queued={} cache_hits={} timeout={} overflow={} cancel={} invalidated={} malformed={} non_ip={}",
             core::mem::size_of::<Self>(),
             metadata,
             self.queued_bytes,
@@ -1469,7 +1469,7 @@ mod tests {
     extern crate std;
     use super::*;
     use crate::packet::NdisPath;
-    use hyperv_protocol::Direction;
+    use firewallx_protocol::Direction;
     use std::{boxed::Box, vec};
     fn engine() -> Box<Engine> {
         let mut e = default_engine();
@@ -2731,7 +2731,7 @@ mod tests {
         assert_eq!(e.retired_events.len(), 2);
         let mut banks = 0;
         while let Some(storage) = e.take_retired_storage() {
-            drop(storage); // Driver performs the same drop after hv_unlock().
+            drop(storage); // Driver performs the same drop after fwx_unlock().
             banks += 1;
         }
         assert!(banks > 1);

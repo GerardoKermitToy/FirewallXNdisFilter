@@ -142,7 +142,7 @@ pub(crate) unsafe fn stop() {
             // An infinite, nonalertable wait on our valid thread handle must
             // succeed. Do not unload on an unexpected wait failure.
             while api::ZwWaitForSingleObject(thread, 0, ptr::null_mut())
-                != HV_WDK_STATUS_SUCCESS as NTSTATUS
+                != FWX_WDK_STATUS_SUCCESS as NTSTATUS
             {
                 delay_retry();
             }
@@ -317,7 +317,7 @@ unsafe extern "C" fn worker(_context: PVOID) {
                 if status < 0 {
                     mark_dirty();
                     delay_retry();
-                } else if status != HV_WDK_STATUS_SUCCESS as NTSTATUS {
+                } else if status != FWX_WDK_STATUS_SUCCESS as NTSTATUS {
                     // Poll anycast without disrupting a valid snapshot. A
                     // failed capture invalidates that snapshot immediately.
                     periodic_refresh = true;
@@ -336,7 +336,7 @@ unsafe extern "C" fn worker(_context: PVOID) {
         DIRTY = true;
         unlock(irql);
         free_snapshot(old);
-        let _ = api::PsTerminateSystemThread(HV_WDK_STATUS_SUCCESS as NTSTATUS);
+        let _ = api::PsTerminateSystemThread(FWX_WDK_STATUS_SUCCESS as NTSTATUS);
     }
 }
 
@@ -353,8 +353,8 @@ unsafe fn capture() -> bool {
 
         let mut unicast: PMIB_UNICASTIPADDRESS_TABLE = ptr::null_mut();
         let status = api::GetUnicastIpAddressTable(AF_UNSPEC as ADDRESS_FAMILY, &mut unicast);
-        if status != HV_WDK_STATUS_SUCCESS as NTSTATUS {
-            let empty = status == HV_WDK_STATUS_NOT_FOUND as NTSTATUS;
+        if status != FWX_WDK_STATUS_SUCCESS as NTSTATUS {
+            let empty = status == FWX_WDK_STATUS_NOT_FOUND as NTSTATUS;
             if !empty {
                 mark_dirty();
             }
@@ -371,8 +371,8 @@ unsafe fn capture() -> bool {
         }
         let mut anycast: PMIB_ANYCASTIPADDRESS_TABLE = ptr::null_mut();
         let status = api::GetAnycastIpAddressTable(AF_UNSPEC as ADDRESS_FAMILY, &mut anycast);
-        if status != HV_WDK_STATUS_SUCCESS as NTSTATUS {
-            let empty = status == HV_WDK_STATUS_NOT_FOUND as NTSTATUS;
+        if status != FWX_WDK_STATUS_SUCCESS as NTSTATUS {
+            let empty = status == FWX_WDK_STATUS_NOT_FOUND as NTSTATUS;
             if !empty {
                 mark_dirty();
             }
@@ -456,7 +456,7 @@ unsafe fn snapshot_from_tables(
             return ptr::null_mut();
         };
         let snapshot = crate::native::pool_allocation(api::ExAllocatePool2(
-            HV_WDK_POOL_FLAG_NON_PAGED as POOL_FLAGS,
+            FWX_WDK_POOL_FLAG_NON_PAGED as POOL_FLAGS,
             size as SIZE_T,
             POOL_TAG,
         ))

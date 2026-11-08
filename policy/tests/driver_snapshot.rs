@@ -3,7 +3,7 @@ extern crate alloc;
 #[path = "../../driver/src/packet_snapshot.rs"]
 mod packet_snapshot;
 
-use hyperv_policy::packet::SNAPSHOT;
+use firewallx_policy::packet::SNAPSHOT;
 use packet_snapshot::{ParserScratch, Snapshot, SnapshotError};
 
 fn view(bytes: &[u8], storage: *mut u8, split: bool) -> Snapshot {

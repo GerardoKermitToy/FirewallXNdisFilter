@@ -80,7 +80,7 @@ if(NOT result STREQUAL "0" OR NOT output MATCHES "direction=0 host receive, 1 ho
    NOT output MATCHES "Connection events carry no process/thread identity" OR
    NOT output MATCHES "Mixed local/transit IP batches bypass policy with a warning" OR
    output MATCHES "--filter-pid|PID=0|possibly shortened" OR
-   output MATCHES "HyperVXNdisFilterPipe|Bridge:|winrpc|named-pipe" OR
+   output MATCHES "FirewallXNdisFilterPipe|Bridge:|winrpc|named-pipe" OR
    output MATCHES "Device name :|Driver version")
     message(FATAL_ERROR "Help did not stay on the no-device path: ${result}: ${output}${errors}")
 endif()

@@ -44,7 +44,7 @@ pub(super) unsafe fn target_adapter(p: PNDIS_FILTER_ATTACH_PARAMETERS, guid: *mu
         // Schema 4 means all compatible Ethernet paths, not the former ICS list.
         // The caller has already checked MiniportMediaType == NdisMedium802_3.
         const BINDING_CONFIG_VERSION: u32 = 4;
-        let mut path = wide!("\\Registry\\Machine\\SOFTWARE\\HyperVXNdisFilter\\Lwf");
+        let mut path = wide!("\\Registry\\Machine\\SOFTWARE\\FirewallXNdisFilter\\Lwf");
         let mut attributes = object_attributes(
             &mut path,
             null_mut(),
@@ -98,7 +98,7 @@ pub(super) unsafe fn read_configuration(registry: PUNICODE_STRING) {
             null_mut(),
         );
         if nt_success(ZwOpenKey(&mut parameters, KEY_READ, &mut attributes)) {
-            crate::HvConfigure(
+            crate::FwxConfigure(
                 read_dword(parameters, wide!("DecisionTimeoutMs"), DEFAULT_TIMEOUT_MS),
                 read_dword(parameters, wide!("CacheTtlMs"), 60000),
                 read_dword(parameters, wide!("FailClosed"), DEFAULT_FAIL_CLOSED),
@@ -120,7 +120,7 @@ unsafe extern "C" {
 #[repr(C)]
 struct ReadyAcl {
     header: ACL,
-    aces: [u8; 2 * (size_of::<ACCESS_ALLOWED_ACE>() + HV_WDK_SECURITY_MAX_SID_SIZE as usize)],
+    aces: [u8; 2 * (size_of::<ACCESS_ALLOWED_ACE>() + FWX_WDK_SECURITY_MAX_SID_SIZE as usize)],
 }
 pub(super) unsafe fn signal_driver_ready() {
     unsafe {
@@ -130,7 +130,7 @@ pub(super) unsafe fn signal_driver_ready() {
             DbgPrintEx(
                 DPFLTR_IHVNETWORK_ID as u32,
                 DPFLTR_WARNING_LEVEL,
-                c"HyperVXNdisFilter: driver-ready event unavailable: 0x%08lX\n".as_ptr(),
+                c"FirewallXNdisFilter: driver-ready event unavailable: 0x%08lX\n".as_ptr(),
                 status as u32,
             );
         }
@@ -175,7 +175,7 @@ unsafe fn create_ready_event() -> i32 {
             return status;
         }
         descriptor.Control |= SE_DACL_PROTECTED as u16;
-        let mut name = wide!("\\BaseNamedObjects\\HyperVXNdisFilter.DriverReady");
+        let mut name = wide!("\\BaseNamedObjects\\FirewallXNdisFilter.DriverReady");
         let mut attributes = object_attributes(
             &mut name,
             null_mut(),
@@ -206,7 +206,7 @@ unsafe fn create_ready_event() -> i32 {
             return status;
         }
         KeSetEvent(READY_EVENT, IO_NO_INCREMENT as i32, 0);
-        HV_WDK_STATUS_SUCCESS
+        FWX_WDK_STATUS_SUCCESS
     }
 }
 use core::mem::size_of_val;

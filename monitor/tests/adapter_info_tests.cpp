@@ -98,7 +98,7 @@ void Reset(std::vector<uint8_t> snapshot = {}) {
 }
 HANDLE CreateFileW(LPCWSTR path, DWORD access, DWORD sharing, LPSECURITY_ATTRIBUTES,
                    DWORD mode, DWORD flags, HANDLE) {
-    if (std::wcscmp(path, L"\\\\.\\HyperVXNdisFilter") || access != (GENERIC_READ | GENERIC_WRITE) ||
+    if (std::wcscmp(path, L"\\\\.\\FirewallXNdisFilter") || access != (GENERIC_READ | GENERIC_WRITE) ||
         sharing || mode != OPEN_EXISTING || !(flags & FILE_FLAG_OVERLAPPED)) {
         ::SetLastError(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE;
     }
@@ -113,7 +113,7 @@ BOOL DeviceIoControl(HANDLE handle, DWORD code, LPVOID input, DWORD input_size, 
     if (code == pmkext::wire::kIoctlShutdown) {
         state.active = ov; state.bytes = 0; state.error = ERROR_SUCCESS; *actual = 0; return TRUE;
     }
-    if (code != pmkext::wire::kIoctlAdapterInfo || !output || capacity < HV_ADAPTER_INFO_HEADER_SIZE) {
+    if (code != pmkext::wire::kIoctlAdapterInfo || !output || capacity < FWX_ADAPTER_INFO_HEADER_SIZE) {
         ::SetLastError(ERROR_NOT_SUPPORTED); return FALSE;
     }
     state.capacities.push_back(capacity);
@@ -123,7 +123,7 @@ BOOL DeviceIoControl(HANDLE handle, DWORD code, LPVOID input, DWORD input_size, 
     DWORD returned = reply && reply->reported != UINT32_MAX ? reply->reported : static_cast<DWORD>(bytes.size());
     if (!reply && capacity < bytes.size()) {
         if (state.legacy) { ::SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
-        returned = HV_ADAPTER_INFO_HEADER_SIZE; error = ERROR_MORE_DATA;
+        returned = FWX_ADAPTER_INFO_HEADER_SIZE; error = ERROR_MORE_DATA;
     }
     if (error && error != ERROR_MORE_DATA && !(reply && reply->pending)) {
         ::SetLastError(error); return FALSE;
@@ -152,29 +152,29 @@ BOOL CancelIoEx(HANDLE, LPOVERLAPPED) { ::SetLastError(ERROR_NOT_FOUND); return 
 #define CHECK(condition) do { if (!(condition)) { \
     std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return false; } } while (0)
 
-static_assert(pmkext::wire::kAdapterInfoVersion == HV_ADAPTER_INFO_VERSION);
-static_assert(pmkext::wire::kAdapterInfoEntrySize == HV_ADAPTER_INFO_ENTRY_SIZE);
-static_assert(pmkext::wire::kAdapterInfoHeaderSize == HV_ADAPTER_INFO_HEADER_SIZE);
-static_assert(pmkext::wire::kMaxAdapters == HV_ADAPTER_INFO_MAX_ADAPTERS);
-static_assert(pmkext::wire::kAdapterNameCapacity == HV_ADAPTER_INFO_NAME_CAPACITY);
-static_assert(pmkext::wire::kMaxAdapterInfoSize == HV_ADAPTER_INFO_MAX_SIZE);
+static_assert(pmkext::wire::kAdapterInfoVersion == FWX_ADAPTER_INFO_VERSION);
+static_assert(pmkext::wire::kAdapterInfoEntrySize == FWX_ADAPTER_INFO_ENTRY_SIZE);
+static_assert(pmkext::wire::kAdapterInfoHeaderSize == FWX_ADAPTER_INFO_HEADER_SIZE);
+static_assert(pmkext::wire::kMaxAdapters == FWX_ADAPTER_INFO_MAX_ADAPTERS);
+static_assert(pmkext::wire::kAdapterNameCapacity == FWX_ADAPTER_INFO_NAME_CAPACITY);
+static_assert(pmkext::wire::kMaxAdapterInfoSize == FWX_ADAPTER_INFO_MAX_SIZE);
 static_assert(pmkext::wire::kIoctlAdapterInfo == 0x9c40e00c);
-static_assert(pmkext::AdapterInfo::Running == HV_ADAPTER_RUNNING);
-static_assert(pmkext::AdapterInfo::GeneralAttributesValid == HV_ADAPTER_GENERAL_VALID);
-static_assert(pmkext::AdapterInfo::ConnectorPresentValid == HV_ADAPTER_CONNECTOR_VALID);
-static_assert(pmkext::AdapterInfo::InstanceNameTruncated == HV_ADAPTER_INSTANCE_NAME_TRUNCATED);
-static_assert(pmkext::AdapterInfo::BaseNameTruncated == HV_ADAPTER_BASE_NAME_TRUNCATED);
-static_assert(pmkext::AdapterInfo::FilterModuleNameTruncated == HV_ADAPTER_FILTER_NAME_TRUNCATED);
-static_assert(pmkext::AdapterInfo::LinkStateValid == HV_ADAPTER_LINK_STATE_VALID);
-static_assert(pmkext::AdapterInfo::PauseValid == HV_ADAPTER_PAUSE_VALID);
+static_assert(pmkext::AdapterInfo::Running == FWX_ADAPTER_RUNNING);
+static_assert(pmkext::AdapterInfo::GeneralAttributesValid == FWX_ADAPTER_GENERAL_VALID);
+static_assert(pmkext::AdapterInfo::ConnectorPresentValid == FWX_ADAPTER_CONNECTOR_VALID);
+static_assert(pmkext::AdapterInfo::InstanceNameTruncated == FWX_ADAPTER_INSTANCE_NAME_TRUNCATED);
+static_assert(pmkext::AdapterInfo::BaseNameTruncated == FWX_ADAPTER_BASE_NAME_TRUNCATED);
+static_assert(pmkext::AdapterInfo::FilterModuleNameTruncated == FWX_ADAPTER_FILTER_NAME_TRUNCATED);
+static_assert(pmkext::AdapterInfo::LinkStateValid == FWX_ADAPTER_LINK_STATE_VALID);
+static_assert(pmkext::AdapterInfo::PauseValid == FWX_ADAPTER_PAUSE_VALID);
 
-HV_ADAPTER_INFO Fixture() {
-    HV_ADAPTER_INFO a{};
+FWX_ADAPTER_INFO Fixture() {
+    FWX_ADAPTER_INFO a{};
     a.ModuleId = 0x0102030405060708ULL;
     a.InterfaceIndex = 0x89abcdef;
     a.FilterInterfaceIndex = 17; a.LowerInterfaceIndex = 18;
-    a.Flags = HV_ADAPTER_RUNNING | HV_ADAPTER_GENERAL_VALID | HV_ADAPTER_CONNECTOR_VALID |
-              HV_ADAPTER_LINK_STATE_VALID | HV_ADAPTER_PAUSE_VALID;
+    a.Flags = FWX_ADAPTER_RUNNING | FWX_ADAPTER_GENERAL_VALID | FWX_ADAPTER_CONNECTOR_VALID |
+              FWX_ADAPTER_LINK_STATE_VALID | FWX_ADAPTER_PAUSE_VALID;
     a.InterfaceLuid = 0x1122334455667788ULL;
     a.FilterInterfaceLuid = 0x8877665544332211ULL;
     a.LowerInterfaceLuid = 0x123456789abcdef0ULL;
@@ -190,34 +190,34 @@ HV_ADAPTER_INFO Fixture() {
     for (unsigned i = 0; i < 6; ++i) a.MacAddress[i] = static_cast<uint8_t>(0xa0 + i);
     a.AutoNegotiationFlags = 0x808; a.PauseReason = 0x909; a.PauseFlags = 0xa0a;
     const uint16_t name[]{0x0410, 0x0434, 0x0430, 0x043f, 0x0442, 0x0435, 0x0440};
-    a.InstanceNameLength = HvCopyAdapterName(a.InstanceName, name, 7, &a.Flags, HV_ADAPTER_INSTANCE_NAME_TRUNCATED);
+    a.InstanceNameLength = FwxCopyAdapterName(a.InstanceName, name, 7, &a.Flags, FWX_ADAPTER_INSTANCE_NAME_TRUNCATED);
     const uint16_t base[]{'\\','D','e','v','i','c','e','\\','t','e','s','t'};
-    a.BaseNameLength = HvCopyAdapterName(a.BaseName, base, 12, &a.Flags, HV_ADAPTER_BASE_NAME_TRUNCATED);
+    a.BaseNameLength = FwxCopyAdapterName(a.BaseName, base, 12, &a.Flags, FWX_ADAPTER_BASE_NAME_TRUNCATED);
     const uint16_t filter[]{'{','1','2','3','4','}'};
-    a.FilterModuleNameLength = HvCopyAdapterName(a.FilterModuleName, filter, 6, &a.Flags, HV_ADAPTER_FILTER_NAME_TRUNCATED);
+    a.FilterModuleNameLength = FwxCopyAdapterName(a.FilterModuleName, filter, 6, &a.Flags, FWX_ADAPTER_FILTER_NAME_TRUNCATED);
     return a;
 }
 
 std::vector<uint8_t> Encode(unsigned count) {
-    std::vector<uint8_t> bytes(HvAdapterInfoSize(count), 0xcc);
-    HvEncodeAdapterInfoHeader(bytes.data(), count, count == 0 ? 0 : 1);
+    std::vector<uint8_t> bytes(FwxAdapterInfoSize(count), 0xcc);
+    FwxEncodeAdapterInfoHeader(bytes.data(), count, count == 0 ? 0 : 1);
     auto a = Fixture();
     for (unsigned i = 0; i < count; ++i) {
         a.ModuleId += i;
-        if (i != 0) a.Flags &= ~HV_ADAPTER_RUNNING;
-        HvEncodeAdapterInfo(bytes.data() + HV_ADAPTER_INFO_HEADER_SIZE + i * HV_ADAPTER_INFO_ENTRY_SIZE, &a);
+        if (i != 0) a.Flags &= ~FWX_ADAPTER_RUNNING;
+        FwxEncodeAdapterInfo(bytes.data() + FWX_ADAPTER_INFO_HEADER_SIZE + i * FWX_ADAPTER_INFO_ENTRY_SIZE, &a);
     }
     return bytes;
 }
 
 bool CheckRoundTrip() {
-    CHECK(HvAdapterInfoSize(0) == 16 && HvAdapterInfoSize(32) == 56336 && HvAdapterInfoSize(33) == 58096);
-    CHECK(HV_ADAPTER_INFO_MAX_ADAPTERS == 2440322u && HV_ADAPTER_INFO_MAX_SIZE == 4294966736u);
-    CHECK(HvAdapterInfoSize(HV_ADAPTER_INFO_MAX_ADAPTERS) == HV_ADAPTER_INFO_MAX_SIZE);
-    CHECK(HvAdapterInfoSize(HV_ADAPTER_INFO_MAX_ADAPTERS + 1u) == 0);
-    CHECK(HvAdapterInfoSize(UINT32_MAX) == 0);
+    CHECK(FwxAdapterInfoSize(0) == 16 && FwxAdapterInfoSize(32) == 56336 && FwxAdapterInfoSize(33) == 58096);
+    CHECK(FWX_ADAPTER_INFO_MAX_ADAPTERS == 2440322u && FWX_ADAPTER_INFO_MAX_SIZE == 4294966736u);
+    CHECK(FwxAdapterInfoSize(FWX_ADAPTER_INFO_MAX_ADAPTERS) == FWX_ADAPTER_INFO_MAX_SIZE);
+    CHECK(FwxAdapterInfoSize(FWX_ADAPTER_INFO_MAX_ADAPTERS + 1u) == 0);
+    CHECK(FwxAdapterInfoSize(UINT32_MAX) == 0);
     static_assert(pmkext::wire::kInitialAdapterInfoSize == 56336);
-    static_assert(static_cast<uint64_t>(HV_ADAPTER_INFO_MAX_SIZE) + HV_ADAPTER_INFO_ENTRY_SIZE > UINT32_MAX);
+    static_assert(static_cast<uint64_t>(FWX_ADAPTER_INFO_MAX_SIZE) + FWX_ADAPTER_INFO_ENTRY_SIZE > UINT32_MAX);
     auto bytes = Encode(2);
     CHECK(bytes[0] == 1 && bytes[4] == 0xe0 && bytes[5] == 6 && bytes[8] == 2 && bytes[12] == 1);
     const size_t p = 16;
@@ -267,14 +267,14 @@ bool CheckMalformed() {
     const auto valid = Encode(2);
     CHECK(reject(nullptr, valid.size()));
     for (size_t size : {size_t{0}, size_t{15}, size_t{16}, valid.size() - 1, valid.size() + 1,
-                        size_t{HV_ADAPTER_INFO_MAX_SIZE + 1}}) CHECK(reject(valid.data(), size));
+                        size_t{FWX_ADAPTER_INFO_MAX_SIZE + 1}}) CHECK(reject(valid.data(), size));
     for (const auto [offset, value] : std::vector<std::pair<size_t, uint32_t>>{
             {0,2}, {4,1759}, {8,33}, {8,0xffffffff}, {12,3}, {12,0},
             {16+20,0x100}, {16+164,33}, {16+160,2},
             {16+200,256}, {16+204,0xffffffff}, {16+208,256},
-            {16+1760+20,HV_ADAPTER_RUNNING}}) {
+            {16+1760+20,FWX_ADAPTER_RUNNING}}) {
         auto bad = valid;
-        HvInfoWrite32(bad.data() + offset, value);
+        FwxInfoWrite32(bad.data() + offset, value);
         CHECK(reject(bad.data(), bad.size()));
     }
     for (size_t offset : {size_t{16+224}, size_t{16+736}, size_t{16+1248}}) {
@@ -292,46 +292,46 @@ bool CheckMalformed() {
 }
 
 std::vector<uint8_t> Header(uint32_t count, uint32_t running = 0) {
-    std::vector<uint8_t> bytes(HV_ADAPTER_INFO_HEADER_SIZE);
-    HvEncodeAdapterInfoHeader(bytes.data(), count, running);
+    std::vector<uint8_t> bytes(FWX_ADAPTER_INFO_HEADER_SIZE);
+    FwxEncodeAdapterInfoHeader(bytes.data(), count, running);
     return bytes;
 }
 
 bool CheckHeaderBounds() {
     std::string error;
     uint32_t required = 123;
-    const auto maximum = Header(HV_ADAPTER_INFO_MAX_ADAPTERS);
+    const auto maximum = Header(FWX_ADAPTER_INFO_MAX_ADAPTERS);
     CHECK(pmkext::wire::DecodeAdapterInfoHeader(maximum.data(), maximum.size(), required, error));
-    CHECK(required == HV_ADAPTER_INFO_MAX_SIZE);
-    for (uint32_t count : {HV_ADAPTER_INFO_MAX_ADAPTERS + 1u, UINT32_MAX}) {
+    CHECK(required == FWX_ADAPTER_INFO_MAX_SIZE);
+    for (uint32_t count : {FWX_ADAPTER_INFO_MAX_ADAPTERS + 1u, UINT32_MAX}) {
         auto bad = Header(count);
         CHECK(!pmkext::wire::DecodeAdapterInfoHeader(bad.data(), bad.size(), required, error));
-        CHECK(required == HV_ADAPTER_INFO_MAX_SIZE && !error.empty());
+        CHECK(required == FWX_ADAPTER_INFO_MAX_SIZE && !error.empty());
     }
     CHECK(!pmkext::wire::DecodeAdapterInfoHeader(maximum.data(), 15, required, error));
     CHECK(!pmkext::wire::DecodeAdapterInfoHeader(nullptr, 16, required, error));
     const auto bad_running = Header(33, 34);
     CHECK(!pmkext::wire::DecodeAdapterInfoHeader(bad_running.data(), 16, required, error));
-    CHECK(required == HV_ADAPTER_INFO_MAX_SIZE);
+    CHECK(required == FWX_ADAPTER_INFO_MAX_SIZE);
 
-    CHECK(HvPlanAdapterInfo(0, 15, 0, &required) == HvAdapterInfoTooSmall);
-    CHECK(required == HV_ADAPTER_INFO_MAX_SIZE);
-    CHECK(HvPlanAdapterInfo(static_cast<uint64_t>(HV_ADAPTER_INFO_MAX_ADAPTERS) + 1, UINT32_MAX,
-                            0, &required) == HvAdapterInfoCountOverflow);
-    CHECK(required == HV_ADAPTER_INFO_MAX_SIZE);
-    CHECK(HvPlanAdapterInfo(0, 16, 0, &required) == HvAdapterInfoEncode && required == 16);
-    CHECK(HvPlanAdapterInfo(1, 16, 0, &required) == HvAdapterInfoHeaderOnly && required == 1776);
-    const uint32_t capacity = HvAdapterInfoSize(100);
-    CHECK(HvPlanAdapterInfo(40, capacity, 0, &required) == HvAdapterInfoGrowStaging);
+    CHECK(FwxPlanAdapterInfo(0, 15, 0, &required) == FwxAdapterInfoTooSmall);
+    CHECK(required == FWX_ADAPTER_INFO_MAX_SIZE);
+    CHECK(FwxPlanAdapterInfo(static_cast<uint64_t>(FWX_ADAPTER_INFO_MAX_ADAPTERS) + 1, UINT32_MAX,
+                            0, &required) == FwxAdapterInfoCountOverflow);
+    CHECK(required == FWX_ADAPTER_INFO_MAX_SIZE);
+    CHECK(FwxPlanAdapterInfo(0, 16, 0, &required) == FwxAdapterInfoEncode && required == 16);
+    CHECK(FwxPlanAdapterInfo(1, 16, 0, &required) == FwxAdapterInfoHeaderOnly && required == 1776);
+    const uint32_t capacity = FwxAdapterInfoSize(100);
+    CHECK(FwxPlanAdapterInfo(40, capacity, 0, &required) == FwxAdapterInfoGrowStaging);
     // Deterministic attach race: user capacity already fits, staging does not.
-    CHECK(HvPlanAdapterInfo(97, capacity, 40, &required) == HvAdapterInfoGrowStaging);
-    CHECK(required == HvAdapterInfoSize(97) && required < capacity);
-    CHECK(HvPlanAdapterInfo(97, capacity, 97, &required) == HvAdapterInfoEncode);
-    CHECK(HvPlanAdapterInfo(30, capacity, 97, &required) == HvAdapterInfoEncode); // Detach/shrink.
-    CHECK(HvPlanAdapterInfo(101, capacity, 97, &required) == HvAdapterInfoHeaderOnly && required > capacity);
+    CHECK(FwxPlanAdapterInfo(97, capacity, 40, &required) == FwxAdapterInfoGrowStaging);
+    CHECK(required == FwxAdapterInfoSize(97) && required < capacity);
+    CHECK(FwxPlanAdapterInfo(97, capacity, 97, &required) == FwxAdapterInfoEncode);
+    CHECK(FwxPlanAdapterInfo(30, capacity, 97, &required) == FwxAdapterInfoEncode); // Detach/shrink.
+    CHECK(FwxPlanAdapterInfo(101, capacity, 97, &required) == FwxAdapterInfoHeaderOnly && required > capacity);
     uint64_t staged = 0;
-    for (uint32_t attempt = 0; attempt < HV_ADAPTER_INFO_MAX_STAGING_ATTEMPTS; ++attempt) {
-        CHECK(HvPlanAdapterInfo(40 + attempt, capacity, staged, &required) == HvAdapterInfoGrowStaging);
+    for (uint32_t attempt = 0; attempt < FWX_ADAPTER_INFO_MAX_STAGING_ATTEMPTS; ++attempt) {
+        CHECK(FwxPlanAdapterInfo(40 + attempt, capacity, staged, &required) == FwxAdapterInfoGrowStaging);
         CHECK(required < capacity); // Kernel exhaustion returns RETRY, never a false MORE_DATA.
         staged = 40 + attempt;
     }
@@ -360,7 +360,7 @@ bool CheckQueries() {
     state.replies = {{Header(40), ERROR_MORE_DATA}, {Header(97), ERROR_MORE_DATA, 16, true}, {many}};
     state.next = 0; state.capacities.clear();
     CHECK(driver.GetAdapterInfo(out, error) && out.adapters.size() == 97);
-    CHECK(state.capacities == std::vector<DWORD>({56336u, HvAdapterInfoSize(40), HvAdapterInfoSize(97)}));
+    CHECK(state.capacities == std::vector<DWORD>({56336u, FwxAdapterInfoSize(40), FwxAdapterInfoSize(97)}));
     // Detach/shrink between probe and full query is also valid, with an exact shorter snapshot.
     state.replies = {{Header(97), ERROR_MORE_DATA}, {kept}}; state.next = 0;
     CHECK(driver.GetAdapterInfo(out, error) && out.adapters.size() == 1);
@@ -375,11 +375,11 @@ bool CheckQueries() {
         CHECK(reject({{{}, code}}));
         CHECK(reject({{Header(40), ERROR_MORE_DATA}, {{}, code, 0, true}}));
     }
-    for (auto header : {Header(0), Header(32), Header(HV_ADAPTER_INFO_MAX_ADAPTERS + 1u), Header(40, 41)})
+    for (auto header : {Header(0), Header(32), Header(FWX_ADAPTER_INFO_MAX_ADAPTERS + 1u), Header(40, 41)})
         CHECK(reject({{std::move(header), ERROR_MORE_DATA}}));
-    auto bad = Header(40); HvInfoWrite32(bad.data(), 2);
+    auto bad = Header(40); FwxInfoWrite32(bad.data(), 2);
     CHECK(reject({{bad, ERROR_MORE_DATA}}));
-    bad = Header(40); HvInfoWrite32(bad.data() + 4, 1759);
+    bad = Header(40); FwxInfoWrite32(bad.data() + 4, 1759);
     CHECK(reject({{bad, ERROR_MORE_DATA}}));
     for (DWORD size : {0u, 15u, 17u, 56337u}) CHECK(reject({{Header(40), ERROR_MORE_DATA, size}}));
     CHECK(reject({{Header(40), ERROR_MORE_DATA}, {Header(40), ERROR_MORE_DATA}})); // No growth.
@@ -417,28 +417,28 @@ bool CheckQueries() {
 }
 
 bool CheckNames() {
-    uint16_t out[HV_ADAPTER_INFO_NAME_CAPACITY];
+    uint16_t out[FWX_ADAPTER_INFO_NAME_CAPACITY];
     uint32_t flags = 0;
     std::vector<uint16_t> input(300, 'X');
-    CHECK(HvCopyAdapterName(out, nullptr, 300, &flags, HV_ADAPTER_BASE_NAME_TRUNCATED) == 0 && out[0] == 0);
-    CHECK(HvCopyAdapterName(out, input.data(), 255, &flags, HV_ADAPTER_BASE_NAME_TRUNCATED) == 255);
+    CHECK(FwxCopyAdapterName(out, nullptr, 300, &flags, FWX_ADAPTER_BASE_NAME_TRUNCATED) == 0 && out[0] == 0);
+    CHECK(FwxCopyAdapterName(out, input.data(), 255, &flags, FWX_ADAPTER_BASE_NAME_TRUNCATED) == 255);
     CHECK(flags == 0 && out[255] == 0);
-    CHECK(HvCopyAdapterName(out, input.data(), 256, &flags, HV_ADAPTER_BASE_NAME_TRUNCATED) == 255);
-    CHECK(flags == HV_ADAPTER_BASE_NAME_TRUNCATED && out[255] == 0);
+    CHECK(FwxCopyAdapterName(out, input.data(), 256, &flags, FWX_ADAPTER_BASE_NAME_TRUNCATED) == 255);
+    CHECK(flags == FWX_ADAPTER_BASE_NAME_TRUNCATED && out[255] == 0);
     input[254] = 0xd83d; input[255] = 0xde80; flags = 0;
-    CHECK(HvCopyAdapterName(out, input.data(), 300, &flags, HV_ADAPTER_INSTANCE_NAME_TRUNCATED) == 254);
-    CHECK(flags == HV_ADAPTER_INSTANCE_NAME_TRUNCATED && out[254] == 0 && out[255] == 0);
+    CHECK(FwxCopyAdapterName(out, input.data(), 300, &flags, FWX_ADAPTER_INSTANCE_NAME_TRUNCATED) == 254);
+    CHECK(flags == FWX_ADAPTER_INSTANCE_NAME_TRUNCATED && out[254] == 0 && out[255] == 0);
     input[2] = 0; flags = 0;
-    CHECK(HvCopyAdapterName(out, input.data(), 300, &flags, HV_ADAPTER_FILTER_NAME_TRUNCATED) == 2 && flags == 0);
+    CHECK(FwxCopyAdapterName(out, input.data(), 300, &flags, FWX_ADAPTER_FILTER_NAME_TRUNCATED) == 2 && flags == 0);
     return true;
 }
 
 bool CheckRestartGeneralReset() {
-    HV_ADAPTER_INFO info = Fixture();
-    const uint32_t preservedFlags = info.Flags & ~HV_ADAPTER_GENERAL_VALID;
+    FWX_ADAPTER_INFO info = Fixture();
+    const uint32_t preservedFlags = info.Flags & ~FWX_ADAPTER_GENERAL_VALID;
     // A later restart without general attributes must not publish the prior
     // restart's values as current.
-    HvClearGeneralAttributes(&info);
+    FwxClearGeneralAttributes(&info);
     CHECK(info.Flags == preservedFlags);
     CHECK(info.Mtu == 0 && info.MaxXmitLinkSpeed == 0 && info.MaxRcvLinkSpeed == 0);
     CHECK(info.LookaheadSize == 0 && info.MacOptions == 0 && info.SupportedPacketFilters == 0);

@@ -173,7 +173,7 @@ pub(crate) mod calls {
             s.worker = callback;
         });
     }
-    pub unsafe fn HvRead(out: *mut u8, length: u32) -> u32 {
+    pub unsafe fn FwxRead(out: *mut u8, length: u32) -> u32 {
         unsafe {
             let n = state(|s| {
                 assert!(s.mutex);
@@ -189,18 +189,18 @@ pub(crate) mod calls {
             n as u32
         }
     }
-    pub unsafe fn HvWrite(_: *const u8, length: u32) -> i32 {
+    pub unsafe fn FwxWrite(_: *const u8, length: u32) -> i32 {
         if length == 0 {
-            HV_WDK_STATUS_INVALID_PARAMETER
+            FWX_WDK_STATUS_INVALID_PARAMETER
         } else {
             0
         }
     }
-    pub unsafe fn HvConnect() {
+    pub unsafe fn FwxConnect() {
         state(|s| s.connects += 1);
         READ_ONLINE.store(1, Ordering::SeqCst);
     }
-    pub unsafe fn HvDisconnect() {
+    pub unsafe fn FwxDisconnect() {
         state(|s| {
             assert!(s.waits > 0);
             s.disconnects += 1;
@@ -218,7 +218,7 @@ fn exclusive_device_create_cleanup_reopens_rundown_once() {
     }
     open(1);
     let mut second = Request::new(IRP_MJ_CREATE, 2, 0);
-    assert_eq!(second.run(), HV_WDK_STATUS_SHARING_VIOLATION);
+    assert_eq!(second.run(), FWX_WDK_STATUS_SHARING_VIOLATION);
     let mut cleanup = Request::new(IRP_MJ_CLEANUP, 1, 0);
     assert_eq!(cleanup.run(), 0);
     assert_eq!(cleanup.run(), 0);
@@ -242,7 +242,7 @@ fn zero_length_read_finishes_but_empty_nonzero_read_waits() {
     let mut zero = Request::new(IRP_MJ_READ, 1, 0);
     assert_eq!(zero.run(), 0);
     let mut read = Request::new(IRP_MJ_READ, 1, 16);
-    assert_eq!(read.run(), HV_WDK_STATUS_PENDING);
+    assert_eq!(read.run(), FWX_WDK_STATUS_PENDING);
     state(|s| {
         assert_eq!(s.references, 1);
         assert_eq!(s.completions.len(), 1);
@@ -253,7 +253,7 @@ fn zero_length_read_finishes_but_empty_nonzero_read_waits() {
     }
     state(|s| {
         assert_eq!(s.references, 0);
-        assert_eq!(s.completions.last().unwrap().1, HV_WDK_STATUS_CANCELLED);
+        assert_eq!(s.completions.last().unwrap().1, FWX_WDK_STATUS_CANCELLED);
     });
 }
 #[test]
@@ -265,7 +265,7 @@ fn ready_worker_copies_then_completes_outside_locks_and_releases_refs() {
     open(1);
     produce(b"packet-record");
     let mut read = Request::new(IRP_MJ_READ, 1, 64);
-    assert_eq!(read.run(), HV_WDK_STATUS_PENDING);
+    assert_eq!(read.run(), FWX_WDK_STATUS_PENDING);
     assert_eq!(state(|s| s.references), 2);
     run_worker();
     assert_eq!(&read.output[..13], b"packet-record");
@@ -284,7 +284,7 @@ fn stale_readiness_requeues_without_successful_empty_completion() {
     open(1);
     READ_READY.store(1, Ordering::SeqCst);
     let mut read = Request::new(IRP_MJ_READ, 1, 8);
-    assert_eq!(read.run(), HV_WDK_STATUS_PENDING);
+    assert_eq!(read.run(), FWX_WDK_STATUS_PENDING);
     run_worker();
     state(|s| {
         assert_eq!(s.references, 1);
@@ -307,11 +307,11 @@ fn already_cancelled_insert_completes_inline_exactly_once() {
     open(1);
     state(|s| s.cancel_insert = true);
     let mut read = Request::new(IRP_MJ_READ, 1, 16);
-    assert_eq!(read.run(), HV_WDK_STATUS_PENDING);
+    assert_eq!(read.run(), FWX_WDK_STATUS_PENDING);
     state(|s| {
         assert_eq!(s.references, 0);
         assert_eq!(s.completions.len(), 1);
-        assert_eq!(s.completions[0].1, HV_WDK_STATUS_CANCELLED);
+        assert_eq!(s.completions[0].1, FWX_WDK_STATUS_CANCELLED);
     });
 }
 #[test]
@@ -322,12 +322,12 @@ fn rejected_insert_after_pending_mark_completes_and_returns_pending() {
     // An open handle may submit a read after the session has shut down.
     READ_ONLINE.store(0, Ordering::SeqCst);
     let mut read = Request::new(IRP_MJ_READ, 1, 16);
-    assert_eq!(read.run(), HV_WDK_STATUS_PENDING);
+    assert_eq!(read.run(), FWX_WDK_STATUS_PENDING);
     assert_ne!(read._stack.Control & SL_PENDING_RETURNED as u8, 0);
     state(|s| {
         assert_eq!(s.references, 0);
         assert_eq!(s.completions.len(), 1);
-        assert_eq!(s.completions[0].1, HV_WDK_STATUS_DEVICE_NOT_CONNECTED);
+        assert_eq!(s.completions[0].1, FWX_WDK_STATUS_DEVICE_NOT_CONNECTED);
         assert_eq!(s.completions[0].2, 0);
         assert!(s.worker.is_none());
     });
@@ -362,20 +362,20 @@ fn cleanup_cancels_all_reads_and_closed_session_rejects_new_irps() {
     open(1);
     let mut a = Request::new(IRP_MJ_READ, 1, 8);
     let mut b = Request::new(IRP_MJ_READ, 1, 8);
-    assert_eq!(a.run(), HV_WDK_STATUS_PENDING);
-    assert_eq!(b.run(), HV_WDK_STATUS_PENDING);
+    assert_eq!(a.run(), FWX_WDK_STATUS_PENDING);
+    assert_eq!(b.run(), FWX_WDK_STATUS_PENDING);
     let mut cleanup = Request::new(IRP_MJ_CLEANUP, 1, 0);
     assert_eq!(cleanup.run(), 0);
     assert_eq!(state(|s| s.references), 0);
     assert_eq!(
         Request::new(IRP_MJ_READ, 1, 8).run(),
-        HV_WDK_STATUS_DEVICE_NOT_CONNECTED
+        FWX_WDK_STATUS_DEVICE_NOT_CONNECTED
     );
     state(|s| {
         assert_eq!(
             s.completions
                 .iter()
-                .filter(|x| x.1 == HV_WDK_STATUS_CANCELLED)
+                .filter(|x| x.1 == FWX_WDK_STATUS_CANCELLED)
                 .count(),
             2
         )
@@ -390,11 +390,11 @@ fn null_output_and_rundown_failure_do_not_queue_or_leak() {
     open(1);
     let mut read = Request::new(IRP_MJ_READ, 1, 8);
     read.irp.AssociatedIrp.SystemBuffer = null_mut();
-    assert_eq!(read.run(), HV_WDK_STATUS_INVALID_PARAMETER);
+    assert_eq!(read.run(), FWX_WDK_STATUS_INVALID_PARAMETER);
     state(|s| s.reject_rundown = true);
     assert_eq!(
         Request::new(IRP_MJ_READ, 1, 8).run(),
-        HV_WDK_STATUS_DEVICE_NOT_CONNECTED
+        FWX_WDK_STATUS_DEVICE_NOT_CONNECTED
     );
     assert_eq!(state(|s| s.references), 0);
 }
@@ -406,15 +406,15 @@ fn ioctl_uses_production_codec_and_shutdown_cancels_pending_reads() {
     }
     open(1);
     let mut query = Request::new(IRP_MJ_DEVICE_CONTROL, 1, 4);
-    query._stack.Parameters.DeviceIoControl.IoControlCode = hyperv_protocol::IOCTL_VERSION;
+    query._stack.Parameters.DeviceIoControl.IoControlCode = firewallx_protocol::IOCTL_VERSION;
     query._stack.Parameters.DeviceIoControl.InputBufferLength = 0;
     query._stack.Parameters.DeviceIoControl.OutputBufferLength = 4;
     assert_eq!(query.run(), 0);
     assert_eq!(query.output, [0, 3, 3, 0]);
     let mut read = Request::new(IRP_MJ_READ, 1, 4);
-    assert_eq!(read.run(), HV_WDK_STATUS_PENDING);
+    assert_eq!(read.run(), FWX_WDK_STATUS_PENDING);
     let mut shutdown = Request::new(IRP_MJ_DEVICE_CONTROL, 1, 0);
-    shutdown._stack.Parameters.DeviceIoControl.IoControlCode = hyperv_protocol::IOCTL_SHUTDOWN;
+    shutdown._stack.Parameters.DeviceIoControl.IoControlCode = firewallx_protocol::IOCTL_SHUTDOWN;
     assert_eq!(shutdown.run(), 0);
     assert_eq!(shutdown.run(), 0);
     state(|s| {

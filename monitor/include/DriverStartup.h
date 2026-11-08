@@ -18,6 +18,6 @@ StartupResult OpenDriverWhenReady(
     const std::atomic<bool>& stop_requested,
     const std::function<void(const std::string&)>& on_waiting,
     std::string& error,
-    const wchar_t* event_name = HV_READY_EVENT_USER_NAME);
+    const wchar_t* event_name = FWX_READY_EVENT_USER_NAME);
 
 } // namespace pmkext::monitor

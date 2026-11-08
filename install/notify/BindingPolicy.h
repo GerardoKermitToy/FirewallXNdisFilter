@@ -4,8 +4,8 @@
 #include <netcfgn.h>
 #include "BindingPath.h"
 
-namespace hyperv_xndis_filter {
-inline constexpr wchar_t kComponentId[] = L"hyperv_xndis_filter";
+namespace firewallx_ndis_filter {
+inline constexpr wchar_t kComponentId[] = L"firewallx_ndis_filter";
 // Package identity from INF NetCfgInstanceId, never a machine adapter GUID.
 inline constexpr GUID kFilterInstanceId = {0x6e76ead1, 0x7bcb, 0x49c4, {0x95, 0x47, 0xd3, 0xe6, 0xb3, 0x48, 0x8f, 0x71}};
 // Independent of the filter's NetCfgInstanceId.

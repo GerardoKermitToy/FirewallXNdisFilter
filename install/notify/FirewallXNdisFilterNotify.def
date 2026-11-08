@@ -1,4 +1,4 @@
-LIBRARY HyperVXNdisFilterNotify
+LIBRARY FirewallXNdisFilterNotify
 EXPORTS
     DllGetClassObject PRIVATE
     DllCanUnloadNow PRIVATE

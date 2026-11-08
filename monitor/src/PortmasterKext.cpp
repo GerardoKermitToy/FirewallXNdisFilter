@@ -1,4 +1,4 @@
-// HyperVXNdisFilter adaptation of kext_client, 2026-10-25; see README.md and LICENSE.
+// FirewallXNdisFilter adaptation of kext_client, 2026-10-25; see README.md and LICENSE.
 #include "PortmasterKext.h"
 #include "DriverProtocol.h"
 

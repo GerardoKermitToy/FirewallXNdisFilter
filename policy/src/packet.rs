@@ -1,4 +1,4 @@
-use hyperv_protocol::{Connection, Direction, MAX_PAYLOAD, connection_header_len};
+use firewallx_protocol::{Connection, Direction, MAX_PAYLOAD, connection_header_len};
 use likely_stable::{likely, unlikely};
 
 pub const SNAPSHOT: usize = 320;

@@ -578,7 +578,7 @@ pub(super) mod api {
             if let Some(rows) = update {
                 change(rows);
             }
-            return HV_WDK_STATUS_NOT_FOUND as NTSTATUS;
+            return FWX_WDK_STATUS_NOT_FOUND as NTSTATUS;
         }
         let size = (core::mem::offset_of!(MIB_UNICASTIPADDRESS_TABLE, Table)
             + rows.len() * size_of::<MIB_UNICASTIPADDRESS_ROW>())
@@ -632,7 +632,7 @@ pub(super) mod api {
         );
         let rows = state.anycast_rows.clone();
         if rows.is_empty() {
-            return HV_WDK_STATUS_NOT_FOUND as NTSTATUS;
+            return FWX_WDK_STATUS_NOT_FOUND as NTSTATUS;
         }
         let size = (core::mem::offset_of!(MIB_ANYCASTIPADDRESS_TABLE, Table)
             + rows.len() * size_of::<MIB_ANYCASTIPADDRESS_ROW>())

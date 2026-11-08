@@ -4,7 +4,7 @@ Signature="$Windows NT$"
 Class=NetService
 ClassGUID={4D36E974-E325-11CE-BFC1-08002BE10318}
 Provider=%Provider%
-CatalogFile=HyperVXNdisFilter.cat
+CatalogFile=FirewallXNdisFilter.cat
 DriverVer=10/27/2026,0.3.3.0
 PnpLockdown=1
 
@@ -13,7 +13,7 @@ PnpLockdown=1
 %Provider%=Models,NTamd64.10.0...25341
 
 [Models.NTamd64.10.0...25341]
-%Description%=Install, hyperv_xndis_filter
+%Description%=Install, firewallx_ndis_filter
 
 [Install]
 Characteristics=0x40000
@@ -22,7 +22,7 @@ CopyFiles=DriverFiles,NotifyFiles
 AddReg=Ndi
 
 [Install.Services]
-AddService=HyperVXNdisFilter,,Service
+AddService=FirewallXNdisFilter,,Service
 
 [Service]
 DisplayName=%Description%
@@ -30,43 +30,43 @@ Description=%Help%
 ServiceType=1
 StartType=1
 ErrorControl=1
-ServiceBinary=%13%\HyperVXNdisFilter.sys
+ServiceBinary=%13%\FirewallXNdisFilter.sys
 LoadOrderGroup=NDIS
 
 [Ndi]
-HKR,Ndi,Service,,"HyperVXNdisFilter"
-HKR,Ndi,CoServices,0x00010000,"HyperVXNdisFilter"
+HKR,Ndi,Service,,"FirewallXNdisFilter"
+HKR,Ndi,CoServices,0x00010000,"FirewallXNdisFilter"
 HKR,Ndi,HelpText,,%Help%
 HKR,Ndi,FilterClass,,"custom"
 HKR,Ndi,FilterType,0x00010001,2
 HKR,Ndi,FilterRunType,0x00010001,2
 HKR,Ndi,ClsID,,"{1CFED41E-4579-42CF-962C-2A7E04C6DBC8}"
-HKR,Ndi,ComponentDll,,"%13%\HyperVXNdisFilterNotify.dll"
+HKR,Ndi,ComponentDll,,"%13%\FirewallXNdisFilterNotify.dll"
 HKR,Ndi\Interfaces,UpperRange,,"noupper"
 HKR,Ndi\Interfaces,LowerRange,,"nolower"
 HKR,Ndi\Interfaces,FilterMediaTypes,,"ethernet"
 
 [Install.Remove.Services]
-DelService=HyperVXNdisFilter,0x200
+DelService=FirewallXNdisFilter,0x200
 
 [DriverFiles]
-HyperVXNdisFilter.sys,,,2
+FirewallXNdisFilter.sys,,,2
 
 [NotifyFiles]
-HyperVXNdisFilterNotify.dll,,,2
+FirewallXNdisFilterNotify.dll,,,2
 
 [SourceDisksNames]
 1=%Description%,,,
 
 [SourceDisksFiles]
-HyperVXNdisFilter.sys=1
-HyperVXNdisFilterNotify.dll=1
+FirewallXNdisFilter.sys=1
+FirewallXNdisFilterNotify.dll=1
 
 [DestinationDirs]
 DriverFiles=13
 NotifyFiles=13
 
 [Strings]
-Provider="HyperVXNdisFilter Project"
-Description="HyperVXNdisFilter Rust Host Adapter LWF"
+Provider="FirewallXNdisFilter Project"
+Description="FirewallXNdisFilter Rust Host Adapter LWF"
 Help="Rust packet verdicts for compatible Ethernet adapter bindings."

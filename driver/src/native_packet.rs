@@ -55,7 +55,7 @@ unsafe fn context_data(nbl: *mut NET_BUFFER_LIST) -> *mut PacketContext {
     unsafe {
         let header = (*nbl).Context;
         if header.is_null() {
-            crate::native::hv_bugcheck();
+            crate::native::fwx_bugcheck();
         }
         header
             .add(1)
@@ -70,7 +70,7 @@ pub(crate) unsafe fn packet_context(nbl: *mut NET_BUFFER_LIST) -> *mut PacketCon
     unsafe {
         let context = context_data(nbl);
         if (*context).signature != CONTEXT_TAG {
-            crate::native::hv_bugcheck();
+            crate::native::fwx_bugcheck();
         }
         context
     }
@@ -301,7 +301,7 @@ pub(crate) unsafe fn copy_receive(
                 return null_mut();
             }
             let storage = crate::native::pool_allocation(api::ExAllocatePool2(
-                HV_WDK_POOL_FLAG_NON_PAGED as POOL_FLAGS,
+                FWX_WDK_POOL_FLAG_NON_PAGED as POOL_FLAGS,
                 length as SIZE_T,
                 TAG,
             ));
@@ -379,17 +379,17 @@ unsafe fn snapshot_view(
 }
 
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn hv_first_nb(packet: usize) -> *mut c_void {
+pub(crate) unsafe extern "C" fn fwx_first_nb(packet: usize) -> *mut c_void {
     unsafe { first_nb(packet as *mut NET_BUFFER_LIST).cast() }
 }
 
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn hv_next_nb(nb: *mut c_void) -> *mut c_void {
+pub(crate) unsafe extern "C" fn fwx_next_nb(nb: *mut c_void) -> *mut c_void {
     unsafe { next_nb(nb.cast()).cast() }
 }
 
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn hv_snapshot_view(
+pub(crate) unsafe extern "C" fn fwx_snapshot_view(
     nb: *mut c_void,
     packet: usize,
     storage: *mut u8,
@@ -408,7 +408,7 @@ pub(crate) unsafe extern "C" fn hv_snapshot_view(
 }
 
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn hv_snapshot(
+pub(crate) unsafe extern "C" fn fwx_snapshot(
     nb: *mut c_void,
     packet: usize,
     out: *mut u8,

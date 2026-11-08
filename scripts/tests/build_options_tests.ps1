@@ -7,12 +7,12 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($buildScript, [
 if ($parseErrors.Count -ne 0 -or $null -eq $ast.ParamBlock) { throw 'Build.ps1 parameter parsing failed.' }
 $probe = [scriptblock]::Create($ast.ParamBlock.Extent.Text + "`n" + '$PfxPassword')
 $timestampProbe = [scriptblock]::Create($ast.ParamBlock.Extent.Text + "`n" + '$TimestampUrl')
-$oldPassword = $env:HYPERVXNDISFILTER_PFX_PASSWORD
+$oldPassword = $env:FIREWALLXNDISFILTER_PFX_PASSWORD
 $script:passed = 0
 
 function Test-Password {
     param([string]$Name, [string]$EnvironmentPassword, [hashtable]$Arguments, [string]$Expected)
-    $env:HYPERVXNDISFILTER_PFX_PASSWORD = $EnvironmentPassword
+    $env:FIREWALLXNDISFILTER_PFX_PASSWORD = $EnvironmentPassword
     $actual = & $probe @Arguments
     if ($actual -cne $Expected) { throw "Unexpected password selection: $Name" }
     ++$script:passed
@@ -58,7 +58,39 @@ try {
     if (($signArgs -join "`0") -cne ($expectedArgs -join "`0")) { throw 'RFC 3161/SHA-256 signing arguments differ.' }
     ++$script:passed
     Write-Host 'PASS all signing uses RFC 3161 with SHA-256 and the selected URL'
+
+    $guard = $ast.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq 'Assert-NoLegacyPackageFiles'
+    }, $true)
+    if ($null -eq $guard) { throw 'Legacy package guard not found.' }
+    . ([scriptblock]::Create($guard.Extent.Text))
+    $fixtureDir = Join-Path ([IO.Path]::GetTempPath()) ('firewallx-build-guard-' + [guid]::NewGuid())
+    New-Item -ItemType Directory -Path $fixtureDir | Out-Null
+    try {
+        Assert-NoLegacyPackageFiles $fixtureDir
+        foreach ($name in @('HyperVXNdisFilter.inf', 'HyperVGuard.sys', 'hyperv_monitor.exe')) {
+            $fixture = Join-Path $fixtureDir $name
+            Set-Content -LiteralPath $fixture -Value 'legacy fixture'
+            $rejected = $false
+            try { Assert-NoLegacyPackageFiles $fixtureDir }
+            catch { $rejected = $true }
+            if (!$rejected -or !(Test-Path -LiteralPath $fixture)) {
+                throw "Legacy artifact was not safely rejected: $name"
+            }
+            Remove-Item -LiteralPath $fixture
+            ++$script:passed
+            Write-Host "PASS preserves and rejects legacy artifact $name"
+        }
+        Set-Content -LiteralPath (Join-Path $fixtureDir 'FirewallXNdisFilter.inf') -Value 'current fixture'
+        Assert-NoLegacyPackageFiles $fixtureDir
+        ++$script:passed
+        Write-Host 'PASS accepts current product artifacts'
+    } finally {
+        Remove-Item -LiteralPath $fixtureDir -Recurse -Force
+    }
     Write-Host "PASS $script:passed build option cases (no compiler, signing tool, key, TSA or driver access)."
 } finally {
-    $env:HYPERVXNDISFILTER_PFX_PASSWORD = $oldPassword
+    $env:FIREWALLXNDISFILTER_PFX_PASSWORD = $oldPassword
 }

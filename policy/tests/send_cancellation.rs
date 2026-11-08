@@ -1,9 +1,9 @@
 use core::ffi::c_void;
-use hyperv_policy::{
+use firewallx_policy::{
     engine::{Action, Engine, Finish, Submission, allocate_record},
     packet::Packet,
 };
-use hyperv_protocol::{Verdict, connection_header_len};
+use firewallx_protocol::{Verdict, connection_header_len};
 use std::{
     ptr,
     sync::{
@@ -26,7 +26,7 @@ struct Guard {
 }
 
 #[unsafe(no_mangle)]
-unsafe extern "C" fn hv_send_guard_lock(value: *mut c_void) -> u32 {
+unsafe extern "C" fn fwx_send_guard_lock(value: *mut c_void) -> u32 {
     let guard = unsafe { &*value.cast::<Guard>() };
     guard.attempts.fetch_add(1, Ordering::SeqCst);
     while guard
@@ -40,7 +40,7 @@ unsafe extern "C" fn hv_send_guard_lock(value: *mut c_void) -> u32 {
 }
 
 #[unsafe(no_mangle)]
-unsafe extern "C" fn hv_send_guard_unlock(value: *mut c_void) {
+unsafe extern "C" fn fwx_send_guard_unlock(value: *mut c_void) {
     let guard = unsafe { &*value.cast::<Guard>() };
     guard.locked.store(false, Ordering::Release);
 }
@@ -74,9 +74,9 @@ fn cancellation_during_capture_prevents_pending_publication() {
     );
 
     // The cancel handler runs after preflight but before pending publication.
-    unsafe { hv_send_guard_lock(handle) };
+    unsafe { fwx_send_guard_lock(handle) };
     guard.cancelled.store(true, Ordering::Relaxed);
-    unsafe { hv_send_guard_unlock(handle) };
+    unsafe { fwx_send_guard_unlock(handle) };
     assert_eq!(engine.cancel(101, cancel), None);
     let mut record = allocate_record(connection_header_len(&packet.connection) + 100);
     let result = with_send_guard(handle, |cancelled| {
@@ -140,10 +140,10 @@ fn publication_guard_serializes_a_concurrent_cancel() {
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let cancelled = &guard.cancelled;
         scope.spawn(move || {
-            unsafe { hv_send_guard_lock(address as *mut c_void) };
+            unsafe { fwx_send_guard_lock(address as *mut c_void) };
             assert!(published.load(Ordering::SeqCst));
             cancelled.store(true, Ordering::Relaxed);
-            unsafe { hv_send_guard_unlock(address as *mut c_void) };
+            unsafe { fwx_send_guard_unlock(address as *mut c_void) };
         });
         let deadline = Instant::now() + Duration::from_secs(5);
         while guard.attempts.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {

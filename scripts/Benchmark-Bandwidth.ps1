@@ -9,7 +9,7 @@ param(
     [string]$OutputDirectory,
     [Parameter(Mandatory = $true)][string]$PfxPath,
     [Parameter(Mandatory = $true)][string]$RootCertificate,
-    [string]$PfxPassword = $(if ($env:HYPERVXNDISFILTER_PFX_PASSWORD) { $env:HYPERVXNDISFILTER_PFX_PASSWORD } else { '1' }),
+    [string]$PfxPassword = $(if ($env:FIREWALLXNDISFILTER_PFX_PASSWORD) { $env:FIREWALLXNDISFILTER_PFX_PASSWORD } else { '1' }),
     [string]$SdkVersion = '10.0.28000.0'
 )
 $ErrorActionPreference = 'Stop'
@@ -35,7 +35,7 @@ try {
     # User-mode example only. No kernel/package build or installation occurs.
     $env:RUSTFLAGS = '-C no-redzone=yes -C debuginfo=2 -C link-arg=/DEBUG:FULL -C link-arg=/PDBALTPATH:%_PDB%'
     $env:CARGO_ENCODED_RUSTFLAGS = $null
-    & cargo build --release -p hyperv-policy --example bandwidth_stats_bench --locked
+    & cargo build --release -p firewallx-policy --example bandwidth_stats_bench --locked
     if ($LASTEXITCODE) { throw 'Bandwidth benchmark build failed.' }
     $exe = Join-Path $root 'target\release\examples\bandwidth_stats_bench.exe'
     # Use existing signing material in place; no key copy, certificate import,

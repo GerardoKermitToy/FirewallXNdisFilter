@@ -4,7 +4,7 @@ use core::{
     mem::{align_of, offset_of, size_of},
     ptr, slice,
 };
-use hyperv_protocol as wire;
+use firewallx_protocol as wire;
 
 #[repr(C)]
 pub struct AdapterInfo {
@@ -77,14 +77,14 @@ fn snapshot_size(count: u32) -> u32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn HvAdapterInfoSize(count: u32) -> u32 {
+pub extern "C" fn FwxAdapterInfoSize(count: u32) -> u32 {
     snapshot_size(count)
 }
 
 /// # Safety
 /// `required` points to writable native storage, protected by the diagnostic lock.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn HvPlanAdapterInfo(
+pub unsafe extern "C" fn FwxPlanAdapterInfo(
     count: u64,
     capacity: u32,
     staged: u64,
@@ -112,7 +112,7 @@ pub unsafe extern "C" fn HvPlanAdapterInfo(
 /// # Safety
 /// `info` is exclusive, aligned native AdapterInfo storage under the diagnostic lock.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn HvClearGeneralAttributes(info: *mut AdapterInfo) {
+pub unsafe extern "C" fn FwxClearGeneralAttributes(info: *mut AdapterInfo) {
     let a = unsafe { &mut *info };
     a.flags &= !wire::ADAPTER_GENERAL_VALID;
     a.mtu = 0;
@@ -134,7 +134,7 @@ pub unsafe extern "C" fn HvClearGeneralAttributes(info: *mut AdapterInfo) {
 /// `out` holds NAME_CAPACITY writable u16s, `flags` is writable, and a non-null
 /// `source` holds `length` readable u16s. Input/output do not overlap.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn HvCopyAdapterName(
+pub unsafe extern "C" fn FwxCopyAdapterName(
     out: *mut u16,
     source: *const u16,
     length: u32,
@@ -167,7 +167,7 @@ pub unsafe extern "C" fn HvCopyAdapterName(
 /// # Safety
 /// `out` holds four writable bytes; no alignment is required.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn HvInfoWrite32(out: *mut u8, value: u32) {
+pub unsafe extern "C" fn FwxInfoWrite32(out: *mut u8, value: u32) {
     unsafe {
         ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), out, 4);
     }
@@ -175,7 +175,7 @@ pub unsafe extern "C" fn HvInfoWrite32(out: *mut u8, value: u32) {
 /// # Safety
 /// `out` holds eight writable bytes; no alignment is required.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn HvInfoWrite64(out: *mut u8, value: u64) {
+pub unsafe extern "C" fn FwxInfoWrite64(out: *mut u8, value: u64) {
     unsafe {
         ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), out, 8);
     }
@@ -192,7 +192,7 @@ fn write64(out: &mut [u8], offset: usize, value: u64) {
 /// `out` holds ADAPTER_INFO_HEADER_SIZE writable bytes. Counts are one consistent
 /// diagnostic-lock observation; encoding does not acquire any lock or allocate.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn HvEncodeAdapterInfoHeader(out: *mut u8, count: u32, running: u32) {
+pub unsafe extern "C" fn FwxEncodeAdapterInfoHeader(out: *mut u8, count: u32, running: u32) {
     let out = unsafe { slice::from_raw_parts_mut(out, wire::ADAPTER_INFO_HEADER_SIZE) };
     write32(out, 0, wire::ADAPTER_INFO_VERSION);
     write32(out, 4, wire::ADAPTER_INFO_ENTRY_SIZE as u32);
@@ -204,7 +204,7 @@ pub unsafe extern "C" fn HvEncodeAdapterInfoHeader(out: *mut u8, count: u32, run
 /// `out` holds ADAPTER_INFO_ENTRY_SIZE writable bytes; `info` is a valid aligned
 /// immutable snapshot, disjoint from output. Native code retains its lifetime.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn HvEncodeAdapterInfo(out: *mut u8, info: *const AdapterInfo) {
+pub unsafe extern "C" fn FwxEncodeAdapterInfo(out: *mut u8, info: *const AdapterInfo) {
     let out = unsafe { slice::from_raw_parts_mut(out, wire::ADAPTER_INFO_ENTRY_SIZE) };
     let a = unsafe { &*info };
     write64(out, 0, a.module_id);

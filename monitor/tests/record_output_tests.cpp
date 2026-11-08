@@ -1,4 +1,4 @@
-// HyperVXNdisFilter adaptation, 2026-10-25: keep test files in the build directory.
+// FirewallXNdisFilter adaptation, 2026-10-25: keep test files in the build directory.
 // Original source provenance/license: ../README.md and ../LICENSE.
 #include "RecordOutput.h"
 #include "DriverProtocol.h"

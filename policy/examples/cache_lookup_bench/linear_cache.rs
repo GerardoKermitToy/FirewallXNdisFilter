@@ -3,7 +3,7 @@
 
 use alloc::alloc::{alloc, dealloc};
 use core::{alloc::Layout, mem, ptr, slice};
-use hyperv_protocol::Connection;
+use firewallx_protocol::Connection;
 
 const INITIAL_CAPACITY: usize = 128;
 const WORK_PER_PASS: usize = 32;

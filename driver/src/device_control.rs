@@ -2,7 +2,7 @@
 //! Native dispatch retains session/IRP ownership and performs shutdown/snapshot
 //! actions only after this function accepts the command.
 use core::ptr;
-use hyperv_protocol as wire;
+use firewallx_protocol as wire;
 mod constants {
     include!(concat!(env!("OUT_DIR"), "/device_constants.rs"));
 }
@@ -15,7 +15,7 @@ use constants::{
 /// `transferred` is writable and disjoint from `out`. A non-null `out` holds
 /// `capacity` writable bytes. The caller owns the buffered IRP and session gate.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn HvDeviceControl(
+pub unsafe extern "C" fn FwxDeviceControl(
     code: u32,
     input: u32,
     out: *mut u8,

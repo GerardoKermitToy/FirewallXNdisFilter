@@ -1,7 +1,7 @@
 //! Track whether an owned NBL contains local or transit IP packets.
 //!
-//! Each NB must first pass the ordinary bounded Ethernet/IP parser. A single
-//! NBL cannot carry different policy decisions for a local and a transit NB.
+//! Each NB must first pass the ordinary bounded Ethernet/IP parser. A mixed
+//! NBL must be split before its local and transit NBs get independent decisions.
 
 use firewallx_policy::packet::Packet;
 
@@ -179,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_local_and_transit_are_permitted_after_all_buffers_are_classified() {
+    fn mixed_local_and_transit_require_split_after_all_buffers_are_classified() {
         for first in [IpScope::Local, IpScope::Transit] {
             let second = if first == IpScope::Local {
                 IpScope::Transit

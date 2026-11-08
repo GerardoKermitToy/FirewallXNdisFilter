@@ -345,6 +345,10 @@ fn capture_packet(nb: Handle, nbl: usize, packet: &Packet) -> Result<Option<Vec<
     Ok(Some(data))
 }
 
+// A positive result normally requests immediate completion; this value asks
+// the native layer to split a validated mixed local/transit NBL first.
+const CLASSIFY_SPLIT: i32 = 3;
+
 // Return -1 when policy owns the nbl; otherwise the caller finishes it after
 // releasing the per-module classification lock. Ownership stays in the native Rust layer.
 #[unsafe(no_mangle)]
@@ -354,13 +358,22 @@ pub extern "C" fn FwxClassify(
     path: u32,
     cancel: usize,
     session: u32,
+    split: u32,
     send_guard: Handle,
 ) -> i32 {
     let Some(path) = NdisPath::decode(path) else {
         with_state(|e| e.malformed(interface_index, "invalid NDIS packet direction"));
         return 1;
     };
-    classify(nbl, interface_index, path, cancel, session, send_guard)
+    classify(
+        nbl,
+        interface_index,
+        path,
+        cancel,
+        session,
+        split,
+        send_guard,
+    )
 }
 fn classify(
     nbl: usize,
@@ -368,6 +381,7 @@ fn classify(
     path: NdisPath,
     cancel: usize,
     session: u32,
+    split: u32,
     send_guard: Handle,
 ) -> i32 {
     let mut batch = transit_packet::PacketBatch::new();
@@ -489,12 +503,11 @@ fn classify(
     let mut packet = match decision {
         transit_packet::BatchDecision::Mixed => {
             return with_state(|e| {
-                let cancelled = with_send_guard(send_guard, |cancelled| cancelled);
-                if cancelled {
+                e.mixed_packet(interface_index);
+                if with_send_guard(send_guard, |cancelled| cancelled) {
                     finish_code(Finish::Cancel)
                 } else {
-                    e.mixed_packet_bypass(interface_index);
-                    finish_code(Finish::Allow)
+                    CLASSIFY_SPLIT
                 }
             });
         }
@@ -527,6 +540,11 @@ fn classify(
         }
         transit_packet::BatchDecision::Transit(packet) => packet,
     };
+    // Splitting must not make a formerly multi-NB batch eligible for cache hits
+    // or permanent decisions merely because each derived NBL has one NB.
+    if split != 0 {
+        packet.cacheable = false;
+    }
     packet.orient(path);
     if session == 0 {
         // The native Rust layer can close the policy rundown while the LWF remains bound.

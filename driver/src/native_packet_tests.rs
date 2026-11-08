@@ -120,6 +120,81 @@ pub(super) mod calls {
         nbl
     }
 
+    pub(crate) unsafe fn NdisAllocateCloneNetBufferList(
+        source: *mut NET_BUFFER_LIST,
+        nbl_pool: NDIS_HANDLE,
+        nb_pool: NDIS_HANDLE,
+        flags: ULONG,
+    ) -> *mut NET_BUFFER_LIST {
+        assert_eq!(nb_pool as usize, 0x202);
+        assert_eq!(flags, 0);
+        unsafe {
+            let clone = NdisAllocateNetBufferList(nbl_pool, 0, 0);
+            assert!(!clone.is_null());
+            (*clone).ParentNetBufferList = source;
+            let mut source_nb = first_nb(source);
+            let mut tail: *mut NET_BUFFER = null_mut();
+            while !source_nb.is_null() {
+                let mut nb = Box::<NET_BUFFER>::default();
+                ptr::copy_nonoverlapping(source_nb, &mut *nb, 1);
+                let nb = Box::into_raw(nb);
+                state(|s| assert!(s.nbs.insert(nb as usize)));
+                set_next_nb(nb, null_mut());
+                let mut source_mdl = first_mdl(source_nb);
+                let original_current = current_mdl(source_nb);
+                let mut first: *mut MDL = null_mut();
+                let mut last: *mut MDL = null_mut();
+                let mut current = null_mut();
+                while !source_mdl.is_null() {
+                    let mut mdl = Box::<MDL>::default();
+                    ptr::copy_nonoverlapping(source_mdl, &mut *mdl, 1);
+                    mdl.Next = null_mut();
+                    let mdl = Box::into_raw(mdl);
+                    state(|s| assert!(s.mdls.insert(mdl as usize)));
+                    if first.is_null() {
+                        first = mdl;
+                    } else {
+                        (*last).Next = mdl;
+                    }
+                    if source_mdl == original_current {
+                        current = mdl;
+                    }
+                    last = mdl;
+                    source_mdl = (*source_mdl).Next;
+                }
+                (*nb).__bindgen_anon_1.__bindgen_anon_1.MdlChain = first;
+                (*nb).__bindgen_anon_1.__bindgen_anon_1.CurrentMdl = current;
+                if tail.is_null() {
+                    set_first_nb(clone, nb);
+                } else {
+                    set_next_nb(tail, nb);
+                }
+                tail = nb;
+                source_nb = next_nb(source_nb);
+            }
+            clone
+        }
+    }
+
+    pub(crate) unsafe fn NdisFreeCloneNetBufferList(clone: *mut NET_BUFFER_LIST, flags: ULONG) {
+        assert_eq!(flags, 0);
+        unsafe {
+            let mut nb = first_nb(clone);
+            while !nb.is_null() {
+                let next = next_nb(nb);
+                let mut mdl = first_mdl(nb);
+                while !mdl.is_null() {
+                    let next_mdl = (*mdl).Next;
+                    IoFreeMdl(mdl);
+                    mdl = next_mdl;
+                }
+                NdisFreeNetBuffer(nb);
+                nb = next;
+            }
+            NdisFreeNetBufferList(clone);
+        }
+    }
+
     pub(crate) unsafe fn NdisFreeNetBufferList(nbl: *mut NET_BUFFER_LIST) {
         state(|s| assert!(s.nbls.remove(&(nbl as usize)), "foreign/double NBL free"));
         unsafe { drop(Box::from_raw(nbl)) };
@@ -237,6 +312,24 @@ pub(super) mod calls {
                 storage
             } else {
                 null_mut()
+            }
+        }
+    }
+
+    pub(crate) unsafe fn NdisCopySendNetBufferListInfo(
+        destination: *mut NET_BUFFER_LIST,
+        source: *const NET_BUFFER_LIST,
+    ) {
+        state(|s| s.metadata_calls += 1);
+        for index in [
+            TcpIpChecksumNetBufferListInfo,
+            Ieee8021QNetBufferListInfo,
+            NetBufferListCancelId,
+            NetBufferListProtocolId,
+        ] {
+            unsafe {
+                (*destination).NetBufferListInfo[index as usize] =
+                    (*source).NetBufferListInfo[index as usize];
             }
         }
     }
@@ -521,6 +614,84 @@ fn receive_copy_deep_copies_all_nbs_preserves_scalar_oob_and_original_offsets() 
     }
     state(|s| assert_eq!(s.metadata_calls, 1));
     assert_eq!(inputs[0].mdls.len(), 2);
+    assert_no_leaks();
+}
+
+#[test]
+fn split_wrapper_uses_cloned_descriptors_and_rejects_opaque_send_metadata() {
+    reset(None);
+    let mut inputs = [Input::new(&[b"abcdef"], 0, 6)];
+    let mut parent = source(&mut inputs);
+    let nb = &mut *inputs[0].nb as *mut NET_BUFFER;
+    parent.NetBufferListInfo[NetBufferListCancelId as usize] = 0x55usize as PVOID;
+    parent.NetBufferListInfo[Ieee8021QNetBufferListInfo as usize] = 0x123usize as PVOID;
+    unsafe {
+        assert!(split_metadata_supported(
+            &mut *parent,
+            NDIS_PATH_SEND,
+            MaxNetBufferListInfo as u32
+        ));
+        let clone = allocate_split_clone(&mut *parent, 0x101 as NDIS_HANDLE, 0x202 as NDIS_HANDLE);
+        let cloned_nb = first_nb(clone);
+        assert_ne!(cloned_nb, nb);
+        let child = allocate_split_nbl(
+            0x303 as NDIS_HANDLE,
+            0x101 as NDIS_HANDLE,
+            &mut *parent,
+            cloned_nb,
+            NDIS_PATH_SEND,
+        );
+        assert!((*child).ParentNetBufferList.is_null());
+        assert_eq!((*child).SourceHandle, 0x303 as NDIS_HANDLE);
+        assert_ne!((*child).NblFlags & NDIS_NBL_FLAGS_SEND_READ_ONLY, 0);
+        assert_eq!(first_nb(child), cloned_nb);
+        assert_eq!(
+            (*child).NetBufferListInfo[NetBufferListCancelId as usize] as usize,
+            0x55
+        );
+        assert_eq!(
+            (*child).NetBufferListInfo[Ieee8021QNetBufferListInfo as usize] as usize,
+            0x123
+        );
+        assert_ne!(first_mdl(cloned_nb), inputs[0].mdls.as_mut_ptr());
+        assert_eq!(
+            (*first_mdl(cloned_nb)).MappedSystemVa,
+            (*first_mdl(nb)).MappedSystemVa
+        );
+        free_split_nbl(child);
+        parent.NetBufferListInfo[NetBufferListCancelId as usize] = null_mut();
+        const RECEIVE_PATH: u32 = 1;
+        let receive = allocate_split_nbl(
+            0x303 as NDIS_HANDLE,
+            0x101 as NDIS_HANDLE,
+            &mut *parent,
+            cloned_nb,
+            RECEIVE_PATH,
+        );
+        assert_ne!((*receive).NblFlags & NDIS_NBL_FLAGS_RECV_READ_ONLY, 0);
+        free_split_nbl(receive);
+        free_split_clone(clone);
+        assert_eq!(first_nb(&mut *parent), nb);
+        parent.NetBufferListInfo[MediaSpecificInformation as usize] = 1usize as PVOID;
+        assert!(!split_metadata_supported(
+            &mut *parent,
+            NDIS_PATH_SEND,
+            MaxNetBufferListInfo as u32
+        ));
+        parent.NetBufferListInfo[MediaSpecificInformation as usize] = null_mut();
+        parent.NblFlags = NDIS_NBL_FLAGS_CAPTURE_TIMESTAMP_ON_TRANSMIT;
+        assert!(!split_metadata_supported(
+            &mut *parent,
+            NDIS_PATH_SEND,
+            MaxNetBufferListInfo as u32
+        ));
+        parent.NblFlags = NDIS_NBL_FLAGS_HD_SPLIT;
+        assert!(!split_metadata_supported(
+            &mut *parent,
+            RECEIVE_PATH,
+            MaxNetBufferListInfo as u32
+        ));
+    }
     assert_no_leaks();
 }
 

@@ -790,12 +790,10 @@ impl Engine {
             ),
         );
     }
-    pub fn mixed_packet_bypass(&mut self, interface_index: u32) {
+    pub fn mixed_packet(&mut self, interface_index: u32) {
         self.log_args(
             LOG_WARNING,
-            format_args!(
-                "Mixed local/transit NBL allowed without policy or cache on interface_index={interface_index}"
-            ),
+            format_args!("Mixed local/transit NBL on interface_index={interface_index}"),
         );
     }
     pub fn malformed(&mut self, interface_index: u32, reason: &str) {
@@ -1548,10 +1546,10 @@ mod tests {
         count
     }
     #[test]
-    fn packet_problem_and_mixed_bypass_warnings_include_interface() {
+    fn packet_problem_and_mixed_warnings_include_interface() {
         let mut e = default_engine();
         e.read(&mut [0; MAX_LOG_RECORD]); // Startup message.
-        e.mixed_packet_bypass(101);
+        e.mixed_packet(101);
         e.malformed(101, "truncated IP packet");
         e.resource_drop(101, "packet copy failed");
         e.paused_drop(101);
@@ -1573,7 +1571,7 @@ mod tests {
         for message in &messages {
             assert!(message.contains("interface_index=101"));
         }
-        assert!(messages[0].contains("Mixed local/transit NBL allowed without policy or cache"));
+        assert!(messages[0].contains("Mixed local/transit NBL"));
         assert!(messages[1].contains("truncated IP packet"));
         assert!(messages[2].contains("packet copy failed"));
         assert!(messages[3].contains("interface is paused"));
@@ -1590,7 +1588,7 @@ mod tests {
 
         e.disconnect();
         e.malformed(101, "offline malformed packet");
-        e.mixed_packet_bypass(101);
+        e.mixed_packet(101);
         assert_eq!(e.read(&mut bytes), 0); // There is no active log consumer.
     }
 

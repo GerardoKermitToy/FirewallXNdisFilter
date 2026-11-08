@@ -35,13 +35,14 @@ pub(crate) struct PacketContext {
     pub(crate) owner: u32,
     pub(crate) copied: u8,
     pub(crate) forwarded: u8,
+    pub(crate) split: *mut c_void,
 }
 
 const _: () = {
     assert!(align_of::<PacketContext>() <= align_of::<*mut c_void>());
     assert!(size_of::<PacketContext>().is_multiple_of(size_of::<*mut c_void>()));
     assert!(size_of::<PacketContext>() <= u16::MAX as usize);
-    assert!(size_of::<PacketContext>() == 32);
+    assert!(size_of::<PacketContext>() == 40);
     assert!(offset_of!(PacketContext, signature) == 8);
     assert!(offset_of!(PacketContext, port) == 20);
     assert!(offset_of!(PacketContext, owner) == 24);
@@ -250,6 +251,108 @@ pub(crate) unsafe fn copy_receive_metadata_supported(
             }
         }
         true
+    }
+}
+
+/// Only scalar send metadata can be shared safely between independently
+/// completed children. Pointer-bearing or otherwise opaque metadata is rejected.
+#[allow(non_upper_case_globals)]
+pub(crate) unsafe fn split_metadata_supported(
+    nbl: *mut NET_BUFFER_LIST,
+    direction: u32,
+    info_count: u32,
+) -> bool {
+    unsafe {
+        let supported_flags = NDIS_NBL_FLAGS_SEND_READ_ONLY
+            | NDIS_NBL_FLAGS_RECV_READ_ONLY
+            | NDIS_NBL_FLAGS_IS_IPV4
+            | NDIS_NBL_FLAGS_IS_IPV6
+            | NDIS_NBL_FLAGS_IS_TCP
+            | NDIS_NBL_FLAGS_IS_UDP
+            | NDIS_NBL_FLAGS_IS_LOOPBACK_PACKET;
+        if (*nbl).NblFlags & !supported_flags != 0 {
+            return false;
+        }
+        if direction != NDIS_PATH_SEND {
+            return copy_receive_metadata_supported(nbl, info_count);
+        }
+        if info_count as usize > (*nbl).NetBufferListInfo.len() || send_segmented(nbl) {
+            return false;
+        }
+        for i in 0..info_count as usize {
+            if (*nbl).NetBufferListInfo[i].is_null() {
+                continue;
+            }
+            match i as NDIS_NET_BUFFER_LIST_INFO {
+                TcpIpChecksumNetBufferListInfo
+                | Ieee8021QNetBufferListInfo
+                | NetBufferListCancelId
+                | NetBufferListProtocolId => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+/// Allocate independent NB/MDL descriptors that still reference the original
+/// packet bytes. Only the creator of the cloned NBs may rearrange their links.
+pub(crate) unsafe fn allocate_split_clone(
+    parent: *mut NET_BUFFER_LIST,
+    nbl_pool: NDIS_HANDLE,
+    nb_pool: NDIS_HANDLE,
+) -> *mut NET_BUFFER_LIST {
+    unsafe { api::NdisAllocateCloneNetBufferList(parent, nbl_pool, nb_pool, 0) }
+}
+
+pub(crate) unsafe fn free_split_clone(clone: *mut NET_BUFFER_LIST) {
+    unsafe { api::NdisFreeCloneNetBufferList(clone, 0) }
+}
+
+/// Wrap one NB created by this filter's clone. The original NBL and its NB
+/// links remain unchanged, and the clone stays alive until all wrappers finish.
+pub(crate) unsafe fn allocate_split_nbl(
+    filter: NDIS_HANDLE,
+    pool: NDIS_HANDLE,
+    parent: *mut NET_BUFFER_LIST,
+    nb: *mut NET_BUFFER,
+    direction: u32,
+) -> *mut NET_BUFFER_LIST {
+    unsafe {
+        let child = api::NdisAllocateNetBufferList(pool, 0, 0);
+        set_next_nbl(child, null_mut());
+        set_first_nb(child, nb);
+        if direction == NDIS_PATH_SEND {
+            api::NdisCopySendNetBufferListInfo(child, parent);
+        } else {
+            api::NdisCopyReceiveNetBufferListInfo(child, parent);
+            (*child).NetBufferListInfo[UdpRecvSegCoalesceOffloadInfo as usize] =
+                (*parent).NetBufferListInfo[UdpRecvSegCoalesceOffloadInfo as usize];
+        }
+        // Cloned MDLs can still reference packet bytes shared with other NBs.
+        // Prevent downstream writers from modifying those shared original bytes.
+        (*child).NblFlags = ((*parent).NblFlags
+            & (NDIS_NBL_FLAGS_IS_IPV4
+                | NDIS_NBL_FLAGS_IS_IPV6
+                | NDIS_NBL_FLAGS_IS_TCP
+                | NDIS_NBL_FLAGS_IS_UDP
+                | NDIS_NBL_FLAGS_IS_LOOPBACK_PACKET))
+            | if direction == NDIS_PATH_SEND {
+                NDIS_NBL_FLAGS_SEND_READ_ONLY
+            } else {
+                NDIS_NBL_FLAGS_RECV_READ_ONLY
+            };
+        (*child).SourceHandle = filter;
+        child
+    }
+}
+
+/// The NB belongs to the intermediate clone and is restored there, not freed
+/// with the wrapper.
+pub(crate) unsafe fn free_split_nbl(nbl: *mut NET_BUFFER_LIST) {
+    unsafe {
+        set_first_nb(nbl, null_mut());
+        api::NdisFreeNetBufferList(nbl);
     }
 }
 

@@ -11,6 +11,10 @@ use crate::{
 use firewallx_protocol as wire;
 use likely_stable::unlikely;
 
+extern crate alloc;
+use alloc::{boxed::Box, vec::Vec};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
+
 #[cfg(not(test))]
 use crate::{self as policy, wdk as api};
 #[cfg(test)]
@@ -24,6 +28,21 @@ mod tests;
 
 const MAX_STAGING_ATTEMPTS: u32 = 8;
 const FINISH_CANCEL: u32 = 2;
+const CLASSIFY_SPLIT: i32 = 3;
+
+/// The original NBL stays untouched. Cloned NB/MDL descriptors are restored to
+/// their intermediate clone and freed after all wrappers finish. The builder
+/// holds one reference until every child is dispatched.
+struct SplitGroup {
+    parent: PNET_BUFFER_LIST,
+    clone: PNET_BUFFER_LIST,
+    adapter: *mut Adapter,
+    buffers: Vec<*mut NET_BUFFER>,
+    references: AtomicUsize,
+    status: AtomicI32,
+    completion_flags: AtomicU32,
+    completion_seen: AtomicBool,
+}
 
 // A send callback owns this stack node until it has processed its whole chain.
 // The adapter lock protects the list, the unprocessed NBL links, and the
@@ -332,6 +351,93 @@ unsafe fn complete_local_lso(nbl: PNET_BUFFER_LIST) -> bool {
     }
 }
 
+/// Record child send failures without losing an already observed cancellation.
+unsafe fn split_status(group: *mut SplitGroup, status: NDIS_STATUS) {
+    unsafe {
+        if status == FWX_WDK_NDIS_SUCCESS as NDIS_STATUS {
+            return;
+        }
+        if status == FWX_WDK_NDIS_SEND_ABORTED as NDIS_STATUS {
+            (*group).status.store(status, Ordering::Release);
+        } else {
+            let _ = (*group).status.compare_exchange(
+                FWX_WDK_NDIS_SUCCESS as NDIS_STATUS,
+                status,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+}
+
+/// Restore the cloned NB chain only after all children are finished.
+unsafe fn release_split_group(group: *mut SplitGroup) {
+    unsafe {
+        if (*group).references.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        let group = Box::from_raw(group);
+        let parent = group.parent;
+        let a = group.adapter;
+        for (index, &nb) in group.buffers.iter().enumerate() {
+            packet::set_next_nb(
+                nb,
+                group.buffers.get(index + 1).copied().unwrap_or(null_mut()),
+            );
+        }
+        packet::set_first_nb(
+            group.clone,
+            group.buffers.first().copied().unwrap_or(null_mut()),
+        );
+        packet::free_split_clone(group.clone);
+        let context = packet::packet_context(parent);
+        let send = (*context).direction == SEND;
+        let copied = (*context).copied != 0;
+        let completion_flags = if group.completion_seen.load(Ordering::Acquire) {
+            group.completion_flags.load(Ordering::Acquire)
+        } else {
+            0
+        };
+        packet::free_packet_context(parent);
+        if send {
+            (*parent).__bindgen_anon_2.Status = group.status.load(Ordering::Acquire);
+            api::NdisFSendNetBufferListsComplete(
+                (*a).filter,
+                parent,
+                send_complete_flags() | completion_flags,
+            );
+        } else if copied {
+            packet::free_receive_copy(parent);
+        } else {
+            api::NdisFReturnNetBufferLists((*a).filter, parent, return_flags() | completion_flags);
+        }
+        release_active(a, 1);
+    }
+}
+
+/// A wrapper borrows one cloned NB; freeing it must not free that NB.
+unsafe fn finish_split_child(nbl: PNET_BUFFER_LIST, status: NDIS_STATUS, flags: Option<u32>) {
+    unsafe {
+        let context = packet::packet_context(nbl);
+        let a = (*context).adapter.cast::<Adapter>();
+        let group = (*context).split.cast::<SplitGroup>();
+        if group.is_null() {
+            fwx_bugcheck();
+        }
+        if (*context).direction == SEND {
+            split_status(group, status);
+        }
+        if let Some(flags) = flags {
+            (*group).completion_flags.fetch_and(flags, Ordering::AcqRel);
+            (*group).completion_seen.store(true, Ordering::Release);
+        }
+        packet::free_packet_context(nbl);
+        packet::free_split_nbl(nbl);
+        release_split_group(group);
+        release_active(a, 1);
+    }
+}
+
 /// Finish one claimed NBL. Publishing a pending NBL transfers its ownership to
 /// policy; the classifier must not inspect it after that publication.
 #[unsafe(no_mangle)]
@@ -367,6 +473,15 @@ pub(super) unsafe extern "C" fn fwx_finish(nbl_address: usize, finish: u32) {
                 }
                 api::NdisFIndicateReceiveNetBufferLists((*a).filter, nbl, port, 1, flags);
             }
+            return;
+        }
+        if unlikely(!(*context).split.is_null()) {
+            let status = if send && finish == FINISH_CANCEL {
+                FWX_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
+            } else {
+                FWX_WDK_NDIS_SUCCESS as NDIS_STATUS
+            };
+            finish_split_child(nbl, status, None);
             return;
         }
         let copied = (*context).copied != 0;
@@ -450,6 +565,124 @@ unsafe fn next_send(batch: *mut SendBatch) -> PNET_BUFFER_LIST {
     }
 }
 
+/// Split a validated mixed NBL into independently classified, zero-copy NB
+/// wrappers over NDIS-cloned descriptors. The original remains unchanged.
+unsafe fn split_mixed(
+    a: *mut Adapter,
+    parent: PNET_BUFFER_LIST,
+    session: bool,
+    batch: *mut SendBatch,
+) {
+    unsafe {
+        let context = packet::packet_context(parent);
+        let direction = (*context).direction;
+        let port = (*context).port;
+        let flags = (*context).flags;
+        if !packet::split_metadata_supported(parent, direction, nbl_info_count(FILTER_NDIS_VERSION))
+        {
+            policy::FwxResourceDrop((*a).interface_index);
+            let cancelled = if batch.is_null() {
+                false
+            } else {
+                ndis_lock(addr_of_mut!((*a).lock));
+                let cancelled = (*batch).cancelled;
+                ndis_unlock(addr_of_mut!((*a).lock));
+                cancelled
+            };
+            fwx_finish(parent as usize, if cancelled { FINISH_CANCEL } else { 1 });
+            return;
+        }
+        let clone = packet::allocate_split_clone(parent, (*a).nbl_pool, (*a).nb_pool);
+        let mut buffers = Vec::new();
+        let mut nb = packet::first_nb(clone);
+        while !nb.is_null() {
+            buffers.push(nb);
+            nb = packet::next_nb(nb);
+        }
+        let Some(references) = buffers.len().checked_add(1) else {
+            fwx_bugcheck();
+        };
+        let group = Box::into_raw(Box::new(SplitGroup {
+            parent,
+            clone,
+            adapter: a,
+            buffers,
+            references: AtomicUsize::new(references),
+            status: AtomicI32::new(FWX_WDK_NDIS_SUCCESS as NDIS_STATUS),
+            completion_flags: AtomicU32::new(if direction == SEND {
+                NDIS_SEND_COMPLETE_FLAGS_SINGLE_QUEUE
+                    | NDIS_SEND_COMPLETE_FLAGS_SWITCH_SINGLE_SOURCE
+            } else {
+                NDIS_RETURN_FLAGS_SINGLE_QUEUE | NDIS_RETURN_FLAGS_SWITCH_SINGLE_SOURCE
+            }),
+            completion_seen: AtomicBool::new(false),
+        }));
+        let mut children = Vec::with_capacity((*group).buffers.len());
+        for &nb in &(*group).buffers {
+            packet::set_next_nb(nb, null_mut());
+            let child =
+                packet::allocate_split_nbl((*a).filter, (*a).nbl_pool, parent, nb, direction);
+            let context = packet::allocate_packet_context(child);
+            (*context).adapter = a.cast();
+            (*context).port = port;
+            (*context).flags = flags;
+            (*context).direction = direction;
+            (*context).owner = packet::OWNER_NDIS;
+            (*context).split = group.cast();
+            ndis_lock(addr_of_mut!((*a).lock));
+            retain_active_locked(a);
+            ndis_unlock(addr_of_mut!((*a).lock));
+            children.push(child);
+        }
+        for child in children {
+            let mut lock: LOCK_STATE_EX = zeroed();
+            api::NdisAcquireRWLockRead((*a).classification_lock, &mut lock, 0);
+            ndis_lock(addr_of_mut!((*a).lock));
+            let running = (*a).running != 0;
+            ndis_unlock(addr_of_mut!((*a).lock));
+            let result = if running {
+                let cancel = if direction == SEND {
+                    (*child).NetBufferListInfo[NetBufferListCancelId as usize] as usize
+                } else {
+                    0
+                };
+                policy::FwxClassify(
+                    child as usize,
+                    (*a).interface_index,
+                    direction,
+                    cancel,
+                    u32::from(session),
+                    1,
+                    batch.cast(),
+                )
+            } else {
+                policy::FwxPausedDrop((*a).interface_index);
+                1
+            };
+            api::NdisReleaseRWLock((*a).classification_lock, &mut lock);
+            if result >= 0 {
+                let cancelled = if batch.is_null() {
+                    false
+                } else {
+                    ndis_lock(addr_of_mut!((*a).lock));
+                    let cancelled = (*batch).cancelled;
+                    ndis_unlock(addr_of_mut!((*a).lock));
+                    cancelled
+                };
+                let finish = if cancelled && result != 0 {
+                    FINISH_CANCEL
+                } else if result == CLASSIFY_SPLIT {
+                    1
+                } else {
+                    result as u32
+                };
+                fwx_finish(child as usize, finish);
+            }
+        }
+        release_split_group(group);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn classify_chain(
     a: *mut Adapter,
@@ -499,10 +732,22 @@ unsafe fn classify_chain(
                         direction,
                         cancel,
                         u32::from(session),
+                        0,
                         batch.cast(),
                     );
                 }
                 api::NdisReleaseRWLock((*a).classification_lock, &mut state);
+            }
+            if unlikely(result == CLASSIFY_SPLIT)
+                && let Ok(parent) = nbl
+            {
+                split_mixed(a, parent, session, batch);
+                if !batch.is_null() {
+                    ndis_lock(addr_of_mut!((*a).lock));
+                    (*batch).current = false;
+                    ndis_unlock(addr_of_mut!((*a).lock));
+                }
+                continue;
             }
             let cancelled = if batch.is_null() {
                 false
@@ -626,9 +871,13 @@ pub(super) unsafe extern "C" fn send_complete(
             {
                 policy::FwxSendFailure((*a).interface_index, status);
             }
-            packet::free_packet_context(nbl);
-            api::NdisFSendNetBufferListsComplete((*a).filter, nbl, flags);
-            release_active(a, 1);
+            if unlikely(!(*owned).split.is_null()) {
+                finish_split_child(nbl, status, Some(flags));
+            } else {
+                packet::free_packet_context(nbl);
+                api::NdisFSendNetBufferListsComplete((*a).filter, nbl, flags);
+                release_active(a, 1);
+            }
         }
         release_active(a, 1);
     }
@@ -737,14 +986,18 @@ pub(super) unsafe extern "C" fn return_receive(
             {
                 fwx_bugcheck();
             }
-            let copied = (*owned).copied != 0;
-            packet::free_packet_context(nbl);
-            if copied {
-                packet::free_receive_copy(nbl);
+            if unlikely(!(*owned).split.is_null()) {
+                finish_split_child(nbl, FWX_WDK_NDIS_SUCCESS as NDIS_STATUS, Some(flags));
             } else {
-                api::NdisFReturnNetBufferLists((*a).filter, nbl, flags);
+                let copied = (*owned).copied != 0;
+                packet::free_packet_context(nbl);
+                if copied {
+                    packet::free_receive_copy(nbl);
+                } else {
+                    api::NdisFReturnNetBufferLists((*a).filter, nbl, flags);
+                }
+                release_active(a, 1);
             }
-            release_active(a, 1);
         }
         release_active(a, 1);
     }

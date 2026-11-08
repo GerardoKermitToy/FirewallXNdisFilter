@@ -45,9 +45,14 @@ struct State {
     rw_depth: usize,
     irql: u8,
     inline: bool,
+    send_complete_extra_flags: u32,
+    receive_return_extra_flags: u32,
     free_original: bool,
     adapter: usize,
     classify_result: i32,
+    split_results: Vec<i32>,
+    split_seen: Vec<usize>,
+    split_early_finish: Option<u32>,
     early_finish: Option<u32>,
     cancel_during_classify: Option<usize>,
     cancel_after_publish: Option<usize>,
@@ -87,9 +92,14 @@ impl Default for State {
             rw_depth: 0,
             irql: 0,
             inline: true,
+            send_complete_extra_flags: 0,
+            receive_return_extra_flags: 0,
             free_original: false,
             adapter: 0,
             classify_result: 0,
+            split_results: Vec::new(),
+            split_seen: Vec::new(),
+            split_early_finish: None,
             early_finish: None,
             cancel_during_classify: None,
             cancel_after_publish: None,
@@ -476,12 +486,13 @@ pub(super) mod calls {
         flags: ULONG,
     ) {
         assert_unlocked();
-        let (inline, a, pause) = state(|s| {
+        let (inline, a, pause, extra_flags) = state(|s| {
             s.events.push(Event::Send(nbl as usize, flags));
             (
                 s.inline,
                 s.adapter,
                 core::mem::take(&mut s.pause_after_forward),
+                s.send_complete_extra_flags,
             )
         });
         if inline {
@@ -489,7 +500,7 @@ pub(super) mod calls {
                 send_complete(
                     a as NDIS_HANDLE,
                     nbl,
-                    flags & NDIS_SEND_FLAGS_DISPATCH_LEVEL,
+                    (flags & NDIS_SEND_FLAGS_DISPATCH_LEVEL) | extra_flags,
                 );
             }
         }
@@ -531,12 +542,13 @@ pub(super) mod calls {
         assert_unlocked();
         assert_eq!(count, 1);
         assert_eq!(flags & NDIS_RECEIVE_FLAGS_RESOURCES, 0);
-        let (inline, a, pause) = state(|s| {
+        let (inline, a, pause, extra_flags) = state(|s| {
             s.events.push(Event::Indicate(nbl as usize, flags));
             (
                 s.inline,
                 s.adapter,
                 core::mem::take(&mut s.pause_after_forward),
+                s.receive_return_extra_flags,
             )
         });
         if inline {
@@ -544,7 +556,7 @@ pub(super) mod calls {
                 return_receive(
                     a as NDIS_HANDLE,
                     nbl,
-                    flags & NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL,
+                    (flags & NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL) | extra_flags,
                 );
             }
         }
@@ -716,6 +728,7 @@ pub(super) mod calls {
         direction: u32,
         cancel: usize,
         session: u32,
+        split: u32,
         guard: PVOID,
     ) -> i32 {
         let (cancel_during_classify, adapter) =
@@ -738,10 +751,26 @@ pub(super) mod calls {
             assert!(s.rw_depth > 0);
             s.events
                 .push(Event::Classify(index, direction, cancel, session));
-            if s.classify_result < 0 && s.early_finish.is_none() {
+            let result = if split != 0 {
+                s.split_seen
+                    .push(unsafe { packet::first_nb(nbl as PNET_BUFFER_LIST) } as usize);
+                if s.split_results.is_empty() {
+                    0
+                } else {
+                    s.split_results.remove(0)
+                }
+            } else {
+                s.classify_result
+            };
+            let early = if split != 0 && result < 0 {
+                s.split_early_finish.take()
+            } else {
+                s.early_finish
+            };
+            if result < 0 && early.is_none() {
                 s.pending.push(nbl);
             }
-            (s.classify_result, s.early_finish)
+            (result, early)
         });
         if let Some(id) = state(|s| s.cancel_after_publish.take()) {
             assert!(result < 0 && early.is_none());
@@ -1213,6 +1242,345 @@ fn resources_receive_uses_private_deep_copy_and_never_returns_original_or_privat
     }
     assert!(source.data.iter().all(|&b| b == 0x5a));
     state(|s| assert!(!s.events.iter().any(|e| matches!(e, Event::Return(_, _)))));
+}
+
+#[test]
+fn mixed_send_completes_original_after_independent_children_and_restores_order() {
+    let f = Fixture::new();
+    let mut a = f.adapter();
+    let mut local = Source::new();
+    let mut transit1 = Source::new();
+    let mut transit2 = Source::new();
+    let parent = (&mut *local.nbl as *mut NET_BUFFER_LIST) as usize;
+    let first = &mut *local._nb as *mut NET_BUFFER;
+    let second = &mut *transit1._nb as *mut NET_BUFFER;
+    let third = &mut *transit2._nb as *mut NET_BUFFER;
+    state(|s| {
+        s.classify_result = CLASSIFY_SPLIT;
+        s.split_results = vec![0, -1, -1];
+    });
+    unsafe {
+        packet::set_next_nb(first, second);
+        packet::set_next_nb(second, third);
+        start(&mut *a);
+        send((&mut *a as *mut Adapter).cast(), &mut *local.nbl, 0, 0);
+        assert_eq!(a.active, 3); // parent plus two outstanding transit children
+        state(|s| {
+            assert_eq!(s.split_seen.len(), 3);
+            assert_ne!(s.split_seen[0], first as usize);
+            assert_ne!(s.split_seen[1], second as usize);
+            assert_ne!(s.split_seen[2], third as usize);
+            assert_eq!(packet::next_nb(first), second);
+            assert_eq!(packet::next_nb(second), third);
+            assert_eq!(s.pending.len(), 2);
+            assert_eq!(
+                s.events
+                    .iter()
+                    .filter(|e| matches!(e, Event::Send(_, _)))
+                    .count(),
+                1
+            );
+            assert!(
+                !s.events
+                    .iter()
+                    .any(|e| matches!(e, Event::Complete(p, _, _) if *p == parent))
+            );
+        });
+        let blocked = state(|s| s.pending.remove(0));
+        fwx_finish(blocked, 1);
+        state(|s| {
+            assert!(
+                !s.events
+                    .iter()
+                    .any(|e| matches!(e, Event::Complete(p, _, _) if *p == parent))
+            )
+        });
+        let allowed = state(|s| s.pending.remove(0));
+        fwx_finish(allowed, 0);
+        assert_eq!(a.active, 0);
+        assert_eq!(packet::first_nb(&mut *local.nbl), first);
+        assert_eq!(packet::next_nb(first), second);
+        assert_eq!(packet::next_nb(second), third);
+        assert!(packet::next_nb(third).is_null());
+        stop(&mut *a);
+    }
+    state(|s| {
+        assert_eq!(
+            s.events
+                .iter()
+                .filter(|e| matches!(e, Event::Send(_, _)))
+                .count(),
+            2
+        );
+        assert_eq!(s.events.iter().filter(|e| matches!(e, Event::Complete(p, status, _) if *p == parent && *status == FWX_WDK_NDIS_SUCCESS as NDIS_STATUS)).count(), 1);
+    });
+}
+
+#[test]
+fn mixed_send_aggregates_lower_completion_flags() {
+    let f = Fixture::new();
+    let mut a = f.adapter();
+    let mut local = Source::new();
+    let mut transit = Source::new();
+    let parent = (&mut *local.nbl as *mut NET_BUFFER_LIST) as usize;
+    state(|s| {
+        s.classify_result = CLASSIFY_SPLIT;
+        s.split_results = vec![0, -1];
+        s.send_complete_extra_flags =
+            NDIS_SEND_COMPLETE_FLAGS_SINGLE_QUEUE | NDIS_SEND_COMPLETE_FLAGS_SWITCH_SINGLE_SOURCE;
+    });
+    unsafe {
+        packet::set_next_nb(&mut *local._nb, &mut *transit._nb);
+        start(&mut *a);
+        send((&mut *a as *mut Adapter).cast(), &mut *local.nbl, 0, 0);
+        state(|s| s.send_complete_extra_flags = NDIS_SEND_COMPLETE_FLAGS_SINGLE_QUEUE);
+        let child = state(|s| s.pending.remove(0));
+        fwx_finish(child, 0);
+        assert_eq!(a.active, 0);
+        stop(&mut *a);
+    }
+    state(|s| {
+        assert_eq!(s.events.iter().filter(|e| matches!(e,
+            Event::Complete(p, _, flags) if *p == parent && *flags == NDIS_SEND_COMPLETE_FLAGS_SINGLE_QUEUE
+        )).count(), 1);
+    });
+}
+
+#[test]
+fn mixed_send_early_verdict_and_inline_completion_keep_parent_alive() {
+    let f = Fixture::new();
+    let mut a = f.adapter();
+    let mut local1 = Source::new();
+    let mut transit = Source::new();
+    let mut local2 = Source::new();
+    let parent = (&mut *local1.nbl as *mut NET_BUFFER_LIST) as usize;
+    let first = &mut *local1._nb as *mut NET_BUFFER;
+    let second = &mut *transit._nb as *mut NET_BUFFER;
+    let third = &mut *local2._nb as *mut NET_BUFFER;
+    state(|s| {
+        s.classify_result = CLASSIFY_SPLIT;
+        s.split_results = vec![0, -1, 0];
+        s.split_early_finish = Some(1);
+    });
+    unsafe {
+        packet::set_next_nb(first, second);
+        packet::set_next_nb(second, third);
+        start(&mut *a);
+        send((&mut *a as *mut Adapter).cast(), &mut *local1.nbl, 0, 0);
+        assert_eq!(a.active, 0);
+        assert_eq!(packet::next_nb(first), second);
+        assert_eq!(packet::next_nb(second), third);
+        stop(&mut *a);
+    }
+    state(|s| {
+        assert!(s.pending.is_empty());
+        assert_eq!(s.split_seen.len(), 3);
+        assert_eq!(
+            s.events
+                .iter()
+                .filter(|e| matches!(e, Event::Complete(p, _, _) if *p == parent))
+                .count(),
+            1
+        );
+    });
+}
+
+#[test]
+fn mixed_send_cancellation_completes_parent_once_after_all_children() {
+    let f = Fixture::new();
+    let mut a = f.adapter();
+    let mut local = Source::new();
+    let mut transit1 = Source::new();
+    let mut transit2 = Source::new();
+    let parent = (&mut *local.nbl as *mut NET_BUFFER_LIST) as usize;
+    let first = &mut *local._nb as *mut NET_BUFFER;
+    let second = &mut *transit1._nb as *mut NET_BUFFER;
+    let third = &mut *transit2._nb as *mut NET_BUFFER;
+    let cancel = 0x1234usize;
+    local.nbl.NetBufferListInfo[NetBufferListCancelId as usize] = cancel as PVOID;
+    state(|s| {
+        s.classify_result = CLASSIFY_SPLIT;
+        s.split_results = vec![0, -1, -1];
+    });
+    unsafe {
+        packet::set_next_nb(first, second);
+        packet::set_next_nb(second, third);
+        start(&mut *a);
+        send((&mut *a as *mut Adapter).cast(), &mut *local.nbl, 0, 0);
+        cancel_send((&mut *a as *mut Adapter).cast(), cancel as PVOID);
+        assert_eq!(a.active, 0);
+        assert_eq!(packet::next_nb(first), second);
+        assert_eq!(packet::next_nb(second), third);
+        stop(&mut *a);
+    }
+    state(|s| {
+        assert!(s.pending.is_empty());
+        assert_eq!(s.events.iter().filter(|e| matches!(e, Event::Complete(p, status, _) if *p == parent && *status == FWX_WDK_NDIS_SEND_ABORTED as NDIS_STATUS)).count(), 1);
+    });
+}
+
+#[test]
+fn mixed_send_with_opaque_metadata_drops_without_detaching_original() {
+    let f = Fixture::new();
+    let mut a = f.adapter();
+    let mut local = Source::new();
+    let mut transit = Source::new();
+    let parent = (&mut *local.nbl as *mut NET_BUFFER_LIST) as usize;
+    let first = &mut *local._nb as *mut NET_BUFFER;
+    let second = &mut *transit._nb as *mut NET_BUFFER;
+    local.nbl.NetBufferListInfo[MediaSpecificInformation as usize] = 1usize as PVOID;
+    state(|s| s.classify_result = CLASSIFY_SPLIT);
+    unsafe {
+        packet::set_next_nb(first, second);
+        start(&mut *a);
+        send((&mut *a as *mut Adapter).cast(), &mut *local.nbl, 0, 0);
+        assert_eq!(a.active, 0);
+        assert_eq!(packet::next_nb(first), second);
+        stop(&mut *a);
+    }
+    state(|s| {
+        assert_eq!(s.resource_drops, 1);
+        assert!(s.split_seen.is_empty());
+        assert!(!s.events.iter().any(|e| matches!(e, Event::Send(_, _))));
+        assert_eq!(
+            s.events
+                .iter()
+                .filter(|e| matches!(e, Event::Complete(p, _, _) if *p == parent))
+                .count(),
+            1
+        );
+    });
+}
+
+#[test]
+fn mixed_send_pause_drains_unprocessed_children_and_completes_once() {
+    let f = Fixture::new();
+    let mut a = f.adapter();
+    let mut local = Source::new();
+    let mut transit = Source::new();
+    let parent = (&mut *local.nbl as *mut NET_BUFFER_LIST) as usize;
+    let first = &mut *local._nb as *mut NET_BUFFER;
+    let second = &mut *transit._nb as *mut NET_BUFFER;
+    state(|s| {
+        s.classify_result = CLASSIFY_SPLIT;
+        s.split_results = vec![0, -1];
+        s.pause_after_forward = true;
+    });
+    unsafe {
+        packet::set_next_nb(first, second);
+        start(&mut *a);
+        send((&mut *a as *mut Adapter).cast(), &mut *local.nbl, 0, 0);
+        assert_eq!(a.running, 0);
+        assert_eq!(a.active, 0);
+        assert_eq!(packet::next_nb(first), second);
+    }
+    state(|s| {
+        assert_eq!(s.paused_drops, 1);
+        assert!(s.pending.is_empty());
+        assert_eq!(
+            s.events
+                .iter()
+                .filter(|e| matches!(e, Event::PauseComplete))
+                .count(),
+            1
+        );
+        assert_eq!(
+            s.events
+                .iter()
+                .filter(|e| matches!(e, Event::Complete(p, _, _) if *p == parent))
+                .count(),
+            1
+        );
+    });
+}
+
+#[test]
+fn mixed_receive_returns_original_only_after_all_children_finish() {
+    let f = Fixture::new();
+    let mut a = f.adapter();
+    let mut local = Source::new();
+    let mut transit = Source::new();
+    let parent = (&mut *local.nbl as *mut NET_BUFFER_LIST) as usize;
+    let first = &mut *local._nb as *mut NET_BUFFER;
+    let second = &mut *transit._nb as *mut NET_BUFFER;
+    state(|s| {
+        s.classify_result = CLASSIFY_SPLIT;
+        s.split_results = vec![0, -1];
+        s.receive_return_extra_flags =
+            NDIS_RETURN_FLAGS_SINGLE_QUEUE | NDIS_RETURN_FLAGS_SWITCH_SINGLE_SOURCE;
+    });
+    unsafe {
+        packet::set_next_nb(first, second);
+        start(&mut *a);
+        receive((&mut *a as *mut Adapter).cast(), &mut *local.nbl, 0, 1, 0);
+        state(|s| {
+            assert_eq!(s.pending.len(), 1);
+            assert!(
+                !s.events
+                    .iter()
+                    .any(|e| matches!(e, Event::Return(p, _) if *p == parent))
+            );
+            s.receive_return_extra_flags = NDIS_RETURN_FLAGS_SINGLE_QUEUE;
+        });
+        let child = state(|s| s.pending.remove(0));
+        fwx_finish(child, 0);
+        assert_eq!(a.active, 0);
+        assert_eq!(packet::next_nb(first), second);
+        stop(&mut *a);
+    }
+    state(|s| {
+        assert_eq!(
+            s.events
+                .iter()
+                .filter(|e| matches!(e, Event::Indicate(_, _)))
+                .count(),
+            2
+        );
+        assert_eq!(s.events.iter().filter(|e| matches!(e, Event::Return(p, flags) if *p == parent && *flags == NDIS_RETURN_FLAGS_SINGLE_QUEUE)).count(), 1);
+    });
+}
+
+#[test]
+fn mixed_resources_receive_keeps_original_untouched_until_transit_finishes() {
+    let f = Fixture::new();
+    let mut a = f.adapter();
+    let mut local = Source::new();
+    let mut transit = Source::new();
+    let first = &mut *local._nb as *mut NET_BUFFER;
+    let second = &mut *transit._nb as *mut NET_BUFFER;
+    state(|s| {
+        s.classify_result = CLASSIFY_SPLIT;
+        s.split_results = vec![0, -1];
+    });
+    unsafe {
+        packet::set_next_nb(first, second);
+        start(&mut *a);
+        receive(
+            (&mut *a as *mut Adapter).cast(),
+            &mut *local.nbl,
+            0,
+            1,
+            NDIS_RECEIVE_FLAGS_RESOURCES,
+        );
+        assert_eq!(packet::next_nb(first), second);
+        assert!(local.nbl.Context.is_null());
+        state(|s| {
+            assert_eq!(s.pending.len(), 1);
+            assert_eq!(
+                s.events
+                    .iter()
+                    .filter(|e| matches!(e, Event::Indicate(_, _)))
+                    .count(),
+                1
+            );
+            assert!(!s.events.iter().any(|e| matches!(e, Event::Return(_, _))));
+        });
+        let child = state(|s| s.pending.remove(0));
+        fwx_finish(child, 1);
+        assert_eq!(a.active, 0);
+        assert_eq!(packet::next_nb(first), second);
+        stop(&mut *a);
+    }
 }
 
 #[test]

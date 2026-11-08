@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(firewallx_monitor LANGUAGES CXX)
+project(ndis_monitor LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "FirewallXNdisFilter monitor targets Windows only.")
@@ -38,19 +38,19 @@ else()
     target_compile_options(pmkext PRIVATE -Wall -Wextra)
 endif()
 
-add_executable(firewallx_monitor src/main.cpp)
-target_link_libraries(firewallx_monitor PRIVATE pmkext advapi32)
+add_executable(ndis_monitor src/main.cpp)
+target_link_libraries(ndis_monitor PRIVATE pmkext advapi32)
 if(MSVC)
-    target_compile_options(firewallx_monitor PRIVATE /W4 /permissive- /utf-8)
+    target_compile_options(ndis_monitor PRIVATE /W4 /permissive- /utf-8)
     # Help/invalid-CLI tests must run without elevation or device access. Actual
     # device sessions still require an elevated token because of the driver ACL.
-    target_link_options(firewallx_monitor PRIVATE
+    target_link_options(ndis_monitor PRIVATE
         /ENTRY:wmainCRTStartup
         "/MANIFESTUAC:level='asInvoker' uiAccess='false'"
     )
 else()
-    target_compile_options(firewallx_monitor PRIVATE -Wall -Wextra)
-    target_link_options(firewallx_monitor PRIVATE -municode)
+    target_compile_options(ndis_monitor PRIVATE -Wall -Wextra)
+    target_link_options(ndis_monitor PRIVATE -municode)
 endif()
 
 # NetCfg loads this user-mode COM object during explicit installation/binding.
@@ -166,11 +166,11 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME notify_object_tests COMMAND notify_object_tests $<TARGET_FILE:firewallx_ndis_filter_notify>)
     set_tests_properties(notify_object_tests PROPERTIES TIMEOUT 15 LABELS "no-driver")
-    add_test(NAME monitor_help COMMAND firewallx_monitor --help)
+    add_test(NAME monitor_help COMMAND ndis_monitor --help)
     set_tests_properties(monitor_help PROPERTIES TIMEOUT 10 LABELS "no-driver"
                         PASS_REGULAR_EXPRESSION "positive seconds")
     add_test(NAME monitor_cli_tests
-        COMMAND "${CMAKE_COMMAND}" "-DMONITOR=$<TARGET_FILE:firewallx_monitor>"
+        COMMAND "${CMAKE_COMMAND}" "-DMONITOR=$<TARGET_FILE:ndis_monitor>"
                 "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/monitor_cli_tests.cmake")
     set_tests_properties(monitor_cli_tests PROPERTIES TIMEOUT 40 LABELS "no-driver")

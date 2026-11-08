@@ -13,7 +13,7 @@ namespace {
 
 bool Parse(std::initializer_list<const wchar_t*> args, pmkext::monitor::Options& options,
            std::string& error) {
-    std::vector<const wchar_t*> argv{L"firewallx_monitor.exe"};
+    std::vector<const wchar_t*> argv{L"ndis_monitor.exe"};
     argv.insert(argv.end(), args.begin(), args.end());
     return pmkext::monitor::ParseOptions(static_cast<int>(argv.size()), argv.data(), options, error);
 }

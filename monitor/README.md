@@ -22,9 +22,9 @@ cmake --build C:\hyperv\monitor\build --config Release --parallel
 ctest --test-dir C:\hyperv\monitor\build -C Release --output-on-failure -L no-driver
 ```
 
-For Visual Studio 2022 use `-G "Visual Studio 17 2022"`. Alternatively configure with Ninja from an x64 VS developer shell and add `-DCMAKE_BUILD_TYPE=Release`; the executable then appears directly in the build directory. A parent build can configure this CMake project without building a driver. Targets include `firewallx_monitor`, `pmkext`, and `firewallx_ndis_filter_notify` (the separate NetCfg binding-policy DLL, built but never registered by CMake).
+For Visual Studio 2022 use `-G "Visual Studio 17 2022"`. Alternatively configure with Ninja from an x64 VS developer shell and add `-DCMAKE_BUILD_TYPE=Release`; the executable then appears directly in the build directory. A parent build can configure this CMake project without building a driver. Targets include `ndis_monitor`, `pmkext`, and `firewallx_ndis_filter_notify` (the separate NetCfg binding-policy DLL, built but never registered by CMake).
 
-With the VS generator the executable is `build\Release\firewallx_monitor.exe`. It deliberately uses an **as-invoker** manifest so `--help` and invalid-CLI tests need neither elevation nor a device. Actual device access still requires elevated Administrator/SYSTEM because of the driver's device ACL.
+With the VS generator the executable is `build\Release\ndis_monitor.exe`. It deliberately uses an **as-invoker** manifest so `--help` and invalid-CLI tests need neither elevation nor a device. Actual device access still requires elevated Administrator/SYSTEM because of the driver's device ACL.
 
 All MSVC targets, including static libraries, standalone header-client examples, setup tools and offline tests, compile with `/Zi`; EXE/DLL links use `/DEBUG:FULL` and `/PDBALTPATH:%_PDB%`. Release optimizations are preserved. Linker PDBs go to the build root (the configuration subdirectory with the VS generator), and the main package build copies the product PDBs to `dist/` alongside their binaries.
 
@@ -50,15 +50,15 @@ A positive `--duration N` limits the monitoring phase. Zero/negative/junk durati
 
 ```powershell
 # Help only: no device access.
-.\build\Release\firewallx_monitor.exe --help
+.\build\Release\ndis_monitor.exe --help
 
 # Runtime examples only; require an explicitly installed/bound LWF,
 # elevation, and separate permission to run against live host-vNIC traffic.
-.\build\Release\firewallx_monitor.exe  # Interactive: wait for startup, then Ctrl+C exits.
-.\build\Release\firewallx_monitor.exe --duration 10 --only-logs
-.\build\Release\firewallx_monitor.exe --duration 30 --out run.log --timestamps --payload
-.\build\Release\firewallx_monitor.exe --duration 30 --filter-protocol 17
-.\build\Release\firewallx_monitor.exe --duration 30 --verdict block --match 192.0.2.10:53
+.\build\Release\ndis_monitor.exe  # Interactive: wait for startup, then Ctrl+C exits.
+.\build\Release\ndis_monitor.exe --duration 10 --only-logs
+.\build\Release\ndis_monitor.exe --duration 30 --out run.log --timestamps --payload
+.\build\Release\ndis_monitor.exe --duration 30 --filter-protocol 17
+.\build\Release\ndis_monitor.exe --duration 30 --verdict block --match 192.0.2.10:53
 ```
 
 Supported options include `--out`, `--filter-ip IP[:PORT]` (`[IPv6]:PORT` for IPv6), `--filter-protocol`, `--match`, `--verdict`, `--no-verdicts`, `--payload`, `--poll`, `--timestamps`, `--memory-stats` and `--verdict-delay-ms`. `--only-logs`, `--no-conn` and `--no-bandwidth` are retained. Numeric values and ports are validated without truncation or wrapping. Display filters combine with AND, never change verdicts, and IP/port pairs must match the same endpoint. `--match` selects the normalized `remote` endpoint reported by the driver in both directions on every interface; the console does not reverse direction, endpoints or bandwidth counters based on interface roles.

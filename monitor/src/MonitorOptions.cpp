@@ -201,8 +201,8 @@ bool AlternateMatches(const Options& opt, const Connection& c) {
 
 void PrintUsage(FILE* out) {
     std::fprintf(out,
-        "Usage: firewallx_monitor.exe [--duration SECONDS] [options]\n"
-        "       firewallx_monitor.exe --help\n\n"
+        "Usage: ndis_monitor.exe [--duration SECONDS] [options]\n"
+        "       ndis_monitor.exe --help\n\n"
         "Opens \\\\.\\FirewallXNdisFilter; fails if the device is absent.\n"
         "Requires elevated admin/SYSTEM; no driver loading or installation.\n\n"
         "Collection:\n"
@@ -243,7 +243,8 @@ void PrintUsage(FILE* out) {
         "  These values and bandwidth TX/RX are presented unchanged for every interface.\n"
         "  Connection events carry no process/thread identity.\n"
         "  payload_layer=3 is the complete logical IP packet (up to 1 MiB, no truncation).\n"
-        "  Mixed local/transit IP batches bypass policy with a warning; invalid/unsupported batches drop.\n"
+        "  Mixed local/transit NBLs warn and split: local packets bypass policy;\n"
+        "  transit packets receive independent decisions without cache. Unsupported batches drop.\n"
         "  Bandwidth records group one host interface/protocol/address family; index is the NDIS base.\n"
         "  Raw NDIS tx/rx correspond to host receive/send; no PID.\n"
         "  Without a controller, eligible transit IP traffic is dropped by default.\n"
@@ -252,11 +253,11 @@ void PrintUsage(FILE* out) {
         "  Block/drop for all events can interrupt transit traffic and connectivity.\n"
         "  Positional .sys paths and PID-suspension options are rejected.\n\n"
         "Examples:\n"
-        "  firewallx_monitor.exe\n"
-        "  firewallx_monitor.exe --duration 10 --only-logs\n"
-        "  firewallx_monitor.exe --duration 30 --out run.log --timestamps --payload\n"
-        "  firewallx_monitor.exe --duration 30 --filter-protocol 17\n"
-        "  firewallx_monitor.exe --duration 30 --verdict block --match 192.0.2.10:53\n");
+        "  ndis_monitor.exe\n"
+        "  ndis_monitor.exe --duration 10 --only-logs\n"
+        "  ndis_monitor.exe --duration 30 --out run.log --timestamps --payload\n"
+        "  ndis_monitor.exe --duration 30 --filter-protocol 17\n"
+        "  ndis_monitor.exe --duration 30 --verdict block --match 192.0.2.10:53\n");
 }
 
 } // namespace pmkext::monitor

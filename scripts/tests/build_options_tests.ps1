@@ -70,7 +70,8 @@ try {
     New-Item -ItemType Directory -Path $fixtureDir | Out-Null
     try {
         Assert-NoLegacyPackageFiles $fixtureDir
-        foreach ($name in @('HyperVXNdisFilter.inf', 'HyperVGuard.sys', 'hyperv_monitor.exe')) {
+        foreach ($name in @('HyperVXNdisFilter.inf', 'HyperVGuard.sys', 'hyperv_monitor.exe',
+                            'firewallx_monitor.exe', 'firewallx_monitor.pdb')) {
             $fixture = Join-Path $fixtureDir $name
             Set-Content -LiteralPath $fixture -Value 'legacy fixture'
             $rejected = $false
@@ -83,7 +84,9 @@ try {
             ++$script:passed
             Write-Host "PASS preserves and rejects legacy artifact $name"
         }
-        Set-Content -LiteralPath (Join-Path $fixtureDir 'FirewallXNdisFilter.inf') -Value 'current fixture'
+        foreach ($name in @('FirewallXNdisFilter.inf', 'ndis_monitor.exe', 'ndis_monitor.pdb')) {
+            Set-Content -LiteralPath (Join-Path $fixtureDir $name) -Value 'current fixture'
+        }
         Assert-NoLegacyPackageFiles $fixtureDir
         ++$script:passed
         Write-Host 'PASS accepts current product artifacts'

@@ -228,8 +228,10 @@ public:
         process.dwSize = sizeof(process);
         if (!Process32FirstW(snapshot.get(), &process)) throw Error{L"Read process list: " + ErrorCode(GetLastError())};
         do {
-            if (_wcsicmp(process.szExeFile, L"firewallx_monitor.exe") == 0) {
-                throw Error{L"Stop firewallx_monitor cleanly before changing the network component. No process will be terminated."};
+            // The previous monitor name can still own the same driver session.
+            if (_wcsicmp(process.szExeFile, L"ndis_monitor.exe") == 0 ||
+                _wcsicmp(process.szExeFile, L"firewallx_monitor.exe") == 0) {
+                throw Error{L"Stop the running monitor cleanly before changing the network component. No process will be terminated."};
             }
         } while (Process32NextW(snapshot.get(), &process));
         if (GetLastError() != ERROR_NO_MORE_FILES) throw Error{L"Read process list: " + ErrorCode(GetLastError())};

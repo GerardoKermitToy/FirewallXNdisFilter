@@ -1,6 +1,10 @@
 if(NOT DEFINED MONITOR OR NOT DEFINED TEST_DIR)
     message(FATAL_ERROR "MONITOR and TEST_DIR are required")
 endif()
+get_filename_component(monitor_filename "${MONITOR}" NAME)
+if(NOT monitor_filename STREQUAL "ndis_monitor.exe")
+    message(FATAL_ERROR "Unexpected monitor executable name: ${monitor_filename}")
+endif()
 
 # Every executable invocation below is --help or a deliberately invalid CLI.
 # There is no valid-duration-only invocation and no device/SCM/driver test.
@@ -60,7 +64,8 @@ endif()
 execute_process(COMMAND "${MONITOR}" --help
     RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE errors TIMEOUT 5
     WORKING_DIRECTORY "${TEST_DIR}")
-if(NOT result STREQUAL "0" OR NOT output MATCHES "direction=0 host receive, 1 host send" OR
+if(NOT result STREQUAL "0" OR NOT output MATCHES "Usage: ndis_monitor[.]exe" OR
+   NOT output MATCHES "direction=0 host receive, 1 host send" OR
    NOT output MATCHES "local=source on receive" OR
    NOT output MATCHES "destination on send" OR
    NOT output MATCHES "Redirects are NOT supported" OR
@@ -78,7 +83,9 @@ if(NOT result STREQUAL "0" OR NOT output MATCHES "direction=0 host receive, 1 ho
    NOT output MATCHES "TCP and UDP use separate caches" OR
    output MATCHES "TCP/UDP and both directions share" OR
    NOT output MATCHES "Connection events carry no process/thread identity" OR
-   NOT output MATCHES "Mixed local/transit IP batches bypass policy with a warning" OR
+   NOT output MATCHES "Mixed local/transit NBLs warn and split" OR
+   NOT output MATCHES "transit packets receive independent decisions without cache" OR
+   output MATCHES "Mixed local/transit IP batches bypass policy" OR
    output MATCHES "--filter-pid|PID=0|possibly shortened" OR
    output MATCHES "FirewallXNdisFilterPipe|Bridge:|winrpc|named-pipe" OR
    output MATCHES "Device name :|Driver version")

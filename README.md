@@ -23,7 +23,7 @@ powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/
 
 Adjust the certificate paths for your machine. Set `FIREWALLXNDISFILTER_PFX_PASSWORD` or pass `-PfxPassword` when needed. The build requests an RFC 3161 timestamp from `http://timestamp.digicert.com` by default; use `-TimestampUrl` for another service. Only the timestamp hash is sent; the private key stays local. Signing does not by itself guarantee that Windows will accept the driver: review the target system's signing and security requirements independently. The build does not install the driver or change certificate stores or security settings.
 
-The package in `dist/` contains `FirewallXNdisFilter.sys`, its INF and CAT, `FirewallXNdisFilterNotify.dll`, `firewallx_monitor.exe`, `Install.exe`, `Uninstall.exe`, and matching full PDBs. Keep these files together and do not mix package versions. If `dist/` contains artifacts from a previous product name, the build refuses to overwrite or mix them; preserve and move the old package before rebuilding.
+The package in `dist/` contains `FirewallXNdisFilter.sys`, its INF and CAT, `FirewallXNdisFilterNotify.dll`, `ndis_monitor.exe`, `Install.exe`, `Uninstall.exe`, and matching full PDBs. Keep these files together and do not mix package versions. If `dist/` contains artifacts from a previous product or monitor name, the build refuses to overwrite or mix them; preserve and move the old package before rebuilding.
 
 ## Install
 
@@ -48,16 +48,16 @@ The previous `Set-Binding.ps1` ICS-only helper is retired and does not change bi
 Start with the default PermanentAccept policy:
 
 ```bash
-./dist/firewallx_monitor.exe --duration 15 --timestamps --memory-stats --out allow.log
+./dist/ndis_monitor.exe --duration 15 --timestamps --memory-stats --out allow.log
 ```
 
 Omit `--duration` to run until **Ctrl+C**. To apply a blocking verdict only to a test remote endpoint:
 
 ```bash
-./dist/firewallx_monitor.exe --duration 10 --match 192.0.2.10:9000 --verdict permanent-block --out block.log
+./dist/ndis_monitor.exe --duration 10 --match 192.0.2.10:9000 --verdict permanent-block --out block.log
 ```
 
-`--match` selects the remote endpoint reported by the driver in both directions; unmatched events receive PermanentAccept. `--filter-ip` only hides output and does not limit verdicts. A blocking verdict without `--match` applies to every event and can disrupt connectivity. Run `./dist/firewallx_monitor.exe --help` for the remaining options.
+`--match` selects the remote endpoint reported by the driver in both directions; unmatched events receive PermanentAccept. `--filter-ip` only hides output and does not limit verdicts. A blocking verdict without `--match` applies to every event and can disrupt connectivity. Run `./dist/ndis_monitor.exe --help` for the remaining options.
 
 The monitor opens the existing control device; it does not install, load, bind, or start a temporary driver. Install and start the NDIS LWF before running it. `--duration` bounds monitoring, not driver installation or startup.
 

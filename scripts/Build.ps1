@@ -14,9 +14,10 @@ function Assert-NoLegacyPackageFiles([string]$Directory) {
     foreach ($name in @('HyperVXNdisFilter.inf', 'HyperVXNdisFilter.cat', 'HyperVXNdisFilter.sys',
                          'HyperVXNdisFilter.pdb', 'HyperVXNdisFilterNotify.dll', 'HyperVXNdisFilterNotify.pdb',
                          'HyperVGuard.inf', 'HyperVGuard.cat', 'HyperVGuard.sys', 'HyperVGuard.pdb',
-                         'HyperVGuardNotify.dll', 'HyperVGuardNotify.pdb', 'hyperv_monitor.exe', 'hyperv_monitor.pdb')) {
+                         'HyperVGuardNotify.dll', 'HyperVGuardNotify.pdb', 'hyperv_monitor.exe', 'hyperv_monitor.pdb',
+                         'firewallx_monitor.exe', 'firewallx_monitor.pdb')) {
         if (Test-Path -LiteralPath (Join-Path $Directory $name)) {
-            throw "Previous product artifact '$name' is present in $Directory. Preserve and move the old package before rebuilding; no files were removed."
+            throw "Previous package artifact '$name' is present in $Directory. Preserve and move the old package before rebuilding; no files were removed."
         }
     }
 }
@@ -75,7 +76,7 @@ try {
         Copy-Item (Join-Path "$build\monitor" $file) $dist -Force
     }
     if (!$SkipMonitor) {
-        foreach ($file in @('firewallx_monitor.exe', 'firewallx_monitor.pdb')) {
+        foreach ($file in @('ndis_monitor.exe', 'ndis_monitor.pdb')) {
             Copy-Item (Join-Path "$build\monitor" $file) $dist -Force
         }
         if ($Test) {
@@ -93,7 +94,7 @@ try {
         if ($RootCertificate) { $signArgs += @('/ac', (Resolve-Path -LiteralPath $RootCertificate).Path) }
     } elseif ($CertificateThumbprint) { $signArgs += @('/sha1', $CertificateThumbprint) }
     $signedFiles = @('FirewallXNdisFilter.sys', 'FirewallXNdisFilterNotify.dll', 'Install.exe', 'Uninstall.exe')
-    if (!$SkipMonitor) { $signedFiles += 'firewallx_monitor.exe' }
+    if (!$SkipMonitor) { $signedFiles += 'ndis_monitor.exe' }
     if ($sign) {
         # Timestamp requests send a hash to the selected RFC 3161 service. The
         # PFX remains local; no key copy, certificate import or security change.

@@ -75,7 +75,7 @@ public:
             owned_ = true;
             return true;
         }
-        error = wait == WAIT_TIMEOUT ? "another firewallx_monitor instance is already running"
+        error = wait == WAIT_TIMEOUT ? "another ndis_monitor instance is already running"
                                      : "singleton wait failed: error " + std::to_string(GetLastError());
         return false;
     }

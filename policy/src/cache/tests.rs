@@ -70,6 +70,41 @@ fn failed_checked_size_is_not_retried_as_a_stale_plan() {
 }
 
 #[test]
+fn growth_planning_preserves_existing_and_new_keys_across_migration() {
+    for ipv6 in [false, true] {
+        for protocol in [6, 17] {
+            let mut caches = caches();
+            let key = |n| {
+                let mut c = connection(ipv6, n);
+                c.protocol = protocol;
+                c
+            };
+            assert_eq!(caches.plan(&key(0)).unwrap().capacity, INITIAL_CAPACITY);
+            for n in 0..(INITIAL_CAPACITY / 4 * 3) as u32 {
+                assert!(insert(&mut caches, &key(n), true, 60000));
+            }
+            let existing = key(0);
+            let new = key(1000);
+            assert!(caches.plan(&existing).is_none());
+            assert_eq!(caches.plan(&new).unwrap().capacity, INITIAL_CAPACITY * 2);
+
+            assert!(insert(&mut caches, &new, false, 60000));
+            let previous_capacity = if ipv6 {
+                caches.ipv6[usize::from(protocol == 17)].previous.capacity
+            } else {
+                caches.ipv4[usize::from(protocol == 17)].previous.capacity
+            };
+            assert_ne!(previous_capacity, 0);
+            assert!(caches.plan(&existing).is_none());
+            assert!(caches.plan(&new).is_none());
+            assert!(caches.plan(&key(1001)).is_none());
+            assert_eq!(caches.get(&existing, 1), Some(true));
+            assert_eq!(caches.get(&new, 1), Some(false));
+        }
+    }
+}
+
+#[test]
 fn separate_tables_grow_past_1024_without_evicting_live_entries() {
     let mut caches = caches();
     for n in 0..8192 {

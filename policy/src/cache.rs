@@ -585,8 +585,10 @@ impl Caches {
     }
     pub(crate) fn plan(&self, c: &Connection) -> Option<CachePlan> {
         let protocol = Self::transport(c.protocol)?;
+        // No allocation means there is no reason to hash or probe the tuple.
         if unlikely(c.ipv6) {
             let cache = &self.ipv6[protocol];
+            let plan = cache.plan(self.allocator)?;
             let tuple = Tuple::from_connection(c);
             let hash = tuple.hash();
             if cache.current.find(&tuple, hash).is_some()
@@ -594,10 +596,11 @@ impl Caches {
             {
                 None
             } else {
-                cache.plan(self.allocator)
+                Some(plan)
             }
         } else {
             let cache = &self.ipv4[protocol];
+            let plan = cache.plan(self.allocator)?;
             let tuple = Tuple::from_connection(c);
             let hash = tuple.hash();
             if cache.current.find(&tuple, hash).is_some()
@@ -605,7 +608,7 @@ impl Caches {
             {
                 None
             } else {
-                cache.plan(self.allocator)
+                Some(plan)
             }
         }
     }

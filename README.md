@@ -91,7 +91,7 @@ For a complete header-only example, see [callback_client.cpp](monitor/examples/c
 - A single packet traversing more than one attached adapter can produce separate verdicts and bandwidth counts at each observation point. A successful verdict write is not delivery confirmation.
 - NDIS supports UDP receive coalescing and recognizes UDP segmentation offload; these logical packets are not cacheable.
 
-Connection payloads are bounded at **1 MiB (1048576 bytes)**, covering ordinary IPv4/IPv6 packets and supported larger offload packets. Larger logical packets are dropped rather than reported with truncated payloads. Packet records, metadata, queues, NBL contexts and private receive copies have no driver-defined aggregate byte budget or item quota. Exhaustion of the driver's nonpaged pool can bugcheck the machine; clients must retrieve records promptly. While a controller is online, malformed or unsupported packets, copy/resource failures, failed sends, paused interfaces and verdict timeouts produce warning LogLine records when the log can be queued; normal blocking verdicts do not. Warnings are not retained while no controller is connected, and queue/allocation failure can prevent a warning. `--filter-pid` is unsupported.
+Connection payloads are bounded at **1 MiB (1048576 bytes)**, covering ordinary IPv4/IPv6 packets and supported larger offload packets. Larger logical packets are dropped rather than reported with truncated payloads. Apart from the LogLine limit below, packet records, metadata, queues, NBL contexts and private receive copies have no driver-defined aggregate byte budget or item quota. Exhaustion of the driver's nonpaged pool can bugcheck the machine; clients must retrieve records promptly. While a controller is online, malformed or unsupported packets, copy/resource failures, failed sends and paused interfaces produce warning LogLine records when the log can be queued; verdict timeouts and normal blocking verdicts do not. Up to **1000 queued LogLine records**, of any severity and including a partially read record, are retained; each new LogLine replaces the oldest completely unread LogLine when the limit is reached. A partially read record is always completed to preserve stream framing. Connection events and bandwidth reports are not subject to this limit. LogLine records are not retained while no controller is connected, and queue/allocation failure can prevent a log record. `--filter-pid` is unsupported.
 
 This is experimental kernel code. Offline tests and an enabled binding do not prove correct live filtering.
 
@@ -286,7 +286,7 @@ Within each table, the key is the full normalized `local_ip, local_port, remote_
 
 Expired entries stop matching immediately. While caches are nonempty, the driver automatically requests a full expiry sweep every 10 seconds; the monitor does not need to request cleanup.
 
-Pending decisions, event queues, bandwidth storage, and receive-copy data have no fixed item-count or aggregate byte quota. Nonpaged-pool exhaustion can bugcheck the machine. Bandwidth counters use saturating 64-bit arithmetic.
+Except for the 1000 queued-LogLine limit described above, pending decisions, event queues, bandwidth storage, and receive-copy data have no fixed item-count or aggregate byte quota. Nonpaged-pool exhaustion can bugcheck the machine. Bandwidth counters use saturating 64-bit arithmetic.
 
 `PrintMemoryStats` queues an Info `LogLine` containing only counts of elements in the policy engine's collections:
 

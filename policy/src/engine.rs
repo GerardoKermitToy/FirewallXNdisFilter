@@ -18,6 +18,7 @@ pub use crate::bandwidth::{BandwidthPlan, BandwidthWork, DeferredBandwidth};
 
 const LOG_INFO: u8 = 3;
 const LOG_WARNING: u8 = 4;
+const MAX_QUEUED_LOGS: usize = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Finish {
@@ -65,6 +66,8 @@ struct Pending {
 struct Event {
     read: usize,
     pending: Option<Handle<Pending>>,
+    log_next: Option<Handle<Event>>,
+    log: bool,
     data: Vec<u8>,
 }
 
@@ -361,6 +364,9 @@ pub struct Engine {
     cache_candidate_count: usize,
     cache_allocator: CacheAllocator,
     events: List<Event>,
+    log_head: Option<Handle<Event>>,
+    log_tail: Option<Handle<Event>>,
+    log_count: usize,
     retired_events: List<Event>,
     bandwidth: BandwidthStore,
     retry_bandwidth: BandwidthStore,
@@ -392,6 +398,9 @@ impl Engine {
             cache_candidate_count: 0,
             cache_allocator: allocator,
             events: List::new(),
+            log_head: None,
+            log_tail: None,
+            log_count: 0,
             retired_events: List::new(),
             bandwidth: BandwidthStore::new(),
             retry_bandwidth: BandwidthStore::new(),
@@ -460,6 +469,9 @@ impl Engine {
                 }
             }
         }
+        self.log_head = None;
+        self.log_tail = None;
+        self.log_count = 0;
         self.retired_events.append(&mut self.events);
         self.queued_bytes = 0;
     }
@@ -484,6 +496,7 @@ impl Engine {
         &mut self,
         data: Vec<u8>,
         pending: Option<Handle<Pending>>,
+        log: bool,
     ) -> Option<Handle<Event>> {
         let queued_bytes = self.queued_bytes.checked_add(data.len())?;
         let handle = self
@@ -491,15 +504,65 @@ impl Engine {
             .try_push_back(Event {
                 read: 0,
                 pending,
+                log_next: None,
+                log,
                 data,
             })
             .ok()?;
         self.queued_bytes = queued_bytes;
+        if log {
+            if let Some(tail) = self.log_tail {
+                // SAFETY: the log index contains only live event handles.
+                unsafe { self.events.get_mut(tail) }.log_next = Some(handle);
+            } else {
+                self.log_head = Some(handle);
+            }
+            self.log_tail = Some(handle);
+            self.log_count += 1;
+            if self.log_count > MAX_QUEUED_LOGS {
+                self.evict_oldest_log();
+            }
+        }
         Some(handle)
+    }
+    fn evict_oldest_log(&mut self) {
+        let head = self.log_head.expect("queued log has a head");
+        // A partial frame must remain in the stream; it can only be the first
+        // event, so the next log is the oldest completely unread one.
+        let first = unsafe { self.events.get(head) };
+        let (previous, victim) = if first.read == 0 {
+            (None, head)
+        } else {
+            (
+                Some(head),
+                first.log_next.expect("overflow has another log"),
+            )
+        };
+        let next = unsafe { self.events.get(victim) }.log_next;
+        if let Some(previous) = previous {
+            unsafe { self.events.get_mut(previous) }.log_next = next;
+        } else {
+            self.log_head = next;
+        }
+        if next.is_none() {
+            self.log_tail = previous;
+        }
+        // SAFETY: victim is a live, fully unread log without a pending NBL.
+        let event = unsafe { self.events.remove(victim) };
+        debug_assert!(event.log && event.read == 0 && event.pending.is_none());
+        self.log_count -= 1;
+        self.queued_bytes -= event.data.len();
     }
     fn pop_event(&mut self) {
         if let Some(event) = self.events.pop_front() {
             self.queued_bytes -= event.data.len();
+            if event.log {
+                self.log_head = event.log_next;
+                self.log_count -= 1;
+                if self.log_count == 0 {
+                    self.log_tail = None;
+                }
+            }
             if let Some(handle) = event.pending {
                 // SAFETY: a pending node is retained until BOTH its event has
                 // left the queue and its NBL has been claimed. No event
@@ -1033,7 +1096,7 @@ impl Engine {
         }) else {
             return self.overflow(interface_index, &packet, nbl, work);
         };
-        let Some(event) = self.push_event(data, Some(handle)) else {
+        let Some(event) = self.push_event(data, Some(handle), false) else {
             // SAFETY: the event was not published, so only this new handle exists.
             unsafe { self.pending.remove(handle) };
             return self.overflow(interface_index, &packet, nbl, work);
@@ -1201,13 +1264,6 @@ impl Engine {
             self.fallback()
         } else {
             self.stats.timeouts = self.stats.timeouts.saturating_add(1);
-            self.log_args(
-                LOG_WARNING,
-                format_args!(
-                    "Packet verdict timed out: interface_index={} id={}",
-                    p.interface_index, p.id
-                ),
-            );
             self.fallback()
         };
         Some(self.claim(handle, finish, work))
@@ -1261,7 +1317,7 @@ impl Engine {
         }
         if let Some(mut data) = allocate_record(len) {
             data.copy_from_slice(&bytes[..len]);
-            let _ = self.push_event(data, None);
+            let _ = self.push_event(data, None, true);
         }
     }
     pub fn log_args(&mut self, severity: u8, message: fmt::Arguments<'_>) {
@@ -1367,6 +1423,8 @@ impl Engine {
         match self.events.try_push_back(Event {
             read: 0,
             pending: None,
+            log_next: None,
+            log: false,
             data,
         }) {
             Ok(_) => {
@@ -1658,28 +1716,188 @@ mod tests {
     }
 
     #[test]
-    fn verdict_timeout_warns_but_explicit_block_does_not() {
-        let mut e = engine();
+    fn log_overflow_preserves_other_events_and_newest_logs() {
+        let mut e = default_engine();
         e.read(&mut [0; MAX_LOG_RECORD]);
-        let timed_out = submit(&mut e, 101, 21);
-        e.read(&mut [0; MAX_LOG_RECORD]);
-        assert_eq!(e.take_due(2100).unwrap().finish, Finish::Allow);
-        let mut bytes = [0; MAX_LOG_RECORD];
-        let n = e.read(&mut bytes);
-        assert_eq!(bytes[0], 0);
-        assert_eq!(bytes[5], LOG_WARNING);
-        let text = core::str::from_utf8(&bytes[6..n]).unwrap();
-        assert!(text.contains("Packet verdict timed out"));
-        assert!(text.contains("interface_index=101"));
-        assert!(text.contains(&std::format!("id={timed_out}")));
-
-        let blocked = submit(&mut e, 101, 22);
-        e.read(&mut [0; MAX_LOG_RECORD]);
+        let id = submit(&mut e, 101, 1);
+        e.bandwidth_add(101, &packet());
+        e.bandwidth();
+        const EXTRA: usize = 137;
+        let mut other_id = None;
+        for i in 0..MAX_QUEUED_LOGS + EXTRA {
+            let severity = if i % 2 == 0 { LOG_INFO } else { LOG_WARNING };
+            e.log(severity, &std::format!("log-{i}"));
+            if i == EXTRA / 2 {
+                other_id = Some(submit(&mut e, 101, 2));
+            }
+        }
+        assert_eq!(e.log_count, MAX_QUEUED_LOGS);
+        assert_eq!(e.pending_count(), 2);
+        assert_eq!(e.events.len(), MAX_QUEUED_LOGS + 3);
         assert_eq!(
-            e.verdict(blocked, Verdict::Block, 101).unwrap().finish,
-            Finish::Drop
+            e.queued_bytes,
+            e.events.iter().map(|event| event.data.len()).sum()
         );
-        assert_eq!(e.read(&mut bytes), 0);
+
+        let mut bytes = vec![0; e.queued_bytes];
+        assert_eq!(e.read(&mut bytes), bytes.len());
+        let (mut offset, mut logs, mut connections, mut bandwidth) = (0, 0, 0, 0);
+        while offset < bytes.len() {
+            let len =
+                u32::from_le_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+            let event = &bytes[offset..offset + 5 + len];
+            match event[0] {
+                0 => {
+                    let number = logs + EXTRA;
+                    assert_eq!(
+                        event[5],
+                        if number.is_multiple_of(2) {
+                            LOG_INFO
+                        } else {
+                            LOG_WARNING
+                        }
+                    );
+                    assert_eq!(
+                        core::str::from_utf8(&event[6..]).unwrap(),
+                        std::format!("log-{number}")
+                    );
+                    logs += 1;
+                }
+                1 => connections += 1,
+                5 => bandwidth += 1,
+                other => panic!("unexpected event type {other}"),
+            }
+            offset += event.len();
+        }
+        assert_eq!((logs, connections, bandwidth), (MAX_QUEUED_LOGS, 2, 1));
+        assert_eq!(e.log_count, 0);
+        assert!(e.log_head.is_none() && e.log_tail.is_none());
+        assert_eq!(e.queued_bytes, 0);
+        assert_eq!(e.verdict(id, Verdict::Drop, 101).unwrap().nbl, 1);
+        assert_eq!(
+            e.verdict(other_id.unwrap(), Verdict::Drop, 101)
+                .unwrap()
+                .nbl,
+            2
+        );
+    }
+
+    #[test]
+    fn log_overflow_preserves_partially_read_frame() {
+        let mut e = default_engine();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        e.log(LOG_INFO, "log-0");
+        let mut prefix = [0; 3];
+        assert_eq!(e.read(&mut prefix), prefix.len());
+        for i in 1..=MAX_QUEUED_LOGS {
+            let severity = if i % 2 == 0 { LOG_INFO } else { LOG_WARNING };
+            e.log(severity, &std::format!("log-{i}"));
+        }
+        assert_eq!(e.log_count, MAX_QUEUED_LOGS);
+        let mut bytes = Vec::from(prefix);
+        let mut remaining = vec![0; e.queued_bytes - prefix.len()];
+        assert_eq!(e.read(&mut remaining), remaining.len());
+        bytes.extend_from_slice(&remaining);
+        let (mut offset, mut count) = (0usize, 0usize);
+        while offset < bytes.len() {
+            let len =
+                u32::from_le_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+            let event = &bytes[offset..offset + 5 + len];
+            let number = if count == 0 { 0 } else { count + 1 };
+            assert_eq!(event[0], 0);
+            assert_eq!(
+                event[5],
+                if number.is_multiple_of(2) {
+                    LOG_INFO
+                } else {
+                    LOG_WARNING
+                }
+            );
+            assert_eq!(
+                core::str::from_utf8(&event[6..]).unwrap(),
+                std::format!("log-{number}")
+            );
+            count += 1;
+            offset += event.len();
+        }
+        assert_eq!(count, MAX_QUEUED_LOGS);
+        assert_eq!(e.log_count, 0);
+        assert!(e.log_head.is_none() && e.log_tail.is_none());
+        assert_eq!(e.queued_bytes, 0);
+    }
+
+    #[test]
+    fn failed_log_enqueue_and_session_reset_keep_the_index_consistent() {
+        let mut e = default_engine();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        for i in 0..MAX_QUEUED_LOGS {
+            e.log(LOG_WARNING, &std::format!("warning-{i}"));
+        }
+        e.events.fail_allocations = true;
+        e.log(LOG_WARNING, "not queued");
+        assert_eq!(e.log_count, MAX_QUEUED_LOGS);
+        assert_eq!(e.events.front().unwrap().data[6..], *b"warning-0");
+        e.events.fail_allocations = false;
+        assert_eq!(e.read(&mut [0; 1]), 1);
+        e.disconnect();
+        assert_eq!(e.log_count, 0);
+        assert!(e.log_head.is_none() && e.log_tail.is_none());
+        while let Some(retired) = e.take_retired_storage() {
+            drop(retired);
+        }
+        e.connect();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        for _ in 0..=MAX_QUEUED_LOGS {
+            e.log(LOG_WARNING, "new session");
+        }
+        assert_eq!(drain_warning_logs(&mut e), MAX_QUEUED_LOGS);
+        assert_eq!(e.log_count, 0);
+        assert!(e.log_head.is_none() && e.log_tail.is_none());
+    }
+
+    #[test]
+    fn unread_timeouts_do_not_create_log_backlog() {
+        let mut e = default_engine();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        for nbl in 1..=MAX_QUEUED_LOGS + 1 {
+            submit(&mut e, 101, nbl);
+            assert_eq!(e.take_due(8100).unwrap().nbl, nbl);
+        }
+        assert_eq!(e.stats().timeouts, (MAX_QUEUED_LOGS + 1) as u64);
+        assert_eq!(e.pending_count(), 0);
+        assert_eq!(e.log_count, 0);
+        assert_eq!(e.queued_bytes, 0);
+        assert!(e.events.is_empty());
+    }
+
+    #[test]
+    fn verdict_timeout_updates_stats_without_warning() {
+        for fail_closed in [false, true] {
+            let mut e = engine();
+            e.configure(2000, 60000, fail_closed);
+            e.read(&mut [0; MAX_LOG_RECORD]);
+            let timed_out = submit(&mut e, 101, 21);
+            e.read(&mut [0; MAX_LOG_RECORD]);
+            assert_eq!(
+                e.take_due(2100).unwrap().finish,
+                if fail_closed {
+                    Finish::Drop
+                } else {
+                    Finish::Allow
+                }
+            );
+            assert_eq!(e.stats().timeouts, 1);
+            assert!(e.verdict(timed_out, Verdict::Accept, 2100).is_err());
+            assert_eq!(e.read(&mut [0; MAX_LOG_RECORD]), 0);
+
+            let blocked = submit(&mut e, 101, 22);
+            e.read(&mut [0; MAX_LOG_RECORD]);
+            assert_eq!(
+                e.verdict(blocked, Verdict::Block, 101).unwrap().finish,
+                Finish::Drop
+            );
+            assert_eq!(e.read(&mut [0; MAX_LOG_RECORD]), 0);
+        }
     }
 
     #[test]
@@ -1847,7 +2065,7 @@ mod tests {
         assert_eq!(expired, COUNT - 3);
         assert_eq!(e.pending_count(), 0);
         assert!(e.pending.is_empty());
-        assert_eq!(drain_warning_logs(&mut e), COUNT - 3);
+        assert_eq!(drain_warning_logs(&mut e), 0);
         assert!(e.events.is_empty());
         assert_eq!(e.stats().dropped, COUNT as u64);
     }
@@ -1897,7 +2115,7 @@ mod tests {
             }
             assert!(seen.into_iter().all(|seen| seen));
             assert_eq!(e.pending_count(), 0);
-            let warnings = if mode == 0 || mode == 3 { COUNT } else { 0 };
+            let warnings = if mode == 3 { MAX_QUEUED_LOGS } else { 0 };
             assert_eq!(e.events.len(), usize::from(mode != 2) + warnings);
             assert_eq!(e.pending.len(), usize::from(mode != 2));
             let mut tail = [0; 133];
@@ -2686,7 +2904,7 @@ mod tests {
         assert_eq!(e.stats().overflow, 2);
         assert_eq!(e.stats().timeouts, 2);
         assert_eq!(e.bandwidth_count, 2);
-        assert_eq!(drain_warning_logs(&mut e), 4);
+        assert_eq!(drain_warning_logs(&mut e), 2);
         e.bandwidth();
         let mut out = [0; 128];
         assert_eq!(e.read(&mut out), 84);
@@ -2931,7 +3149,7 @@ mod tests {
         }
         assert_eq!(count, COUNT);
         assert_eq!(e.pending_count(), 0);
-        assert_eq!(drain_warning_logs(&mut e), COUNT);
+        assert_eq!(drain_warning_logs(&mut e), 0);
         assert_eq!(e.queued_bytes, 0);
         assert_eq!(e.stats().overflow, 1);
         assert_eq!(e.stats().allowed, 0);
@@ -3606,7 +3824,7 @@ mod tests {
         assert_eq!(prefix[0], 1);
         assert_eq!(n, 133);
         assert_eq!(u64::from_le_bytes(b[2..10].try_into().unwrap()), id);
-        assert_eq!(drain_warning_logs(&mut e), 1);
+        assert_eq!(drain_warning_logs(&mut e), 0);
     }
     #[test]
     fn queue_accounting_overflow_falls_back_without_losing_owned_token() {
@@ -3663,7 +3881,7 @@ mod tests {
                 assert!(n > 0);
                 received.extend_from_slice(&chunk[..n]);
             }
-            assert_eq!(drain_warning_logs(&mut e), 1);
+            assert_eq!(drain_warning_logs(&mut e), 0);
             assert_eq!(received.len(), prefix + MAX_PAYLOAD);
             assert_eq!(u64::from_le_bytes(received[5..13].try_into().unwrap()), id);
             assert_eq!(
@@ -3696,7 +3914,7 @@ mod tests {
         let _ = e.submit(k, p, 9, None, 100, record(&p));
         assert!(e.queued_bytes > 65536);
         assert_eq!(e.take_due(2100).unwrap().nbl, 9);
-        assert_eq!(drain_warning_logs(&mut e), 1);
+        assert_eq!(drain_warning_logs(&mut e), 0);
         assert_eq!(e.read(&mut [0; 16]), 0);
         assert_eq!(e.queued_bytes, 0);
         assert!(e.events.is_empty());

@@ -68,6 +68,7 @@ impl<T> List<T> {
         self.len = len;
         Ok(handle)
     }
+    #[cfg(test)]
     pub(crate) fn bytes(&self) -> usize {
         self.len.saturating_mul(core::mem::size_of::<Node<T>>())
     }

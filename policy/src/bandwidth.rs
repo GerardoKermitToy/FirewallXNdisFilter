@@ -677,6 +677,7 @@ impl BandwidthStore {
     pub(crate) fn has_storage(&self) -> bool {
         !self.banks.is_empty()
     }
+    #[cfg(test)]
     pub(crate) fn bytes(&self) -> usize {
         self.payload_bytes.saturating_add(self.banks.bytes())
     }

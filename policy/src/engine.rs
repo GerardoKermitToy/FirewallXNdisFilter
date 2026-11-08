@@ -16,6 +16,7 @@ use likely_stable::{likely, unlikely};
 
 pub use crate::bandwidth::{BandwidthPlan, BandwidthWork, DeferredBandwidth};
 
+const LOG_INFO: u8 = 3;
 const LOG_WARNING: u8 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -739,6 +740,7 @@ impl Engine {
             .caches
             .plan(&pending.packet.connection)
     }
+    #[cfg(test)]
     fn cache_counts(&self) -> (usize, usize) {
         self.interfaces
             .iter()
@@ -748,6 +750,7 @@ impl Engine {
                 (v4 + counts.0, v6 + counts.1)
             })
     }
+    #[cfg(test)]
     fn cache_bytes(&self) -> usize {
         self.interfaces.iter().map(|c| c.caches.bytes()).sum()
     }
@@ -1402,42 +1405,32 @@ impl Engine {
         let _ = self.finish_bandwidth(&mut table);
     }
     pub fn memory_stats(&mut self) {
-        let mut text = Text {
-            bytes: [0; 400],
-            len: 0,
-        };
-        let s = self.stats;
-        let metadata = self.pending.bytes()
-            + self.events.bytes()
-            + self.interfaces.bytes()
-            + self.bandwidth.bytes()
-            + self.retry_bandwidth.bytes();
-        let _ = write!(
-            text,
-            "FirewallXNdisFilter: fixed_bytes={} metadata_bytes={} event_bytes={} pending={} events={} bandwidth={} cached_v4={} cached_v6={} cache_bytes={} cache_alloc_fail={} rx={} allow={} drop={} queued={} cache_hits={} timeout={} overflow={} cancel={} invalidated={} malformed={} non_ip={}",
-            core::mem::size_of::<Self>(),
-            metadata,
-            self.queued_bytes,
-            self.pending_count(),
-            self.events.len(),
-            self.bandwidth_count,
-            self.cache_counts().0,
-            self.cache_counts().1,
-            self.cache_bytes(),
-            s.cache_allocation_failures,
-            s.received,
-            s.allowed,
-            s.dropped,
-            s.queued,
-            s.cache_hits,
-            s.timeouts,
-            s.overflow,
-            s.cancelled,
-            s.invalidated,
-            s.malformed,
-            s.non_ip
+        let mut cache_counts = [[0usize; 2]; 2];
+        for interface in self.interfaces.iter() {
+            for (totals, counts) in cache_counts
+                .iter_mut()
+                .zip(interface.caches.counts_by_table())
+            {
+                for (total, count) in totals.iter_mut().zip(counts) {
+                    *total += count;
+                }
+            }
+        }
+        let [
+            [cached_tcp_v4, cached_udp_v4],
+            [cached_tcp_v6, cached_udp_v6],
+        ] = cache_counts;
+        let pending = self.pending_count;
+        let pending_nodes = self.pending.len();
+        let events = self.events.len();
+        let interfaces = self.interfaces.len();
+        let bandwidth = self.bandwidth_count;
+        self.log_args(
+            LOG_INFO,
+            format_args!(
+                "FirewallXNdisFilter: pending={pending} pending_nodes={pending_nodes} events={events} interfaces={interfaces} bandwidth={bandwidth} cached_tcp_v4={cached_tcp_v4} cached_udp_v4={cached_udp_v4} cached_tcp_v6={cached_tcp_v6} cached_udp_v6={cached_udp_v6}"
+            ),
         );
-        self.log(3, text.as_str());
     }
 }
 struct Text {
@@ -1545,6 +1538,78 @@ mod tests {
         }
         count
     }
+    #[test]
+    fn memory_stats_reports_empty_collection_counts() {
+        let mut e = default_engine();
+        e.read(&mut [0; MAX_LOG_RECORD]); // Startup message.
+        e.memory_stats();
+
+        let mut bytes = [0; MAX_LOG_RECORD];
+        let n = e.read(&mut bytes);
+        assert_eq!(bytes[0], 0);
+        assert_eq!(
+            u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize,
+            n - 5
+        );
+        assert_eq!(bytes[5], LOG_INFO);
+        assert_eq!(
+            core::str::from_utf8(&bytes[6..n]).unwrap(),
+            "FirewallXNdisFilter: pending=0 pending_nodes=0 events=0 interfaces=1 bandwidth=0 cached_tcp_v4=0 cached_udp_v4=0 cached_tcp_v6=0 cached_udp_v6=0"
+        );
+    }
+
+    #[test]
+    fn memory_stats_counts_collections_and_each_cache_table() {
+        let mut e = default_engine();
+        e.read(&mut [0; MAX_LOG_RECORD]); // Startup message.
+        assert!(e.attach(102));
+        assert!(e.restart(102));
+        for (ipv6, protocol, count) in [(false, 6, 1), (false, 17, 2), (true, 6, 3), (true, 17, 4)]
+        {
+            for i in 0..count {
+                let interface = if i % 2 == 0 { 101 } else { 102 };
+                let p = cache_packet(ipv6, protocol, 1000 + i);
+                let Submission::Pending(id) = e.submit(interface, p, 1, None, 100, record(&p))
+                else {
+                    panic!("expected pending packet");
+                };
+                let verdict = if !ipv6 && protocol == 6 {
+                    Verdict::PermanentAccept
+                } else {
+                    Verdict::PermanentDrop
+                };
+                e.verdict(id, verdict, 101).unwrap();
+            }
+        }
+        let p = cache_packet(false, 17, 5000);
+        let Submission::Pending(id) = e.submit(101, p, 2, None, 100, record(&p)) else {
+            panic!("expected pending packet");
+        };
+        assert_eq!(e.read(&mut [0; 1]), 1); // Retain a partially read event.
+        e.verdict(id, Verdict::Accept, 101).unwrap();
+        // Disabled caches still occupy their tables until unlocked reclamation.
+        e.invalidate(102, false);
+        assert_ne!(e.cache_counts(), (3, 7));
+        let p = cache_packet(false, 17, 5001);
+        assert!(matches!(
+            e.submit(101, p, 3, None, 100, record(&p)),
+            Submission::Pending(_)
+        ));
+        e.memory_stats();
+
+        let event = e.events.iter().last().unwrap();
+        assert_eq!(event.data[0], 0);
+        assert_eq!(
+            u32::from_le_bytes(event.data[1..5].try_into().unwrap()) as usize,
+            event.data.len() - 5
+        );
+        assert_eq!(event.data[5], LOG_INFO);
+        assert_eq!(
+            core::str::from_utf8(&event.data[6..]).unwrap(),
+            "FirewallXNdisFilter: pending=1 pending_nodes=2 events=2 interfaces=2 bandwidth=2 cached_tcp_v4=1 cached_udp_v4=2 cached_tcp_v6=3 cached_udp_v6=4"
+        );
+    }
+
     #[test]
     fn packet_problem_and_mixed_warnings_include_interface() {
         let mut e = default_engine();

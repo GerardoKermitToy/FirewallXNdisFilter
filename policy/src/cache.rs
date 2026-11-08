@@ -688,6 +688,13 @@ impl Caches {
     pub(crate) fn has_entries(&self) -> bool {
         self.ipv4.iter().any(|c| c.len() != 0) || self.ipv6.iter().any(|c| c.len() != 0)
     }
+    // Rows are IPv4/IPv6; columns follow the TCP/UDP table order.
+    pub(crate) fn counts_by_table(&self) -> [[usize; 2]; 2] {
+        [
+            self.ipv4.each_ref().map(Cache::len),
+            self.ipv6.each_ref().map(Cache::len),
+        ]
+    }
     pub fn counts(&self) -> (usize, usize) {
         (
             self.ipv4.iter().map(Cache::len).sum(),

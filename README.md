@@ -286,9 +286,20 @@ Within each table, the key is the full normalized `local_ip, local_port, remote_
 
 Expired entries stop matching immediately. While caches are nonempty, the driver automatically requests a full expiry sweep every 10 seconds; the monitor does not need to request cleanup.
 
-Pending decisions, event queues, bandwidth storage, and receive-copy data have no fixed item-count or aggregate byte quota. Nonpaged-pool exhaustion can bugcheck the machine. `PrintMemoryStats` reports storage/counter statistics, and traffic diagnostics are collected only while a controller is online and reset on disconnect. Bandwidth counters use saturating 64-bit arithmetic.
+Pending decisions, event queues, bandwidth storage, and receive-copy data have no fixed item-count or aggregate byte quota. Nonpaged-pool exhaustion can bugcheck the machine. Bandwidth counters use saturating 64-bit arithmetic.
 
-If a cache entry cannot be inserted, the current packet still receives its requested verdict, but later traffic requires another decision. `PrintMemoryStats` reports `cached_v4`, `cached_v6`, `cache_bytes` and `cache_alloc_fail` across interfaces.
+`PrintMemoryStats` queues an Info `LogLine` containing only counts of elements in the policy engine's collections:
+
+| Field | Count |
+|---|---|
+| `pending` | Pending NBLs not yet claimed for completion, including expired or invalidated requests awaiting drain. |
+| `pending_nodes` | Allocated pending nodes, including a claimed decision retained by a partially read event. |
+| `events` | Queued events before the statistics `LogLine` itself is queued, including partially read events. |
+| `interfaces` | Interface contexts, including detached contexts awaiting cache reclamation. |
+| `bandwidth` | Entries in the active and retry bandwidth stores; an in-flight detached report is not included, and retry stores can contain duplicate keys. |
+| `cached_tcp_v4`, `cached_udp_v4`, `cached_tcp_v6`, `cached_udp_v6` | Entries in each protocol/family cache, summed across interface contexts and current/previous tables. Entries awaiting expiry or invalidation cleanup are included until reclaimed. |
+
+These are collection counts, not byte sizes, capacities, traffic counters, or a complete accounting of detached and retired storage. If a cache entry cannot be inserted, the current packet still receives its requested verdict, but later traffic requires another decision.
 
 The default TTL is **60000 ms**. `PermanentAccept` uses a **sliding idle timeout**: the initial deadline is set when the verdict is applied, and each cacheable TCP/UDP packet actually admitted by that still-valid entry resets the deadline to its classification time plus `CacheTtlMs`. Either direction refreshes the matching tuple in that protocol-specific table; TCP traffic cannot refresh a UDP entry or vice versa. Preliminary cache checks and uncacheable packets do not refresh it. At or after the deadline, a packet needs a new decision rather than reviving the expired entry. `PermanentBlock` and `PermanentDrop` retain a **fixed TTL from verdict application**; matching traffic does not extend them.
 
@@ -374,7 +385,7 @@ Commands are **unframed**, unlike events. One write can concatenate complete com
 | `ClearCache` | 4 | 1 | Invalidates all permanent-cache entries. |
 | `GetLogs` | 5 | 1 | Compatibility no-op; log records are already queued. |
 | `GetBandwidthStats` | 6 | 1 | Queues bandwidth deltas for active buckets. |
-| `PrintMemoryStats` | 7 | 1 | Queues an Info `LogLine` containing policy storage/counter statistics. |
+| `PrintMemoryStats` | 7 | 1 | Queues an Info `LogLine` containing policy collection element counts. |
 | `CleanEndedConnections` | 8 | Unsupported | Rejected; expiry cleanup is automatic. |
 
 Single-byte commands contain only their command byte. Command byte 8 is unsupported, including when it follows otherwise valid commands; the entire batch is rejected before any command takes effect. Request results are read asynchronously from the same event stream; there is no correlation ID or separate acknowledgement. Diagnostic/statistics records need not be queued when no data is available or a size limit is exceeded.

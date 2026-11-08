@@ -438,27 +438,31 @@ fn classify(
         );
         match parsed {
             Ok(Some(p)) => {
-                #[cfg(feature = "native-wdk")]
-                let scope = {
-                    use native_local_address::LocalMatch;
-                    let matched = if p.flow.ipv6 {
-                        native_local_address::lookup_v6(p.flow.source, p.flow.destination)
-                    } else {
-                        let src = p.flow.source;
-                        let dst = p.flow.destination;
-                        native_local_address::lookup_v4(
-                            [src[0], src[1], src[2], src[3]],
-                            [dst[0], dst[1], dst[2], dst[3]],
-                        )
-                    };
-                    match matched {
-                        LocalMatch::Local => transit_packet::IpScope::Local,
-                        LocalMatch::Transit => transit_packet::IpScope::Transit,
-                        LocalMatch::Unknown => transit_packet::IpScope::Unknown,
+                let scope = transit_packet::ip_scope(&p, || {
+                    #[cfg(feature = "native-wdk")]
+                    {
+                        use native_local_address::LocalMatch;
+                        let matched = if p.flow.ipv6 {
+                            native_local_address::lookup_v6(p.flow.source, p.flow.destination)
+                        } else {
+                            let src = p.flow.source;
+                            let dst = p.flow.destination;
+                            native_local_address::lookup_v4(
+                                [src[0], src[1], src[2], src[3]],
+                                [dst[0], dst[1], dst[2], dst[3]],
+                            )
+                        };
+                        match matched {
+                            LocalMatch::Local => transit_packet::IpScope::Local,
+                            LocalMatch::Transit => transit_packet::IpScope::Transit,
+                            LocalMatch::Unknown => transit_packet::IpScope::Unknown,
+                        }
                     }
-                };
-                #[cfg(not(feature = "native-wdk"))]
-                let scope = transit_packet::IpScope::Transit;
+                    #[cfg(not(feature = "native-wdk"))]
+                    {
+                        transit_packet::IpScope::Transit
+                    }
+                });
                 if batch.observe_ip(p, scope).is_err() {
                     with_state(|e| {
                         e.malformed(interface_index, "IP and non-IP data share one NBL")

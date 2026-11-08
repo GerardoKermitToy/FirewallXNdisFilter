@@ -1,5 +1,7 @@
 # FirewallXNdisFilter
 
+**English** | [Русский](README.ru.md)
+
 FirewallXNdisFilter is an experimental Windows network filter written in Rust, with a C++ monitor and client APIs. It uses an **NDIS Lightweight Filter (LWF)** on compatible host Ethernet adapters, both physical and virtual.
 
 Only traffic traversing an attached NDIS module can be inspected. Some adapters cannot accept an ordinary LWF; for example, Wintun/WireGuard adapters declaring `LowerRange=nolower` are not supported. Internal VM-to-VM traffic that never passes through an attached host adapter is also outside the filter's scope. The package and device API version is **0.3.3.0**; use a matching driver and client.

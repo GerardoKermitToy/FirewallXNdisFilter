@@ -57,6 +57,236 @@ pub(crate) fn ip_scope(packet: &Packet, lookup: impl FnOnce() -> IpScope) -> IpS
     if exempt { IpScope::Local } else { lookup() }
 }
 
+/// Local or unavailable inventory already bypasses policy, so only inspect
+/// DHCP server replies when the inventory has identified transit traffic.
+pub(crate) fn inventory_then_dhcp(scope: IpScope, is_dhcp: impl FnOnce() -> bool) -> IpScope {
+    if scope == IpScope::Transit && is_dhcp() {
+        IpScope::Local
+    } else {
+        scope
+    }
+}
+
+fn dhcp_server_to_client(packet: &Packet) -> bool {
+    const UDP: u8 = 17;
+    const DHCPV4_SERVER_PORT: u16 = 67;
+    const DHCPV4_CLIENT_PORT: u16 = 68;
+    const DHCPV6_SERVER_PORT: u16 = 547;
+    const DHCPV6_CLIENT_PORT: u16 = 546;
+    let ports = if packet.flow.ipv6 {
+        (DHCPV6_SERVER_PORT, DHCPV6_CLIENT_PORT)
+    } else {
+        (DHCPV4_SERVER_PORT, DHCPV4_CLIENT_PORT)
+    };
+    packet.flow.protocol == UDP && (packet.flow.source_port, packet.flow.destination_port) == ports
+}
+
+/// DHCPv6 clients use this link-scoped group to find servers and relays.
+pub(crate) fn dhcpv6_client_multicast(packet: &Packet) -> bool {
+    const UDP: u8 = 17;
+    const DHCPV6_CLIENT_PORT: u16 = 546;
+    const DHCPV6_SERVER_PORT: u16 = 547;
+    const ALL_DHCP_RELAYS_AND_SERVERS: [u8; 16] =
+        [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 2];
+    packet.flow.ipv6
+        && packet.flow.protocol == UDP
+        && packet.flow.source_port == DHCPV6_CLIENT_PORT
+        && packet.flow.destination_port == DHCPV6_SERVER_PORT
+        && packet.flow.destination == ALL_DHCP_RELAYS_AND_SERVERS
+}
+
+/// Broadcast replies are permitted based on the IP/UDP tuple alone.
+pub(crate) fn dhcp_server_broadcast(packet: &Packet) -> bool {
+    const IPV4_LIMITED_BROADCAST: [u8; 4] = [255; 4];
+    !packet.flow.ipv6
+        && dhcp_server_to_client(packet)
+        && packet.flow.destination.starts_with(&IPV4_LIMITED_BROADCAST)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DhcpReply {
+    Match,
+    NoMatch,
+    NeedMore,
+}
+
+/// Recognize DHCPv4 Offer/ACK or DHCPv6 Advertise/Reply within the UDP datagram.
+/// `frame` is the readable prefix; a longer prefix is needed only when an
+/// option needed for the decision is not present yet.
+pub(crate) fn dhcp_reply(packet: &Packet, frame: &[u8], offload: bool) -> DhcpReply {
+    const BOOTREPLY: u8 = 2;
+    const BOOTP_HEADER_LEN: usize = 236;
+    const COOKIE: [u8; 4] = [99, 130, 83, 99];
+    const PAD: u8 = 0;
+    const END: u8 = 255;
+    const MESSAGE_TYPE: u8 = 53;
+    const OFFER: u8 = 2;
+    const ACK: u8 = 5;
+
+    if !dhcp_server_to_client(packet) || offload {
+        return DhcpReply::NoMatch;
+    }
+    if packet.flow.ipv6 {
+        return dhcpv6_reply(packet, frame);
+    }
+
+    let ip = usize::from(packet.flow.l2_len);
+    let Some(&version_ihl) = frame.get(ip) else {
+        return DhcpReply::NeedMore;
+    };
+    let ip_header_len = usize::from(version_ihl & 15) * 4;
+    let udp = ip + ip_header_len;
+    let ip_end = ip + packet.payload_len as usize;
+    if version_ihl >> 4 != 4 || ip_header_len < 20 || udp + 8 > ip_end {
+        return DhcpReply::NoMatch;
+    }
+    let Some(length) = frame.get(udp + 4..udp + 6) else {
+        return DhcpReply::NeedMore;
+    };
+    let udp_len = usize::from(u16::from_be_bytes([length[0], length[1]]));
+    let end = udp + udp_len;
+    let bootp = udp + 8;
+    let options = bootp + BOOTP_HEADER_LEN + COOKIE.len();
+    if udp_len < 8 + BOOTP_HEADER_LEN + COOKIE.len() || end > ip_end {
+        return DhcpReply::NoMatch;
+    }
+    if frame.len() < options {
+        return DhcpReply::NeedMore;
+    }
+    if frame[bootp] != BOOTREPLY || frame[bootp + BOOTP_HEADER_LEN..options] != COOKIE {
+        return DhcpReply::NoMatch;
+    }
+
+    let mut cursor = options;
+    let mut found_reply = false;
+    while cursor < end {
+        let Some(&kind) = frame.get(cursor) else {
+            return DhcpReply::NeedMore;
+        };
+        cursor += 1;
+        match kind {
+            PAD => continue,
+            END => {
+                return if found_reply {
+                    DhcpReply::Match
+                } else {
+                    DhcpReply::NoMatch
+                };
+            }
+            _ => {}
+        }
+        if cursor >= end {
+            return DhcpReply::NoMatch;
+        }
+        let Some(&length) = frame.get(cursor) else {
+            return DhcpReply::NeedMore;
+        };
+        cursor += 1;
+        let next = cursor + usize::from(length);
+        if next > end {
+            return DhcpReply::NoMatch;
+        }
+        if next > frame.len() {
+            return DhcpReply::NeedMore;
+        }
+        if kind == MESSAGE_TYPE {
+            if found_reply || length != 1 || !matches!(frame[cursor], OFFER | ACK) {
+                return DhcpReply::NoMatch;
+            }
+            found_reply = true;
+        }
+        cursor = next;
+    }
+    DhcpReply::NoMatch
+}
+
+/// Locate UDP through the same IPv6 extension types as the bounded parser,
+/// then validate the DHCPv6 message header and option lengths.
+fn dhcpv6_reply(packet: &Packet, frame: &[u8]) -> DhcpReply {
+    const IPV6_HEADER_LEN: usize = 40;
+    const UDP_HEADER_LEN: usize = 8;
+    const DHCPV6_HEADER_LEN: usize = 4;
+    const DHCPV6_OPTION_HEADER_LEN: usize = 4;
+    const UDP: u8 = 17;
+    const ADVERTISE: u8 = 2;
+    const REPLY: u8 = 7;
+
+    let ip = usize::from(packet.flow.l2_len);
+    let ip_end = ip + packet.payload_len as usize;
+    let mut udp = ip + IPV6_HEADER_LEN;
+    if udp > ip_end {
+        return DhcpReply::NoMatch;
+    }
+    let Some(header) = frame.get(ip..udp) else {
+        return DhcpReply::NeedMore;
+    };
+    if header[0] >> 4 != 6 {
+        return DhcpReply::NoMatch;
+    }
+    let mut next_header = header[6];
+    let mut steps = 0;
+    while matches!(next_header, 0 | 43 | 60 | 51) {
+        steps += 1;
+        if steps > 8 || udp + 2 > ip_end {
+            return DhcpReply::NoMatch;
+        }
+        let Some(extension) = frame.get(udp..udp + 2) else {
+            return DhcpReply::NeedMore;
+        };
+        let extension_len = if next_header == 51 {
+            (usize::from(extension[1]) + 2) * 4
+        } else {
+            (usize::from(extension[1]) + 1) * 8
+        };
+        let end = udp + extension_len;
+        if end > ip_end {
+            return DhcpReply::NoMatch;
+        }
+        if end > frame.len() {
+            return DhcpReply::NeedMore;
+        }
+        next_header = extension[0];
+        udp = end;
+    }
+    // Fragment headers are intentionally not followed: ports on fragmented
+    // packets are not validated by the ordinary parser.
+    if next_header != UDP || udp + UDP_HEADER_LEN > ip_end {
+        return DhcpReply::NoMatch;
+    }
+    let Some(length) = frame.get(udp + 4..udp + 6) else {
+        return DhcpReply::NeedMore;
+    };
+    let udp_len = usize::from(u16::from_be_bytes([length[0], length[1]]));
+    let end = udp + udp_len;
+    let mut option = udp + UDP_HEADER_LEN + DHCPV6_HEADER_LEN;
+    if udp_len < UDP_HEADER_LEN + DHCPV6_HEADER_LEN || end > ip_end {
+        return DhcpReply::NoMatch;
+    }
+    if frame.len() < option {
+        return DhcpReply::NeedMore;
+    }
+    if !matches!(frame[udp + UDP_HEADER_LEN], ADVERTISE | REPLY) {
+        return DhcpReply::NoMatch;
+    }
+    while option < end {
+        if option + DHCPV6_OPTION_HEADER_LEN > end {
+            return DhcpReply::NoMatch;
+        }
+        let Some(header) = frame.get(option..option + DHCPV6_OPTION_HEADER_LEN) else {
+            return DhcpReply::NeedMore;
+        };
+        let length = usize::from(u16::from_be_bytes([header[2], header[3]]));
+        option += DHCPV6_OPTION_HEADER_LEN + length;
+        if option > end {
+            return DhcpReply::NoMatch;
+        }
+        if option > frame.len() {
+            return DhcpReply::NeedMore;
+        }
+    }
+    DhcpReply::Match
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BatchScope {
     Empty,
@@ -291,6 +521,465 @@ mod tests {
         frame[34..36].copy_from_slice(&68u16.to_be_bytes());
         frame[36..38].copy_from_slice(&67u16.to_be_bytes());
         frame
+    }
+
+    fn dhcp_reply_frame(options: &[u8]) -> Vec<u8> {
+        let mut frame = ipv4();
+        frame[22] = 64;
+        frame[26..30].copy_from_slice(&[192, 0, 2, 1]);
+        frame[30..34].copy_from_slice(&[255; 4]);
+        frame[34..36].copy_from_slice(&67u16.to_be_bytes());
+        frame[36..38].copy_from_slice(&68u16.to_be_bytes());
+        frame.resize(14 + 20 + 8 + 240, 0);
+        frame[42] = 2;
+        frame[278..282].copy_from_slice(&[99, 130, 83, 99]);
+        frame.extend_from_slice(options);
+        let ip_len = (frame.len() - 14) as u16;
+        let udp_len = (frame.len() - 34) as u16;
+        frame[16..18].copy_from_slice(&ip_len.to_be_bytes());
+        frame[38..40].copy_from_slice(&udp_len.to_be_bytes());
+        frame
+    }
+
+    fn dhcp_scope(packet: &Packet, frame: &[u8]) -> IpScope {
+        ip_scope(packet, || {
+            inventory_then_dhcp(IpScope::Transit, || {
+                dhcp_server_broadcast(packet)
+                    || dhcpv6_client_multicast(packet)
+                    || dhcp_reply(packet, frame, false) == DhcpReply::Match
+            })
+        })
+    }
+
+    #[test]
+    fn local_or_unknown_inventory_never_inspects_dhcp_reply() {
+        for scope in [IpScope::Local, IpScope::Unknown] {
+            assert_eq!(
+                inventory_then_dhcp(scope, || panic!("inventory already bypasses policy")),
+                scope
+            );
+        }
+        assert_eq!(
+            inventory_then_dhcp(IpScope::Transit, || true),
+            IpScope::Local
+        );
+        assert_eq!(
+            inventory_then_dhcp(IpScope::Transit, || false),
+            IpScope::Transit
+        );
+    }
+
+    #[test]
+    fn dhcp_offer_and_ack_bypass_policy_at_any_ttl_and_direction() {
+        for message_type in [2, 5] {
+            for destination in [[255; 4], [192, 0, 2, 99]] {
+                for ttl in [0, 1, 2, 64, 128, 255] {
+                    let mut frame = dhcp_reply_frame(&[0, 1, 2, 0, 1, 53, 1, message_type, 255]);
+                    frame[22] = ttl;
+                    frame[30..34].copy_from_slice(&destination);
+                    let packet = parsed_frame(&frame);
+                    for path in [packet::NdisPath::Send, packet::NdisPath::Receive] {
+                        let mut packet = packet;
+                        packet.orient(path);
+                        assert_eq!(dhcp_reply(&packet, &frame, false), DhcpReply::Match);
+                        assert_eq!(dhcp_scope(&packet, &frame), IpScope::Local);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dhcp_reply_accepts_vlan_ipv4_options_and_late_options() {
+        let mut options = vec![0; 100];
+        options.extend_from_slice(&[53, 1, 2, 255]);
+        let mut frame = dhcp_reply_frame(&options);
+        frame.splice(34..34, [0; 40]);
+        frame[14] = 0x4f;
+        let ip_len = frame.len() - 14;
+        frame[16..18].copy_from_slice(&(ip_len as u16).to_be_bytes());
+        frame.splice(12..12, [0x81, 0, 0, 0]);
+        frame.splice(12..12, [0x88, 0xa8, 0, 0]);
+        let packet = parsed_frame(&frame);
+        assert_eq!(packet.flow.l2_len, 22);
+        assert_eq!(
+            dhcp_reply(&packet, &frame[..320], false),
+            DhcpReply::NeedMore
+        );
+        assert_eq!(dhcp_reply(&packet, &frame, false), DhcpReply::Match);
+    }
+
+    #[test]
+    fn dhcp_reply_handles_the_largest_ipv4_datagram() {
+        let mut options = vec![0; 65_263];
+        options.extend_from_slice(&[53, 1, 2, 255]);
+        let frame = dhcp_reply_frame(&options);
+        let packet = parsed_frame(&frame);
+        assert_eq!(packet.payload_len, u16::MAX as u32);
+        assert_eq!(
+            dhcp_reply(&packet, &frame[..320], false),
+            DhcpReply::NeedMore
+        );
+        assert_eq!(dhcp_reply(&packet, &frame, false), DhcpReply::Match);
+    }
+
+    #[test]
+    fn dhcp_reply_needs_complete_readable_option_bytes() {
+        let frame = dhcp_reply_frame(&[0, 1, 3, 11, 22, 33, 53, 1, 2, 255]);
+        let packet = parsed_frame(&frame);
+        for end in 0..frame.len() {
+            assert_eq!(
+                dhcp_reply(&packet, &frame[..end], false),
+                DhcpReply::NeedMore,
+                "prefix {end}"
+            );
+        }
+        assert_eq!(dhcp_reply(&packet, &frame, false), DhcpReply::Match);
+        assert_eq!(dhcp_reply(&packet, &frame, true), DhcpReply::NoMatch);
+    }
+
+    #[test]
+    fn dhcp_reply_rejects_other_or_malformed_messages() {
+        let mut other_source_port = dhcp_reply_frame(&[53, 1, 2, 255]);
+        other_source_port[34..36].copy_from_slice(&68u16.to_be_bytes());
+        let mut other_destination_port = dhcp_reply_frame(&[53, 1, 2, 255]);
+        other_destination_port[36..38].copy_from_slice(&67u16.to_be_bytes());
+        let mut wrong_op = dhcp_reply_frame(&[53, 1, 2, 255]);
+        wrong_op[42] = 1;
+        let mut wrong_cookie = dhcp_reply_frame(&[53, 1, 2, 255]);
+        wrong_cookie[278] = 0;
+        let mut fragmented = dhcp_reply_frame(&[53, 1, 2, 255]);
+        fragmented[20..22].copy_from_slice(&0x2000u16.to_be_bytes());
+        let mut non_initial_fragment = fragmented.clone();
+        non_initial_fragment[20..22].copy_from_slice(&1u16.to_be_bytes());
+        let mut tcp = dhcp_reply_frame(&[53, 1, 2, 255]);
+        tcp[23] = 6;
+        tcp[46] = 0x50;
+        for mut frame in [
+            other_source_port,
+            other_destination_port,
+            wrong_op,
+            wrong_cookie,
+            fragmented,
+            non_initial_fragment,
+            tcp,
+            dhcp_reply_frame(&[53, 1, 1, 255]),
+            dhcp_reply_frame(&[53, 1, 6, 255]),
+            dhcp_reply_frame(&[53, 0, 255]),
+            dhcp_reply_frame(&[53, 2, 2, 0, 255]),
+            dhcp_reply_frame(&[53, 1, 2]),
+            dhcp_reply_frame(&[53, 1, 2, 53, 1, 2, 255]),
+            dhcp_reply_frame(&[53, 1, 2, 53, 1, 5, 255]),
+            dhcp_reply_frame(&[53, 1, 2, 1, 4, 0, 255]),
+            dhcp_reply_frame(&[1, 4, 53, 1, 2]),
+            dhcp_reply_frame(&[255, 53, 1, 2]),
+            dhcp_reply_frame(&[]),
+        ] {
+            frame[30..34].copy_from_slice(&[192, 0, 2, 99]);
+            let packet = parsed_frame(&frame);
+            assert_eq!(dhcp_reply(&packet, &frame, false), DhcpReply::NoMatch);
+            assert_eq!(dhcp_scope(&packet, &frame), IpScope::Transit);
+        }
+        let mut ipv6 = ipv6();
+        ipv6[54..56].copy_from_slice(&67u16.to_be_bytes());
+        ipv6[56..58].copy_from_slice(&68u16.to_be_bytes());
+        assert_eq!(
+            dhcp_reply(&parsed_frame(&ipv6), &ipv6, false),
+            DhcpReply::NoMatch
+        );
+    }
+
+    #[test]
+    fn dhcp_reply_never_uses_bytes_beyond_udp_length() {
+        let mut frame = dhcp_reply_frame(&[53, 1, 2, 255]);
+        frame[38..40].copy_from_slice(&(248u16).to_be_bytes());
+        let packet = parsed_frame(&frame);
+        assert_eq!(dhcp_reply(&packet, &frame, false), DhcpReply::NoMatch);
+
+        frame[38..40].copy_from_slice(&(250u16).to_be_bytes());
+        let packet = parsed_frame(&frame);
+        assert_eq!(dhcp_reply(&packet, &frame, false), DhcpReply::NoMatch);
+    }
+
+    #[test]
+    fn dhcp_reply_and_other_transit_packets_split_in_either_order() {
+        let mut reply_frame = dhcp_reply_frame(&[53, 1, 5, 255]);
+        let mut other_frame = dhcp_reply_frame(&[53, 1, 6, 255]);
+        reply_frame[30..34].copy_from_slice(&[192, 0, 2, 99]);
+        other_frame[30..34].copy_from_slice(&[192, 0, 2, 99]);
+        let reply = parsed_frame(&reply_frame);
+        let other = parsed_frame(&other_frame);
+        for packets in [
+            [(reply, &reply_frame), (other, &other_frame)],
+            [(other, &other_frame), (reply, &reply_frame)],
+        ] {
+            let mut batch = PacketBatch::new();
+            for (packet, frame) in packets {
+                batch
+                    .observe_ip(packet, dhcp_scope(&packet, frame))
+                    .unwrap();
+            }
+            assert!(matches!(batch.finish(), Ok(BatchDecision::Mixed)));
+        }
+    }
+
+    #[test]
+    fn dhcp_server_broadcast_uses_only_ipv4_addresses_and_ports() {
+        for source in [[0, 0, 0, 0], [192, 0, 2, 1]] {
+            for ttl in [0, 1, 2, 64, 128, 255] {
+                for payload in [&[][..], &[3, 1, 4, 1, 5][..]] {
+                    let mut frame = ipv4();
+                    frame[22] = ttl;
+                    frame[26..30].copy_from_slice(&source);
+                    frame[30..34].copy_from_slice(&[255; 4]);
+                    frame[34..36].copy_from_slice(&67u16.to_be_bytes());
+                    frame[36..38].copy_from_slice(&68u16.to_be_bytes());
+                    frame.extend_from_slice(payload);
+                    let ip_len = (28 + payload.len()) as u16;
+                    let udp_len = (8 + payload.len()) as u16;
+                    frame[16..18].copy_from_slice(&ip_len.to_be_bytes());
+                    frame[38..40].copy_from_slice(&udp_len.to_be_bytes());
+                    for offload in [false, true] {
+                        let packet = packet::parse(&frame, frame.len(), frame.len(), offload)
+                            .unwrap()
+                            .unwrap();
+                        for path in [packet::NdisPath::Send, packet::NdisPath::Receive] {
+                            let mut packet = packet;
+                            packet.orient(path);
+                            assert!(dhcp_server_broadcast(&packet));
+                            assert_eq!(dhcp_scope(&packet, &frame), IpScope::Local);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dhcp_server_broadcast_requires_the_exact_tuple() {
+        let mut valid = dhcp_reply_frame(&[]);
+        valid[22] = 64;
+        let mut wrong_destination = valid.clone();
+        wrong_destination[33] = 254;
+        let mut directed_broadcast = valid.clone();
+        directed_broadcast[30..34].copy_from_slice(&[192, 0, 2, 255]);
+        let mut wrong_source_port = valid.clone();
+        wrong_source_port[34..36].copy_from_slice(&68u16.to_be_bytes());
+        let mut wrong_destination_port = valid.clone();
+        wrong_destination_port[36..38].copy_from_slice(&67u16.to_be_bytes());
+        let mut fragment = valid.clone();
+        fragment[20..22].copy_from_slice(&0x2000u16.to_be_bytes());
+        let mut tcp = valid;
+        tcp[23] = 6;
+        tcp[46] = 0x50;
+        for frame in [
+            wrong_destination,
+            directed_broadcast,
+            wrong_source_port,
+            wrong_destination_port,
+            fragment,
+            tcp,
+        ] {
+            let packet = parsed_frame(&frame);
+            assert!(!dhcp_server_broadcast(&packet));
+            assert_eq!(dhcp_scope(&packet, &frame), IpScope::Transit);
+        }
+        let mut ipv6 = ipv6();
+        ipv6[54..56].copy_from_slice(&67u16.to_be_bytes());
+        ipv6[56..58].copy_from_slice(&68u16.to_be_bytes());
+        assert!(!dhcp_server_broadcast(&parsed_frame(&ipv6)));
+    }
+
+    fn dhcpv6_frame(message_type: u8, options: &[u8]) -> Vec<u8> {
+        let mut frame = ipv6();
+        frame[21] = 64;
+        frame[54..56].copy_from_slice(&547u16.to_be_bytes());
+        frame[56..58].copy_from_slice(&546u16.to_be_bytes());
+        frame.extend_from_slice(&[message_type, 1, 2, 3]);
+        frame.extend_from_slice(options);
+        let length = (frame.len() - 54) as u16;
+        frame[18..20].copy_from_slice(&length.to_be_bytes());
+        frame[58..60].copy_from_slice(&length.to_be_bytes());
+        frame
+    }
+
+    fn dhcpv6_multicast_frame(payload: &[u8]) -> Vec<u8> {
+        let mut frame = ipv6();
+        frame[21] = 64;
+        frame[38..54].copy_from_slice(&[0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 2]);
+        frame[54..56].copy_from_slice(&546u16.to_be_bytes());
+        frame[56..58].copy_from_slice(&547u16.to_be_bytes());
+        frame.extend_from_slice(payload);
+        let length = (frame.len() - 54) as u16;
+        frame[18..20].copy_from_slice(&length.to_be_bytes());
+        frame[58..60].copy_from_slice(&length.to_be_bytes());
+        frame
+    }
+
+    #[test]
+    fn dhcpv6_client_multicast_uses_only_addresses_and_ports() {
+        for hop in [0, 1, 2, 64, 128, 255] {
+            for payload in [&[][..], &[7, 1, 4, 1, 5][..]] {
+                let mut frame = dhcpv6_multicast_frame(payload);
+                frame[21] = hop;
+                for offload in [false, true] {
+                    let packet = packet::parse(&frame, frame.len(), frame.len(), offload)
+                        .unwrap()
+                        .unwrap();
+                    for path in [packet::NdisPath::Send, packet::NdisPath::Receive] {
+                        let mut packet = packet;
+                        packet.orient(path);
+                        assert!(dhcpv6_client_multicast(&packet));
+                        assert_eq!(dhcp_scope(&packet, &frame), IpScope::Local);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dhcpv6_client_multicast_requires_exact_group_and_ports() {
+        let base = dhcpv6_multicast_frame(&[]);
+        let mut other_group = base.clone();
+        other_group[53] = 3;
+        let mut other_scope = base.clone();
+        other_scope[39] = 5;
+        let mut unicast = base.clone();
+        unicast[38..54].copy_from_slice(&[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let mut wrong_source_port = base.clone();
+        wrong_source_port[54..56].copy_from_slice(&547u16.to_be_bytes());
+        let mut wrong_destination_port = base.clone();
+        wrong_destination_port[56..58].copy_from_slice(&546u16.to_be_bytes());
+        let mut fragmented = base.clone();
+        fragmented[20] = 44;
+        fragmented.splice(54..54, [17, 0, 0, 0, 0, 0, 0, 0]);
+        let payload_len = (fragmented.len() - 54) as u16;
+        fragmented[18..20].copy_from_slice(&payload_len.to_be_bytes());
+        let mut tcp = base;
+        tcp[20] = 6;
+        tcp.resize(14 + 40 + 20, 0);
+        tcp[18..20].copy_from_slice(&20u16.to_be_bytes());
+        tcp[66] = 0x50;
+        for frame in [
+            other_group,
+            other_scope,
+            unicast,
+            wrong_source_port,
+            wrong_destination_port,
+            fragmented,
+            tcp,
+        ] {
+            let packet = parsed_frame(&frame);
+            assert!(!dhcpv6_client_multicast(&packet));
+            assert_eq!(dhcp_scope(&packet, &frame), IpScope::Transit);
+        }
+        assert!(!dhcpv6_client_multicast(&parsed_frame(&dhcp_reply_frame(
+            &[]
+        ))));
+    }
+
+    #[test]
+    fn dhcpv6_advertise_and_reply_bypass_policy_at_any_hop_limit() {
+        for message_type in [2, 7] {
+            for hop in [0, 1, 2, 64, 128, 255] {
+                let mut frame = dhcpv6_frame(message_type, &[0, 1, 0, 2, 0x12, 0x34]);
+                frame[21] = hop;
+                let packet = parsed_frame(&frame);
+                for path in [packet::NdisPath::Send, packet::NdisPath::Receive] {
+                    let mut packet = packet;
+                    packet.orient(path);
+                    assert_eq!(dhcp_reply(&packet, &frame, false), DhcpReply::Match);
+                    assert_eq!(dhcp_scope(&packet, &frame), IpScope::Local);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dhcpv6_reply_supports_extension_headers_and_late_options() {
+        let mut options = vec![0, 23, 1, 0];
+        options.extend_from_slice(&[0; 256]);
+        for extension_type in [0, 43, 60, 51] {
+            let mut frame = dhcpv6_frame(7, &options);
+            frame[20] = extension_type;
+            frame.splice(54..54, [17, 0, 0, 0, 0, 0, 0, 0]);
+            let payload_len = (frame.len() - 54) as u16;
+            frame[18..20].copy_from_slice(&payload_len.to_be_bytes());
+            let packet = packet::parse(&frame[..320], 320, frame.len(), false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                dhcp_reply(&packet, &frame[..320], false),
+                DhcpReply::NeedMore
+            );
+            assert_eq!(dhcp_reply(&packet, &frame, false), DhcpReply::Match);
+        }
+    }
+
+    #[test]
+    fn dhcpv6_reply_rejects_wrong_type_ports_fragments_and_malformed_options() {
+        let mut wrong_source_port = dhcpv6_frame(7, &[]);
+        wrong_source_port[54..56].copy_from_slice(&546u16.to_be_bytes());
+        let mut wrong_destination_port = dhcpv6_frame(7, &[]);
+        wrong_destination_port[56..58].copy_from_slice(&547u16.to_be_bytes());
+        let mut fragmented = dhcpv6_frame(7, &[]);
+        fragmented[20] = 44;
+        fragmented.splice(54..54, [17, 0, 0, 0, 0, 0, 0, 0]);
+        let payload_len = (fragmented.len() - 54) as u16;
+        fragmented[18..20].copy_from_slice(&payload_len.to_be_bytes());
+        for frame in [
+            wrong_source_port,
+            wrong_destination_port,
+            fragmented,
+            dhcpv6_frame(1, &[]),
+            dhcpv6_frame(10, &[]),
+            dhcpv6_frame(7, &[0, 1, 0]),
+            dhcpv6_frame(7, &[0, 1, 0, 4, 1, 2]),
+        ] {
+            let packet = parsed_frame(&frame);
+            assert_eq!(dhcp_reply(&packet, &frame, false), DhcpReply::NoMatch);
+            assert_eq!(dhcp_scope(&packet, &frame), IpScope::Transit);
+        }
+        let frame = dhcpv6_frame(7, &[0, 1, 0, 2, 1, 2]);
+        let packet = parsed_frame(&frame);
+        for end in 0..frame.len() {
+            assert_eq!(
+                dhcp_reply(&packet, &frame[..end], false),
+                DhcpReply::NeedMore,
+                "prefix {end}"
+            );
+        }
+        assert_eq!(dhcp_reply(&packet, &frame, true), DhcpReply::NoMatch);
+    }
+
+    #[test]
+    fn dhcpv6_reply_never_uses_bytes_beyond_udp_length() {
+        let mut frame = dhcpv6_frame(7, &[0, 1, 0, 2, 1, 2]);
+        for udp_len in [11u16, 13] {
+            frame[58..60].copy_from_slice(&udp_len.to_be_bytes());
+            let packet = parsed_frame(&frame);
+            assert_eq!(dhcp_reply(&packet, &frame, false), DhcpReply::NoMatch);
+        }
+    }
+
+    #[test]
+    fn dhcpv6_reply_and_other_transit_packets_split_in_either_order() {
+        let reply_frame = dhcpv6_frame(7, &[]);
+        let other_frame = dhcpv6_frame(10, &[]);
+        let reply = parsed_frame(&reply_frame);
+        let other = parsed_frame(&other_frame);
+        for packets in [
+            [(reply, &reply_frame), (other, &other_frame)],
+            [(other, &other_frame), (reply, &reply_frame)],
+        ] {
+            let mut batch = PacketBatch::new();
+            for (packet, frame) in packets {
+                batch
+                    .observe_ip(packet, dhcp_scope(&packet, frame))
+                    .unwrap();
+            }
+            assert!(matches!(batch.finish(), Ok(BatchDecision::Mixed)));
+        }
     }
 
     #[test]

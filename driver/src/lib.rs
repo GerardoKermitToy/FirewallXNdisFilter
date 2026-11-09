@@ -345,6 +345,43 @@ fn capture_packet(nb: Handle, nbl: usize, packet: &Packet) -> Result<Option<Vec<
     Ok(Some(data))
 }
 
+// The ordinary parser only needs a short prefix. DHCP options can occur later,
+// so request the complete bounded IP packet only when necessary.
+fn read_dhcp_reply(nb: Handle, nbl: usize, packet: &Packet, scratch: &mut ParserScratch) -> bool {
+    let limit = usize::from(packet.flow.l2_len) + packet.payload_len as usize;
+    let view = scratch.read_with_limit(
+        limit,
+        |storage| {
+            let mut view = Snapshot::default();
+            view.data = unsafe {
+                fwx_snapshot_view(
+                    nb,
+                    nbl,
+                    storage,
+                    limit as u32,
+                    &mut view.copied,
+                    &mut view.trusted,
+                    &mut view.frame_len,
+                    &mut view.offload,
+                )
+            };
+            view
+        },
+        |length| alloc::vec![0; length],
+    );
+    let Ok(view) = view else {
+        return false;
+    };
+    if (view.frame_len as usize) < limit {
+        return false;
+    }
+    // SAFETY: this NB is still owned by the caller, and scratch is not
+    // read again until the returned prefix has been fully inspected.
+    let length = view.copied.min(view.trusted) as usize;
+    let data = unsafe { core::slice::from_raw_parts(view.data, length) };
+    transit_packet::dhcp_reply(packet, data, view.offload != 0) == transit_packet::DhcpReply::Match
+}
+
 // A positive result normally requests immediate completion; this value asks
 // the native layer to split a validated mixed local/transit NBL first.
 const CLASSIFY_SPLIT: i32 = 3;
@@ -440,7 +477,7 @@ fn classify(
             Ok(Some(p)) => {
                 let scope = transit_packet::ip_scope(&p, || {
                     #[cfg(feature = "native-wdk")]
-                    {
+                    let inventory_scope = {
                         use native_local_address::LocalMatch;
                         let matched = if p.flow.ipv6 {
                             native_local_address::lookup_v6(p.flow.source, p.flow.destination)
@@ -457,11 +494,25 @@ fn classify(
                             LocalMatch::Transit => transit_packet::IpScope::Transit,
                             LocalMatch::Unknown => transit_packet::IpScope::Unknown,
                         }
-                    }
+                    };
                     #[cfg(not(feature = "native-wdk"))]
-                    {
-                        transit_packet::IpScope::Transit
-                    }
+                    let inventory_scope = transit_packet::IpScope::Transit;
+
+                    transit_packet::inventory_then_dhcp(inventory_scope, || {
+                        if transit_packet::dhcp_server_broadcast(&p)
+                            || transit_packet::dhcpv6_client_multicast(&p)
+                        {
+                            return true;
+                        }
+                        let trusted = (view.trusted as usize).min(data.len());
+                        match transit_packet::dhcp_reply(&p, &data[..trusted], view.offload != 0) {
+                            transit_packet::DhcpReply::Match => true,
+                            transit_packet::DhcpReply::NoMatch => false,
+                            transit_packet::DhcpReply::NeedMore => {
+                                read_dhcp_reply(nb, nbl, &p, &mut scratch)
+                            }
+                        }
+                    })
                 });
                 if batch.observe_ip(p, scope).is_err() {
                     with_state(|e| {

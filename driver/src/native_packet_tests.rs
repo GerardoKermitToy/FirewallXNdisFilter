@@ -917,6 +917,48 @@ fn snapshots_borrow_contiguous_bytes_or_copy_owned_bytes_without_advancing_offse
 }
 
 #[test]
+fn expanded_snapshot_copies_split_mdls_without_advancing_offsets() {
+    reset(None);
+    let bytes: Vec<u8> = (0..602).map(|n| (n % 251) as u8).collect();
+    for split in [280, 281, 282, 320, 321] {
+        let mut inputs = [Input::new(&[&bytes[..split], &bytes[split..]], 2, 600)];
+        let mut source = source(&mut inputs);
+        unsafe {
+            allocate_packet_context(&mut *source);
+            let packet = &mut *source as *mut NET_BUFFER_LIST as usize;
+            let nb = fwx_first_nb(packet);
+            let (mut copied, mut trusted, mut length, mut offload) = (0, 0, 0, 0);
+            let mut scratch = vec![0; 600];
+            assert_eq!(
+                fwx_snapshot_view(
+                    nb,
+                    packet,
+                    scratch.as_mut_ptr(),
+                    600,
+                    &mut copied,
+                    &mut trusted,
+                    &mut length,
+                    &mut offload,
+                ),
+                scratch.as_ptr()
+            );
+            assert_eq!((copied, trusted, length, offload), (600, 600, 600, 0));
+            assert_eq!(scratch, &bytes[2..]);
+            assert_eq!(current_mdl_offset(nb.cast()), 2);
+            assert_eq!(
+                (*nb.cast::<NET_BUFFER>())
+                    .__bindgen_anon_1
+                    .__bindgen_anon_1
+                    .DataOffset,
+                2
+            );
+            free_packet_context(&mut *source);
+        }
+    }
+    assert_no_leaks();
+}
+
+#[test]
 fn split_snapshots_require_scratch_and_report_observed_length_on_mapping_failure() {
     reset(None);
     let mut inputs = [Input::new(&[b"xxabc", b"defyy"], 2, 6)];

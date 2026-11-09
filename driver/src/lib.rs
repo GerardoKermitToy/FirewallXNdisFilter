@@ -499,9 +499,7 @@ fn classify(
                     let inventory_scope = transit_packet::IpScope::Transit;
 
                     transit_packet::inventory_then_dhcp(inventory_scope, || {
-                        if transit_packet::dhcp_server_broadcast(&p)
-                            || transit_packet::dhcpv6_client_multicast(&p)
-                        {
+                        if transit_packet::dhcp_server_broadcast(&p) {
                             return true;
                         }
                         let trusted = (view.trusted as usize).min(data.len());

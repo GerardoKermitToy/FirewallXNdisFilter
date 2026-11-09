@@ -12,15 +12,25 @@ pub(crate) enum IpScope {
     Unknown,
 }
 
-/// DHCP client broadcasts use addresses and ports only. The other destination
-/// exceptions require IPv4 TTL or IPv6 Hop Limit 1.
+/// IGMP multicast, DHCP client broadcasts and exact mDNS tuples bypass policy
+/// at any hop limit; other destination exceptions require TTL/Hop Limit 1.
 pub(crate) fn ip_scope(packet: &Packet, lookup: impl FnOnce() -> IpScope) -> IpScope {
     const IPV4_UNSPECIFIED: [u8; 4] = [0; 4];
     const IPV4_LIMITED_BROADCAST: [u8; 4] = [255; 4];
+    const IP_PROTOCOL_IGMP: u8 = 2;
     const IP_PROTOCOL_UDP: u8 = 17;
     const DHCP_CLIENT_PORT: u16 = 68;
     const DHCP_SERVER_PORT: u16 = 67;
+    const MDNS_PORT: u16 = 5353;
+    const IPV4_MULTICAST_MASK: u8 = 0xf0;
+    const IPV4_MULTICAST_PREFIX: u8 = 0xe0;
 
+    if packet.flow.protocol == IP_PROTOCOL_IGMP
+        && !packet.flow.ipv6
+        && packet.flow.destination[0] & IPV4_MULTICAST_MASK == IPV4_MULTICAST_PREFIX
+    {
+        return IpScope::Local;
+    }
     if !packet.flow.ipv6
         && packet.flow.protocol == IP_PROTOCOL_UDP
         && packet.flow.source.starts_with(&IPV4_UNSPECIFIED)
@@ -31,6 +41,19 @@ pub(crate) fn ip_scope(packet: &Packet, lookup: impl FnOnce() -> IpScope) -> IpS
         return IpScope::Local;
     }
     if packet.hop_limit != 1 {
+        const IPV4_MDNS: [u8; 4] = [224, 0, 0, 251];
+        const IPV6_MDNS: [u8; 16] = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xfb];
+        if packet.flow.protocol == IP_PROTOCOL_UDP
+            && packet.flow.source_port == MDNS_PORT
+            && packet.flow.destination_port == MDNS_PORT
+            && if packet.flow.ipv6 {
+                packet.flow.destination == IPV6_MDNS
+            } else {
+                packet.flow.destination.starts_with(&IPV4_MDNS)
+            }
+        {
+            return IpScope::Local;
+        }
         return lookup();
     }
 
@@ -510,6 +533,328 @@ mod tests {
         frame[30..34].copy_from_slice(&[224, 0, 0, 251]);
         frame[36..38].copy_from_slice(&5353u16.to_be_bytes());
         frame
+    }
+
+    fn mdns_frame(ipv6: bool, payload: &[u8]) -> Vec<u8> {
+        let mut frame = if ipv6 {
+            let mut frame = self::ipv6();
+            frame[21] = 64;
+            frame[38..54]
+                .copy_from_slice(&[0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xfb]);
+            frame[54..56].copy_from_slice(&5353u16.to_be_bytes());
+            frame[56..58].copy_from_slice(&5353u16.to_be_bytes());
+            frame
+        } else {
+            let mut frame = mdns_udp_frame();
+            frame[22] = 64;
+            frame[34..36].copy_from_slice(&5353u16.to_be_bytes());
+            frame
+        };
+        frame.extend_from_slice(payload);
+        if ipv6 {
+            let udp_len = (frame.len() - 54) as u16;
+            frame[18..20].copy_from_slice(&udp_len.to_be_bytes());
+            frame[58..60].copy_from_slice(&udp_len.to_be_bytes());
+        } else {
+            let ip_len = (frame.len() - 14) as u16;
+            let udp_len = (frame.len() - 34) as u16;
+            frame[16..18].copy_from_slice(&ip_len.to_be_bytes());
+            frame[38..40].copy_from_slice(&udp_len.to_be_bytes());
+        }
+        frame
+    }
+
+    #[test]
+    fn mdns_exact_tuple_bypasses_policy_at_any_hop_limit_and_direction() {
+        for ipv6 in [false, true] {
+            for hop in [0, 1, 2, 64, 128, 255] {
+                for payload in [&[][..], &[1, 2, 3, 4][..]] {
+                    let mut frame = mdns_frame(ipv6, payload);
+                    frame[if ipv6 { 21 } else { 22 }] = hop;
+                    for offload in [false, true] {
+                        let packet = packet::parse(&frame, frame.len(), frame.len(), offload)
+                            .unwrap()
+                            .unwrap();
+                        for path in [packet::NdisPath::Send, packet::NdisPath::Receive] {
+                            let mut packet = packet;
+                            packet.orient(path);
+                            let scope = ip_scope(&packet, || panic!("mDNS needs no inventory"));
+                            let mut batch = PacketBatch::new();
+                            batch.observe_ip(packet, scope).unwrap();
+                            assert!(matches!(batch.finish(), Ok(BatchDecision::Local)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mdns_requires_exact_destination_udp_and_both_ports() {
+        for ipv6 in [false, true] {
+            let base = mdns_frame(ipv6, &[]);
+            let (source_port, destination_port, destination, protocol) = if ipv6 {
+                (54, 56, 53, 20)
+            } else {
+                (34, 36, 33, 23)
+            };
+            let mut other_group = base.clone();
+            other_group[destination] ^= 1;
+            let mut other_source_port = base.clone();
+            other_source_port[source_port..source_port + 2].copy_from_slice(&5354u16.to_be_bytes());
+            let mut other_destination_port = base.clone();
+            other_destination_port[destination_port..destination_port + 2]
+                .copy_from_slice(&5354u16.to_be_bytes());
+            let mut other_protocol = base;
+            other_protocol[protocol] = if ipv6 { 58 } else { 1 };
+            for frame in [
+                other_group,
+                other_source_port,
+                other_destination_port,
+                other_protocol,
+            ] {
+                let packet = parsed_frame(&frame);
+                for scope in [IpScope::Local, IpScope::Transit, IpScope::Unknown] {
+                    assert_eq!(ip_scope(&packet, || scope), scope);
+                }
+            }
+        }
+        let mut other_scope = mdns_frame(true, &[]);
+        other_scope[39] = 0x12;
+        assert_eq!(
+            ip_scope(&parsed_frame(&other_scope), || IpScope::Transit),
+            IpScope::Transit
+        );
+    }
+
+    #[test]
+    fn mdns_accepts_any_source_but_not_malformed_udp() {
+        for ipv6 in [false, true] {
+            for source_byte in [0, 1, 255] {
+                let mut frame = mdns_frame(ipv6, &[]);
+                frame[if ipv6 { 37 } else { 29 }] = source_byte;
+                assert_eq!(
+                    ip_scope(&parsed_frame(&frame), || IpScope::Transit),
+                    IpScope::Local
+                );
+            }
+            let mut frame = mdns_frame(ipv6, &[]);
+            let length_offset = if ipv6 { 58 } else { 38 };
+            frame[length_offset..length_offset + 2].copy_from_slice(&7u16.to_be_bytes());
+            assert!(matches!(
+                packet::parse(&frame, frame.len(), frame.len(), false),
+                Err(ParseError::Malformed)
+            ));
+        }
+    }
+
+    #[test]
+    fn mdns_fragments_without_validated_ports_keep_existing_scope() {
+        for fragment in [0x2000u16, 0x0001] {
+            let mut frame = mdns_frame(false, &[]);
+            frame[20..22].copy_from_slice(&fragment.to_be_bytes());
+            let packet = parsed_frame(&frame);
+            assert_eq!(
+                (packet.flow.source_port, packet.flow.destination_port),
+                (0, 0)
+            );
+            assert_eq!(ip_scope(&packet, || IpScope::Transit), IpScope::Transit);
+            frame[22] = 1;
+            assert_eq!(
+                ip_scope(&parsed_frame(&frame), || IpScope::Transit),
+                IpScope::Local
+            );
+        }
+        for fragment in [0u16, 8] {
+            let mut frame = mdns_frame(true, &[]);
+            frame[20] = 44;
+            frame.splice(54..54, [17, 0, 0, 0, 0, 0, 0, 0]);
+            frame[56..58].copy_from_slice(&fragment.to_be_bytes());
+            let payload_len = (frame.len() - 54) as u16;
+            frame[18..20].copy_from_slice(&payload_len.to_be_bytes());
+            let packet = parsed_frame(&frame);
+            assert_eq!(
+                (packet.flow.source_port, packet.flow.destination_port),
+                (0, 0)
+            );
+            assert_eq!(ip_scope(&packet, || IpScope::Transit), IpScope::Transit);
+            frame[21] = 1;
+            assert_eq!(
+                ip_scope(&parsed_frame(&frame), || IpScope::Transit),
+                IpScope::Local
+            );
+        }
+    }
+
+    #[test]
+    fn mdns_ipv6_extension_headers_use_the_bounded_transport_parser() {
+        for extension_type in [0, 43, 60, 51] {
+            let mut frame = mdns_frame(true, &[]);
+            frame[20] = extension_type;
+            frame.splice(54..54, [17, 0, 0, 0, 0, 0, 0, 0]);
+            let payload_len = (frame.len() - 54) as u16;
+            frame[18..20].copy_from_slice(&payload_len.to_be_bytes());
+            let packet = parsed_frame(&frame);
+            assert_eq!(ip_scope(&packet, || IpScope::Transit), IpScope::Local);
+        }
+        let mut frame = mdns_frame(true, &[]);
+        frame[20] = 0;
+        let mut extension = vec![0; 272];
+        extension[0] = 17;
+        extension[1] = 33;
+        frame.splice(54..54, extension);
+        let payload_len = (frame.len() - 54) as u16;
+        frame[18..20].copy_from_slice(&payload_len.to_be_bytes());
+        let packet = packet::parse(&frame[..320], 320, frame.len(), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (packet.flow.source_port, packet.flow.destination_port),
+            (0, 0)
+        );
+        assert_eq!(ip_scope(&packet, || IpScope::Transit), IpScope::Transit);
+    }
+
+    #[test]
+    fn igmp_multicast_bypasses_policy_at_any_ttl_and_direction() {
+        for destination in [
+            [224, 0, 0, 0],
+            [224, 0, 0, 251],
+            [225, 1, 2, 3],
+            [232, 1, 2, 3],
+            [239, 192, 152, 143],
+            [239, 255, 255, 250],
+            [239, 255, 255, 255],
+        ] {
+            for ttl in [0, 1, 2, 64, 128, 255] {
+                for fragment in [0u16, 0x2000, 1] {
+                    let mut frame = discovery_frame();
+                    frame[22] = ttl;
+                    frame[23] = 2;
+                    frame[20..22].copy_from_slice(&fragment.to_be_bytes());
+                    frame[30..34].copy_from_slice(&destination);
+                    for offload in [false, true] {
+                        let packet = packet::parse(&frame, frame.len(), frame.len(), offload)
+                            .unwrap()
+                            .unwrap();
+                        for path in [packet::NdisPath::Send, packet::NdisPath::Receive] {
+                            let mut packet = packet;
+                            packet.orient(path);
+                            assert_eq!(
+                                ip_scope(&packet, || panic!("IGMP multicast needs no inventory")),
+                                IpScope::Local
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn igmp_exemption_requires_ipv4_multicast_destination() {
+        // Test both boundaries and every first octet, avoiding other exceptions.
+        for first_octet in 0u8..=u8::MAX {
+            let mut frame = discovery_frame();
+            frame[22] = 64;
+            frame[23] = 2;
+            frame[30..34].copy_from_slice(&[first_octet, 1, 2, 3]);
+            let packet = parsed_frame(&frame);
+            let expected = if (224..=239).contains(&first_octet) {
+                IpScope::Local
+            } else {
+                IpScope::Transit
+            };
+            assert_eq!(
+                ip_scope(&packet, || IpScope::Transit),
+                expected,
+                "{first_octet}"
+            );
+        }
+        for ttl in [0, 1, 2, 255] {
+            for destination in [[192, 0, 2, 99], [223, 255, 255, 255], [240, 0, 0, 0]] {
+                let mut frame = discovery_frame();
+                frame[22] = ttl;
+                frame[23] = 2;
+                frame[30..34].copy_from_slice(&destination);
+                let packet = parsed_frame(&frame);
+                for original in [IpScope::Local, IpScope::Transit, IpScope::Unknown] {
+                    assert_eq!(ip_scope(&packet, || original), original);
+                }
+            }
+        }
+        let mut other_family = ipv6();
+        other_family[20] = 2;
+        other_family[21] = 64;
+        other_family[38..54]
+            .copy_from_slice(&[0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xfb]);
+        assert_eq!(
+            ip_scope(&parsed_frame(&other_family), || IpScope::Transit),
+            IpScope::Transit
+        );
+    }
+
+    #[test]
+    fn igmpv3_query_with_router_alert_bypasses_policy() {
+        let mut frame = vec![0; 14];
+        frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        // Synthetic IGMPv3 group-specific query with an IPv4 Router Alert option.
+        frame.extend_from_slice(&[
+            0x46, 0x00, 0x00, 0x24, 0xed, 0x3e, 0x40, 0x00, 0x01, 0x02, 0xad, 0x43, 0xc0, 0x00,
+            0x02, 0x01, 0xef, 0xc0, 0x98, 0x8f, 0x94, 0x04, 0x00, 0x00, 0x11, 0x0a, 0x64, 0x28,
+            0xef, 0xc0, 0x98, 0x8f, 0x02, 0x7d, 0x00, 0x00,
+        ]);
+        let packet = parsed_frame(&frame);
+        assert_eq!(&packet.flow.destination[..4], &[239, 192, 152, 143]);
+        assert_eq!(packet.flow.protocol, 2);
+        assert_eq!(ip_scope(&packet, || IpScope::Transit), IpScope::Local);
+    }
+
+    #[test]
+    fn igmp_multicast_does_not_exempt_other_protocols() {
+        for protocol in [1, 17, 58] {
+            let mut frame = discovery_frame();
+            frame[22] = 64;
+            frame[23] = protocol;
+            frame[30..34].copy_from_slice(&[239, 192, 152, 143]);
+            let packet = parsed_frame(&frame);
+            for original in [IpScope::Local, IpScope::Transit, IpScope::Unknown] {
+                assert_eq!(ip_scope(&packet, || original), original);
+            }
+        }
+    }
+
+    #[test]
+    fn new_multicast_exceptions_and_transit_split_in_either_order() {
+        let mut igmp = discovery_frame();
+        igmp[23] = 2;
+        let mut other_igmp = igmp.clone();
+        other_igmp[30..34].copy_from_slice(&[192, 0, 2, 99]);
+        for (local, transit) in [
+            (mdns_frame(false, &[]), {
+                let mut frame = mdns_frame(false, &[]);
+                frame[34..36].copy_from_slice(&5354u16.to_be_bytes());
+                frame
+            }),
+            (mdns_frame(true, &[]), {
+                let mut frame = mdns_frame(true, &[]);
+                frame[54..56].copy_from_slice(&5354u16.to_be_bytes());
+                frame
+            }),
+            (igmp, other_igmp),
+        ] {
+            let local = parsed_frame(&local);
+            let transit = parsed_frame(&transit);
+            for packets in [[local, transit], [transit, local]] {
+                let mut batch = PacketBatch::new();
+                for packet in packets {
+                    batch
+                        .observe_ip(packet, ip_scope(&packet, || IpScope::Transit))
+                        .unwrap();
+                }
+                assert!(matches!(batch.finish(), Ok(BatchDecision::Mixed)));
+            }
+        }
     }
 
     // Synthetic headers only: the DHCP exception does not inspect UDP payload.

@@ -1,4 +1,4 @@
-//! A machine-wide NETIO unicast/anycast inventory for the NDIS fast path.
+//! A machine-wide NETIO address and IPv4 directed-broadcast inventory.
 //!
 //! `start` and `stop` are serialized by the driver lifecycle at PASSIVE_LEVEL.
 //! Start before admitting packet callbacks; stop only after packet admission is
@@ -69,14 +69,22 @@ impl Address {
     }
 }
 
-// One nonpaged allocation contains the header followed by `len` sorted
-// addresses. Only the worker constructs and frees snapshots. The rundown
-// reference is acquired under STATE_LOCK before a fast-path reader sees it.
+#[derive(Clone, Copy)]
+struct Entry {
+    address: Address,
+    // A directed broadcast only matches a destination, not a source.
+    local: bool,
+}
+
+// One nonpaged allocation contains the header followed by sorted, deduplicated
+// addresses. The worker precomputes directed broadcasts and merges them into
+// the same index so packet lookups still need at most two binary searches. The
+// rundown reference is acquired under STATE_LOCK before a reader sees it.
 #[repr(C)]
 struct Snapshot {
     rundown: EX_RUNDOWN_REF,
     len: usize,
-    addresses: [Address; 0],
+    addresses: [Entry; 0],
 }
 
 static mut STATE_LOCK: KSPIN_LOCK = 0;
@@ -185,11 +193,15 @@ fn lookup(source: Address, destination: Address) -> LocalMatch {
         unlock(irql);
 
         let addresses = slice::from_raw_parts(
-            addr_of!((*snapshot).addresses).cast::<Address>(),
+            addr_of!((*snapshot).addresses).cast::<Entry>(),
             (*snapshot).len,
         );
-        let found = addresses.binary_search(&source).is_ok()
-            || addresses.binary_search(&destination).is_ok();
+        let found = addresses
+            .binary_search_by_key(&source, |entry| entry.address)
+            .is_ok_and(|index| addresses[index].local)
+            || addresses
+                .binary_search_by_key(&destination, |entry| entry.address)
+                .is_ok();
         #[cfg(test)]
         api::lookup_checkpoint();
 
@@ -431,6 +443,17 @@ unsafe fn read_address(address: &SOCKADDR_INET) -> Option<Address> {
     }
 }
 
+/// RFC 3021 /31 links and /32 host routes have no directed broadcast. A /0
+/// would only yield the limited broadcast, which is handled without inventory.
+fn directed_broadcast(address: Address, prefix: u8) -> Option<Address> {
+    if address.family != Family::V4 || !(1..=30).contains(&prefix) {
+        return None;
+    }
+    let bytes = address.bytes;
+    let ip = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    Some(Address::v4((ip | (u32::MAX >> prefix)).to_be_bytes()))
+}
+
 unsafe fn snapshot_from_tables(
     unicast: PMIB_UNICASTIPADDRESS_TABLE,
     anycast: PMIB_ANYCASTIPADDRESS_TABLE,
@@ -446,13 +469,14 @@ unsafe fn snapshot_from_tables(
         } else {
             (*anycast).NumEntries as usize
         };
-        let Some((count, size)) = unicast_count.checked_add(anycast_count).and_then(|count| {
-            count
-                .checked_mul(size_of::<Address>())
-                .and_then(|n| size_of::<Snapshot>().checked_add(n))
-                .filter(|n| *n <= isize::MAX as usize)
-                .map(|size| (count, size))
-        }) else {
+        // Each unicast row contributes at most one extra directed broadcast.
+        let Some(size) = unicast_count
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(anycast_count))
+            .and_then(|count| count.checked_mul(size_of::<Entry>()))
+            .and_then(|n| size_of::<Snapshot>().checked_add(n))
+            .filter(|n| *n <= isize::MAX as usize)
+        else {
             return ptr::null_mut();
         };
         let snapshot = crate::native::pool_allocation(api::ExAllocatePool2(
@@ -473,21 +497,54 @@ unsafe fn snapshot_from_tables(
         } else {
             addr_of!((*anycast).Table).cast::<MIB_ANYCASTIPADDRESS_ROW>()
         };
-        let addresses = addr_of_mut!((*snapshot).addresses).cast::<Address>();
-        for i in 0..count {
-            let address = if i < unicast_count {
-                &(*unicast_rows.add(i)).Address
-            } else {
-                &(*anycast_rows.add(i - unicast_count)).Address
-            };
-            let Some(value) = read_address(address) else {
+        let addresses = addr_of_mut!((*snapshot).addresses).cast::<Entry>();
+        let mut count = 0;
+        for i in 0..unicast_count {
+            let row = &*unicast_rows.add(i);
+            let Some(address) = read_address(&row.Address) else {
                 free_snapshot(snapshot);
                 return ptr::null_mut();
             };
-            addresses.add(i).write(value);
+            if address.family == Family::V4 && row.OnLinkPrefixLength > 32 {
+                free_snapshot(snapshot);
+                return ptr::null_mut();
+            }
+            addresses.add(count).write(Entry {
+                address,
+                local: true,
+            });
+            count += 1;
+            if let Some(address) = directed_broadcast(address, row.OnLinkPrefixLength) {
+                addresses.add(count).write(Entry {
+                    address,
+                    local: false,
+                });
+                count += 1;
+            }
         }
-        (*snapshot).len = count;
-        slice::from_raw_parts_mut(addresses, count).sort_unstable();
+        for i in 0..anycast_count {
+            let Some(address) = read_address(&(*anycast_rows.add(i)).Address) else {
+                free_snapshot(snapshot);
+                return ptr::null_mut();
+            };
+            addresses.add(count).write(Entry {
+                address,
+                local: true,
+            });
+            count += 1;
+        }
+        slice::from_raw_parts_mut(addresses, count).sort_unstable_by_key(|entry| entry.address);
+        let mut unique = 0;
+        for i in 0..count {
+            let entry = addresses.add(i).read();
+            if unique > 0 && (*addresses.add(unique - 1)).address == entry.address {
+                (*addresses.add(unique - 1)).local |= entry.local;
+            } else {
+                addresses.add(unique).write(entry);
+                unique += 1;
+            }
+        }
+        (*snapshot).len = unique;
         snapshot
     }
 }

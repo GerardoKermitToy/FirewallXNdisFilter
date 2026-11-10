@@ -14,6 +14,7 @@ use std::{
 #[derive(Clone)]
 enum Row {
     V4([u8; 4], u32),
+    V4Prefix([u8; 4], u32, u8),
     V6([u8; 16], u32),
     Invalid,
 }
@@ -137,20 +138,115 @@ fn snapshot_matches_either_endpoint_across_all_interfaces_and_families() {
 }
 
 #[test]
+fn directed_broadcast_calculation_handles_all_ipv4_prefix_lengths() {
+    let address = Address::v4([192, 168, 7, 11]);
+    for prefix in 1..=30 {
+        let expected = u32::from_be_bytes([192, 168, 7, 11]) | (u32::MAX >> prefix);
+        assert!(directed_broadcast(address, prefix) == Some(Address::v4(expected.to_be_bytes())));
+    }
+    for prefix in [0, 31, 32, 33, 255] {
+        assert!(directed_broadcast(address, prefix).is_none());
+    }
+    assert!(directed_broadcast(Address::v6(V6), 24).is_none());
+}
+
+#[test]
+fn broadcast_destinations_follow_windows_prefixes_and_notifications() {
+    let _serial = serial();
+    reset();
+    let broadcast_a = [192, 168, 7, 255];
+    let broadcast_b = [10, 9, 15, 255];
+    fake().rows = vec![
+        Row::V4Prefix(A, 1, 24),
+        Row::V4Prefix([192, 168, 7, 99], 3, 24),
+        Row::V4Prefix(B, 2, 21),
+    ];
+    fake().anycast_rows = vec![Row::V4Prefix([203, 0, 113, 1], 4, 24)];
+    start_test();
+    wait_match(LocalMatch::Local, C, broadcast_a);
+    assert_eq!(lookup_v4(C, broadcast_b), LocalMatch::Local);
+    assert_eq!(lookup_v4(broadcast_a, C), LocalMatch::Transit);
+    assert_eq!(lookup_v4(C, [192, 168, 7, 254]), LocalMatch::Transit);
+    assert_eq!(lookup_v4(C, [10, 9, 8, 255]), LocalMatch::Transit);
+    // Anycast addresses match endpoints but never supply subnet prefixes.
+    assert_eq!(lookup_v4(C, [203, 0, 113, 1]), LocalMatch::Local);
+    assert_eq!(lookup_v4(C, [203, 0, 113, 255]), LocalMatch::Transit);
+    // A callback racing a successful broadcast match invalidates the answer.
+    fake().checkpoint_change = true;
+    assert_eq!(lookup_v4(C, broadcast_a), LocalMatch::Unknown);
+    wait_match(LocalMatch::Local, C, broadcast_a);
+    change(vec![Row::V4Prefix(A, 1, 25)]);
+    wait_match(LocalMatch::Local, C, [192, 168, 7, 127]);
+    assert_eq!(lookup_v4(C, broadcast_a), LocalMatch::Transit);
+    assert_eq!(lookup_v4(C, broadcast_b), LocalMatch::Transit);
+    stop_test();
+}
+
+#[test]
+fn host_and_point_to_point_prefixes_never_add_broadcasts() {
+    let _serial = serial();
+    reset();
+    fake().rows = vec![
+        Row::V4Prefix([192, 0, 2, 0], 1, 31),
+        Row::V4Prefix([198, 51, 100, 1], 2, 32),
+        Row::V4Prefix([203, 0, 113, 1], 3, 0),
+    ];
+    start_test();
+    wait_match(LocalMatch::Local, [192, 0, 2, 0], C);
+    assert_eq!(lookup_v4(C, [192, 0, 2, 1]), LocalMatch::Transit);
+    assert_eq!(lookup_v4(C, [198, 51, 100, 255]), LocalMatch::Transit);
+    stop_test();
+}
+
+#[test]
+fn overlapping_broadcast_and_local_addresses_keep_source_matches() {
+    let _serial = serial();
+    reset();
+    let overlap = [192, 168, 7, 255];
+    fake().rows = vec![Row::V4Prefix(A, 1, 24)];
+    fake().anycast_rows = vec![Row::V4(overlap, 2)];
+    start_test();
+    wait_match(LocalMatch::Local, overlap, C);
+    assert_eq!(lookup_v4(C, overlap), LocalMatch::Local);
+    fake().anycast_rows.clear();
+    change(vec![Row::V4Prefix(A, 1, 24)]);
+    wait_match(LocalMatch::Transit, overlap, C);
+    assert_eq!(lookup_v4(C, overlap), LocalMatch::Local);
+    stop_test();
+}
+
+#[test]
+fn invalid_ipv4_prefix_does_not_publish_partial_inventory() {
+    let _serial = serial();
+    reset();
+    fake().rows = vec![Row::V4Prefix(A, 1, 33)];
+    start_test();
+    wait_for(|s| s.anycast_calls >= 1);
+    assert_eq!(lookup_v4(C, [192, 168, 7, 255]), LocalMatch::Unknown);
+    assert!(!available());
+    change(vec![Row::V4Prefix(A, 1, 24)]);
+    wait_match(LocalMatch::Local, C, [192, 168, 7, 255]);
+    stop_test();
+}
+
+#[test]
 fn callback_during_initial_snapshot_cannot_publish_stale_table() {
     let _serial = serial();
     reset();
     {
         let mut state = fake();
-        state.rows = vec![Row::V4(A, 1)];
-        state.mutate_during_get = Some(vec![Row::V4(B, 2)]);
+        state.rows = vec![Row::V4Prefix(A, 1, 24)];
+        state.mutate_during_get = Some(vec![Row::V4Prefix(B, 2, 21)]);
     }
     start_test();
     wait_for(|s| s.table_calls >= 1);
     // The first table was captured before the injected callback; it must not
     // become a valid answer while the worker is delayed before retrying.
     assert_eq!(lookup_v4(A, C), LocalMatch::Unknown);
+    assert_eq!(lookup_v4(C, [192, 168, 7, 255]), LocalMatch::Unknown);
     wait_match(LocalMatch::Local, B, C);
+    assert_eq!(lookup_v4(C, [10, 9, 15, 255]), LocalMatch::Local);
+    assert_eq!(lookup_v4(C, [192, 168, 7, 255]), LocalMatch::Transit);
     assert_eq!(lookup_v4(A, C), LocalMatch::Transit);
     assert!(fake().notify_calls >= 1);
     assert!(fake().table_calls >= 2);
@@ -161,16 +257,20 @@ fn callback_during_initial_snapshot_cannot_publish_stale_table() {
 fn dirty_failure_and_retry_never_report_transit_from_old_state() {
     let _serial = serial();
     reset();
-    fake().rows = vec![Row::V4(A, 1)];
+    fake().rows = vec![Row::V4Prefix(A, 1, 24)];
     start_test();
     wait_match(LocalMatch::Local, A, C);
     fake().table_failures = 10_000;
-    change(vec![Row::V4(B, 4)]);
+    change(vec![Row::V4Prefix(B, 4, 21)]);
     wait_for(|s| s.table_calls >= 2);
     assert_eq!(lookup_v4(A, C), LocalMatch::Unknown);
     assert_eq!(lookup_v4(B, C), LocalMatch::Unknown);
+    assert_eq!(lookup_v4(C, [192, 168, 7, 255]), LocalMatch::Unknown);
+    assert_eq!(lookup_v4(C, [10, 9, 15, 255]), LocalMatch::Unknown);
     fake().table_failures = 0;
     wait_match(LocalMatch::Local, B, C);
+    assert_eq!(lookup_v4(C, [10, 9, 15, 255]), LocalMatch::Local);
+    assert_eq!(lookup_v4(C, [192, 168, 7, 255]), LocalMatch::Transit);
     assert_eq!(lookup_v4(A, C), LocalMatch::Transit);
     stop_test();
 }
@@ -594,10 +694,17 @@ pub(super) mod api {
             for (i, row) in rows.into_iter().enumerate() {
                 let entry = &mut *target.add(i);
                 match row {
-                    Row::V4(bytes, index) => {
+                    Row::V4(bytes, index) | Row::V4Prefix(bytes, index, 32) => {
                         entry.Address.Ipv4.sin_family = AF_INET as ADDRESS_FAMILY;
                         entry.Address.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(bytes);
                         entry.InterfaceIndex = index;
+                        entry.OnLinkPrefixLength = 32;
+                    }
+                    Row::V4Prefix(bytes, index, prefix) => {
+                        entry.Address.Ipv4.sin_family = AF_INET as ADDRESS_FAMILY;
+                        entry.Address.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(bytes);
+                        entry.InterfaceIndex = index;
+                        entry.OnLinkPrefixLength = prefix;
                     }
                     Row::V6(bytes, index) => {
                         entry.Address.Ipv6.sin6_family = AF_INET6 as ADDRESS_FAMILY;
@@ -648,7 +755,7 @@ pub(super) mod api {
             for (i, row) in rows.into_iter().enumerate() {
                 let entry = &mut *target.add(i);
                 match row {
-                    Row::V4(bytes, index) => {
+                    Row::V4(bytes, index) | Row::V4Prefix(bytes, index, _) => {
                         entry.Address.Ipv4.sin_family = AF_INET as ADDRESS_FAMILY;
                         entry.Address.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(bytes);
                         entry.InterfaceIndex = index;

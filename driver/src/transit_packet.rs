@@ -12,37 +12,22 @@ pub(crate) enum IpScope {
     Unknown,
 }
 
-/// All IPv4/IPv6 multicast and DHCP client broadcasts bypass policy at any
-/// hop limit; IPv4 limited broadcast also bypasses policy at TTL 1.
+/// Multicast and IPv4 limited broadcast bypass policy without inventory.
+/// Directed broadcasts are included in the inventory lookup.
 pub(crate) fn ip_scope(packet: &Packet, lookup: impl FnOnce() -> IpScope) -> IpScope {
-    const IPV4_UNSPECIFIED: [u8; 4] = [0; 4];
     const IPV4_LIMITED_BROADCAST: [u8; 4] = [255; 4];
     const IPV4_MULTICAST_MASK: u8 = 0xf0;
     const IPV4_MULTICAST_PREFIX: u8 = 0xe0;
     const IPV6_MULTICAST_PREFIX: u8 = 0xff;
-    const IP_PROTOCOL_UDP: u8 = 17;
-    const DHCP_CLIENT_PORT: u16 = 68;
-    const DHCP_SERVER_PORT: u16 = 67;
 
     let destination = &packet.flow.destination;
-    let multicast = if packet.flow.ipv6 {
+    let bypass = if packet.flow.ipv6 {
         destination[0] == IPV6_MULTICAST_PREFIX
     } else {
         destination[0] & IPV4_MULTICAST_MASK == IPV4_MULTICAST_PREFIX
+            || destination.starts_with(&IPV4_LIMITED_BROADCAST)
     };
-    if multicast {
-        return IpScope::Local;
-    }
-    if !packet.flow.ipv6 && destination.starts_with(&IPV4_LIMITED_BROADCAST) {
-        let dhcp_client = packet.flow.protocol == IP_PROTOCOL_UDP
-            && packet.flow.source.starts_with(&IPV4_UNSPECIFIED)
-            && packet.flow.source_port == DHCP_CLIENT_PORT
-            && packet.flow.destination_port == DHCP_SERVER_PORT;
-        if packet.hop_limit == 1 || dhcp_client {
-            return IpScope::Local;
-        }
-    }
-    lookup()
+    if bypass { IpScope::Local } else { lookup() }
 }
 
 /// Local or unavailable inventory already bypasses policy, so only inspect
@@ -67,14 +52,6 @@ fn dhcp_server_to_client(packet: &Packet) -> bool {
         (DHCPV4_SERVER_PORT, DHCPV4_CLIENT_PORT)
     };
     packet.flow.protocol == UDP && (packet.flow.source_port, packet.flow.destination_port) == ports
-}
-
-/// Broadcast replies are permitted based on the IP/UDP tuple alone.
-pub(crate) fn dhcp_server_broadcast(packet: &Packet) -> bool {
-    const IPV4_LIMITED_BROADCAST: [u8; 4] = [255; 4];
-    !packet.flow.ipv6
-        && dhcp_server_to_client(packet)
-        && packet.flow.destination.starts_with(&IPV4_LIMITED_BROADCAST)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -883,7 +860,7 @@ mod tests {
         }
     }
 
-    // Synthetic headers only: the DHCP exception does not inspect UDP payload.
+    // Synthetic headers are sufficient for the limited-broadcast exemption.
     fn dhcp_frame() -> Vec<u8> {
         let mut frame = ipv4();
         frame[22] = 255;
@@ -915,8 +892,7 @@ mod tests {
     fn dhcp_scope(packet: &Packet, frame: &[u8]) -> IpScope {
         ip_scope(packet, || {
             inventory_then_dhcp(IpScope::Transit, || {
-                dhcp_server_broadcast(packet)
-                    || dhcp_reply(packet, frame, false) == DhcpReply::Match
+                dhcp_reply(packet, frame, false) == DhcpReply::Match
             })
         })
     }
@@ -1094,21 +1070,20 @@ mod tests {
     }
 
     #[test]
-    fn dhcp_server_broadcast_uses_only_ipv4_addresses_and_ports() {
-        for source in [[0, 0, 0, 0], [192, 0, 2, 1]] {
-            for ttl in [0, 1, 2, 64, 128, 255] {
-                for payload in [&[][..], &[3, 1, 4, 1, 5][..]] {
+    fn limited_broadcast_bypasses_inventory_for_protocols_fragments_and_offloads() {
+        for protocol in [1, 2, 6, 17, 99] {
+            for ttl in [0, 1, 2, 64, 255] {
+                for fragment in [0u16, 0x2000, 1] {
                     let mut frame = ipv4();
                     frame[22] = ttl;
-                    frame[26..30].copy_from_slice(&source);
+                    frame[23] = protocol;
+                    frame[20..22].copy_from_slice(&fragment.to_be_bytes());
                     frame[30..34].copy_from_slice(&[255; 4]);
-                    frame[34..36].copy_from_slice(&67u16.to_be_bytes());
-                    frame[36..38].copy_from_slice(&68u16.to_be_bytes());
-                    frame.extend_from_slice(payload);
-                    let ip_len = (28 + payload.len()) as u16;
-                    let udp_len = (8 + payload.len()) as u16;
-                    frame[16..18].copy_from_slice(&ip_len.to_be_bytes());
-                    frame[38..40].copy_from_slice(&udp_len.to_be_bytes());
+                    if protocol == 6 {
+                        frame.resize(14 + 20 + 20, 0);
+                        frame[16..18].copy_from_slice(&40u16.to_be_bytes());
+                        frame[46] = 0x50;
+                    }
                     for offload in [false, true] {
                         let packet = packet::parse(&frame, frame.len(), frame.len(), offload)
                             .unwrap()
@@ -1116,48 +1091,17 @@ mod tests {
                         for path in [packet::NdisPath::Send, packet::NdisPath::Receive] {
                             let mut packet = packet;
                             packet.orient(path);
-                            assert!(dhcp_server_broadcast(&packet));
-                            assert_eq!(dhcp_scope(&packet, &frame), IpScope::Local);
+                            assert_eq!(
+                                ip_scope(&packet, || panic!(
+                                    "limited broadcast needs no inventory"
+                                )),
+                                IpScope::Local
+                            );
                         }
                     }
                 }
             }
         }
-    }
-
-    #[test]
-    fn dhcp_server_broadcast_requires_the_exact_tuple() {
-        let mut valid = dhcp_reply_frame(&[]);
-        valid[22] = 64;
-        let mut wrong_destination = valid.clone();
-        wrong_destination[33] = 254;
-        let mut directed_broadcast = valid.clone();
-        directed_broadcast[30..34].copy_from_slice(&[192, 0, 2, 255]);
-        let mut wrong_source_port = valid.clone();
-        wrong_source_port[34..36].copy_from_slice(&68u16.to_be_bytes());
-        let mut wrong_destination_port = valid.clone();
-        wrong_destination_port[36..38].copy_from_slice(&67u16.to_be_bytes());
-        let mut fragment = valid.clone();
-        fragment[20..22].copy_from_slice(&0x2000u16.to_be_bytes());
-        let mut tcp = valid;
-        tcp[23] = 6;
-        tcp[46] = 0x50;
-        for frame in [
-            wrong_destination,
-            directed_broadcast,
-            wrong_source_port,
-            wrong_destination_port,
-            fragment,
-            tcp,
-        ] {
-            let packet = parsed_frame(&frame);
-            assert!(!dhcp_server_broadcast(&packet));
-            assert_eq!(dhcp_scope(&packet, &frame), IpScope::Transit);
-        }
-        let mut ipv6 = ipv6();
-        ipv6[54..56].copy_from_slice(&67u16.to_be_bytes());
-        ipv6[56..58].copy_from_slice(&68u16.to_be_bytes());
-        assert!(!dhcp_server_broadcast(&parsed_frame(&ipv6)));
     }
 
     fn dhcpv6_frame(message_type: u8, options: &[u8]) -> Vec<u8> {
@@ -1380,37 +1324,16 @@ mod tests {
     }
 
     #[test]
-    fn dhcp_exception_requires_exact_ipv4_udp_addresses_and_ports() {
-        let mut other_source = dhcp_frame();
-        other_source[26..30].copy_from_slice(&[192, 0, 2, 1]);
+    fn non_limited_destinations_still_use_the_inventory() {
         let mut other_destination = dhcp_frame();
         other_destination[30..34].copy_from_slice(&[192, 0, 2, 255]);
-        let mut other_source_port = dhcp_frame();
-        other_source_port[34..36].copy_from_slice(&67u16.to_be_bytes());
-        let mut other_destination_port = dhcp_frame();
-        other_destination_port[36..38].copy_from_slice(&68u16.to_be_bytes());
-        let mut tcp = dhcp_frame();
-        tcp.resize(14 + 20 + 20, 0);
-        tcp[16..18].copy_from_slice(&40u16.to_be_bytes());
-        tcp[23] = 6;
-        tcp[46] = 0x50;
-        let mut fragmented = dhcp_frame();
-        fragmented[20..22].copy_from_slice(&0x2000u16.to_be_bytes());
         let mut ipv6 = ipv6();
         ipv6[21] = 255;
         ipv6[22..38].fill(0);
         ipv6[38..54].copy_from_slice(&[0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         ipv6[54..56].copy_from_slice(&68u16.to_be_bytes());
         ipv6[56..58].copy_from_slice(&67u16.to_be_bytes());
-        for frame in [
-            other_source,
-            other_destination,
-            other_source_port,
-            other_destination_port,
-            tcp,
-            fragmented,
-            ipv6,
-        ] {
+        for frame in [other_destination, ipv6] {
             let packet = parsed_frame(&frame);
             for original in [IpScope::Local, IpScope::Transit, IpScope::Unknown] {
                 assert_eq!(ip_scope(&packet, || original), original);
@@ -1422,7 +1345,7 @@ mod tests {
     fn dhcp_and_transit_packets_split_in_either_order() {
         let dhcp = parsed_frame(&dhcp_frame());
         let mut other_frame = dhcp_frame();
-        other_frame[36..38].copy_from_slice(&68u16.to_be_bytes());
+        other_frame[30..34].copy_from_slice(&[192, 0, 2, 99]);
         let transit = parsed_frame(&other_frame);
         for packets in [[dhcp, transit], [transit, dhcp]] {
             let mut batch = PacketBatch::new();
@@ -1435,30 +1358,7 @@ mod tests {
     }
 
     #[test]
-    fn limited_broadcast_depends_on_ttl_and_inventory() {
-        let mut broadcast = ipv4();
-        broadcast[30..34].copy_from_slice(&[255; 4]);
-        assert_eq!(
-            ip_scope(&parsed_frame(&broadcast), || panic!(
-                "unit TTL needs no inventory"
-            )),
-            IpScope::Local
-        );
-        for ttl in [0, 2, 64, 255] {
-            broadcast[22] = ttl;
-            let packet = parsed_frame(&broadcast);
-            for path in [packet::NdisPath::Send, packet::NdisPath::Receive] {
-                let mut packet = packet;
-                packet.orient(path);
-                for original in [IpScope::Local, IpScope::Transit, IpScope::Unknown] {
-                    assert_eq!(ip_scope(&packet, || original), original);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn identical_broadcast_flows_with_different_ttl_split() {
+    fn identical_limited_broadcast_flows_with_different_ttl_stay_local() {
         let mut base = ipv4();
         base[30..34].copy_from_slice(&[255; 4]);
         let unit_hop = parsed_frame(&base);
@@ -1471,7 +1371,7 @@ mod tests {
                 let scope = ip_scope(&packet, || IpScope::Transit);
                 batch.observe_ip(packet, scope).unwrap();
             }
-            assert!(matches!(batch.finish(), Ok(BatchDecision::Mixed)));
+            assert!(matches!(batch.finish(), Ok(BatchDecision::Local)));
         }
     }
 

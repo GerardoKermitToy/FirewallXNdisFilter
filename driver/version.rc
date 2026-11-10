@@ -4,8 +4,8 @@
 LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,3,3,8
- PRODUCTVERSION 0,3,3,8
+ FILEVERSION 0,3,3,9
+ PRODUCTVERSION 0,3,3,9
  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
  FILEFLAGS 0
  FILEOS VOS_NT_WINDOWS32
@@ -18,12 +18,12 @@ BEGIN
         BEGIN
             VALUE "Comments", "https://github.com/GerardoKermitToy/FirewallXNdisFilter"
             VALUE "FileDescription", "FirewallXNdisFilter Rust Host Adapter LWF"
-            VALUE "FileVersion", "0.3.3.8"
+            VALUE "FileVersion", "0.3.3.9"
             VALUE "InternalName", "FirewallXNdisFilter"
             VALUE "LegalCopyright", "skrudjmdk (https://forum.ru-board.com/profile.cgi?action=show&member=skrudjmdk)"
             VALUE "OriginalFilename", "FirewallXNdisFilter.sys"
             VALUE "ProductName", "FirewallXNdisFilter"
-            VALUE "ProductVersion", "0.3.3.8"
+            VALUE "ProductVersion", "0.3.3.9"
         END
     END
     BLOCK "VarFileInfo"

@@ -56,8 +56,6 @@ pub struct Packet {
     pub flow: Flow,
     pub connection: Connection,
     pub cacheable: bool,
-    // IPv4 TTL or IPv6 Hop Limit; never part of the flow/cache identity.
-    pub hop_limit: u8,
     // False for fragments or an incomplete bounded header parse.
     mergeable: bool,
     pub ip_len: u64,      // Total bytes for bandwidth; can aggregate same-flow NBs.
@@ -74,7 +72,6 @@ impl Packet {
         flow: Flow::EMPTY,
         connection: Connection::EMPTY,
         cacheable: false,
-        hop_limit: 0,
         mergeable: false,
         ip_len: 0,
         payload_len: 0,
@@ -230,7 +227,6 @@ pub fn parse_ip(
         if unlikely(total > logical && !offload) {
             return Err(ParseError::Truncated);
         }
-        p.hop_limit = ip[8];
         p.flow.source[..4].copy_from_slice(&ip[12..16]);
         p.flow.destination[..4].copy_from_slice(&ip[16..20]);
         (
@@ -260,7 +256,6 @@ pub fn parse_ip(
         if unlikely(total > logical) {
             return Err(ParseError::Truncated);
         }
-        p.hop_limit = ip[7];
         p.flow.ipv6 = true;
         p.flow.source.copy_from_slice(&ip[8..24]);
         p.flow.destination.copy_from_slice(&ip[24..40]);

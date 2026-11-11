@@ -61,6 +61,7 @@ unsafe extern "C" {
     fn fwx_cache_allocate(size: usize) -> *mut u8;
     fn fwx_cache_free(data: *mut u8, size: usize);
     fn fwx_finish(nbl: usize, finish: u32);
+    fn fwx_is_loopback(nbl: usize) -> u32;
     fn fwx_first_nb(nbl: usize) -> Handle;
     fn fwx_next_nb(nb: Handle) -> Handle;
     fn fwx_snapshot(
@@ -611,6 +612,7 @@ fn classify(
         });
     }
     let cancel = (path == NdisPath::Send).then_some(cancel);
+    let loopback = path == NdisPath::Receive && unsafe { fwx_is_loopback(nbl) != 0 };
     let wants_event = match with_bandwidth(|e, work, now| {
         with_send_guard(send_guard, |cancelled| {
             if cancelled {
@@ -618,6 +620,12 @@ fn classify(
                     nbl,
                     finish: Finish::Cancel,
                 });
+            }
+            if loopback
+                && let Some(finish) =
+                    e.cached_loopback_with_work(interface_index, &packet, now, work)
+            {
+                return Err(Action { nbl, finish });
             }
             e.preflight_with_work(interface_index, &packet, nbl, now, work)
         })
@@ -645,6 +653,11 @@ fn classify(
                     nbl,
                     finish: Finish::Cancel,
                 })
+            } else if loopback
+                && let Some(finish) =
+                    e.cached_loopback_with_work(interface_index, &packet, now, work)
+            {
+                Submission::Finish(Action { nbl, finish })
             } else {
                 e.submit_with_work(
                     interface_index,

@@ -16,7 +16,7 @@ use crate::wdk as api;
 #[cfg(test)]
 use tests::calls as api;
 
-/// MSVC's multi-character pool tag 'gVHH' (not the little-endian byte spelling).
+#[cfg(test)]
 pub(crate) const TAG: u32 = u32::from_be_bytes(*b"gVHH");
 const CONTEXT_TAG: u32 = u32::from_be_bytes(*b"nVHH");
 
@@ -33,7 +33,6 @@ pub(crate) struct PacketContext {
     pub(crate) direction: u32,
     pub(crate) port: NDIS_PORT_NUMBER,
     pub(crate) owner: u32,
-    pub(crate) copied: u8,
     pub(crate) forwarded: u8,
     pub(crate) split: *mut c_void,
 }
@@ -46,7 +45,7 @@ const _: () = {
     assert!(offset_of!(PacketContext, signature) == 8);
     assert!(offset_of!(PacketContext, port) == 20);
     assert!(offset_of!(PacketContext, owner) == 24);
-    assert!(offset_of!(PacketContext, copied) == 28);
+    assert!(offset_of!(PacketContext, forwarded) == 28);
 };
 
 #[inline]
@@ -139,6 +138,7 @@ pub(crate) unsafe fn data_length(nb: *mut NET_BUFFER) -> u32 {
     }
 }
 
+#[cfg(test)]
 #[inline]
 pub(crate) unsafe fn first_mdl(nb: *mut NET_BUFFER) -> *mut MDL {
     unsafe { (*nb).__bindgen_anon_1.__bindgen_anon_1.MdlChain }
@@ -356,96 +356,6 @@ pub(crate) unsafe fn free_split_nbl(nbl: *mut NET_BUFFER_LIST) {
     }
 }
 
-/// Free only a private resources-receive copy built by copy_receive. Every NB
-/// owns exactly one MDL and one pool allocation; even a partial chain is valid.
-pub(crate) unsafe fn free_receive_copy(nbl: *mut NET_BUFFER_LIST) {
-    unsafe {
-        let mut nb = first_nb(nbl);
-        while !nb.is_null() {
-            let next = next_nb(nb);
-            let mdl = first_mdl(nb);
-            // MmGetMdlVirtualAddress. StartVa is page-aligned and may precede
-            // the allocation, so use wrapping pointer arithmetic to recover it.
-            let data = (*mdl)
-                .StartVa
-                .cast::<u8>()
-                .wrapping_add((*mdl).ByteOffset as usize);
-            api::NdisFreeNetBuffer(nb);
-            api::IoFreeMdl(mdl);
-            api::ExFreePoolWithTag(data.cast(), TAG);
-            nb = next;
-        }
-        api::NdisFreeNetBufferList(nbl);
-    }
-}
-
-/// Synchronously deep-copy all NBs before a RESOURCES indication returns. No
-/// original NBL/MDL/borrowed OOB ownership escapes the callback on either path.
-pub(crate) unsafe fn copy_receive(
-    filter: NDIS_HANDLE,
-    nbl_pool: NDIS_HANDLE,
-    nb_pool: NDIS_HANDLE,
-    source: *mut NET_BUFFER_LIST,
-    info_count: u32,
-) -> *mut NET_BUFFER_LIST {
-    unsafe {
-        if !copy_receive_metadata_supported(source, info_count) || first_nb(source).is_null() {
-            return null_mut();
-        }
-        let copy = api::NdisAllocateNetBufferList(nbl_pool, 0, 0);
-        set_first_nb(copy, null_mut());
-        set_next_nbl(copy, null_mut());
-        let mut tail: *mut NET_BUFFER = null_mut();
-        let mut nb = first_nb(source);
-        while !nb.is_null() {
-            let length = data_length(nb);
-            if length == 0 {
-                free_receive_copy(copy);
-                return null_mut();
-            }
-            // The entire allocation is filled below before it is exposed by an NB.
-            let storage = crate::native::pool_allocation(api::ExAllocatePool2(
-                (FWX_WDK_POOL_FLAG_NON_PAGED | FWX_WDK_POOL_FLAG_UNINITIALIZED) as POOL_FLAGS,
-                length as SIZE_T,
-                TAG,
-            ));
-            let data = api::NdisGetDataBuffer(nb, length, storage, 1, 0);
-            if data.is_null() {
-                api::ExFreePoolWithTag(storage, TAG);
-                free_receive_copy(copy);
-                return null_mut();
-            }
-            if data != storage {
-                ptr::copy_nonoverlapping(data.cast::<u8>(), storage.cast::<u8>(), length as usize);
-            }
-            let mdl = api::IoAllocateMdl(storage, length, 0, 0, null_mut());
-            api::MmBuildMdlForNonPagedPool(mdl);
-            let created = api::NdisAllocateNetBuffer(nb_pool, mdl, 0, length as SIZE_T);
-            set_next_nb(created, null_mut());
-            if tail.is_null() {
-                set_first_nb(copy, created);
-            } else {
-                set_next_nb(tail, created);
-            }
-            tail = created;
-            nb = next_nb(nb);
-        }
-        api::NdisCopyReceiveNetBufferListInfo(copy, source);
-        // NdisCopyReceiveNetBufferListInfo does not guarantee copying URO's
-        // scalar SegCount/SegSize. Preserve the complete inline slot explicitly.
-        (*copy).NetBufferListInfo[UdpRecvSegCoalesceOffloadInfo as usize] =
-            (*source).NetBufferListInfo[UdpRecvSegCoalesceOffloadInfo as usize];
-        (*copy).NblFlags = (*source).NblFlags
-            & (NDIS_NBL_FLAGS_IS_IPV4
-                | NDIS_NBL_FLAGS_IS_IPV6
-                | NDIS_NBL_FLAGS_IS_TCP
-                | NDIS_NBL_FLAGS_IS_UDP
-                | NDIS_NBL_FLAGS_IS_LOOPBACK_PACKET);
-        (*copy).SourceHandle = filter;
-        copy
-    }
-}
-
 #[inline]
 pub(crate) unsafe fn snapshot_offload(nbl: *mut NET_BUFFER_LIST) -> u32 {
     unsafe {
@@ -479,6 +389,15 @@ unsafe fn snapshot_view(
         }
         *copied = length;
         data.cast()
+    }
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fwx_is_loopback(packet: usize) -> u32 {
+    unsafe {
+        u32::from(
+            (*(packet as *mut NET_BUFFER_LIST)).NblFlags & NDIS_NBL_FLAGS_IS_LOOPBACK_PACKET != 0,
+        )
     }
 }
 

@@ -149,18 +149,25 @@ bool ParseOptions(int argc, const wchar_t* const* argv, Options& opt, std::strin
                 return false;
             }
             opt.has_alt = true;
-        } else if (arg == L"--match" || arg == L"--filter-ip") {
+        } else if (arg == L"--match" || arg == L"--match-any" || arg == L"--filter-ip") {
+            const bool verdict_match = arg != L"--filter-ip";
+            const bool match_any = arg == L"--match-any";
+            if (verdict_match && opt.match.present && opt.match_any_endpoint != match_any) {
+                error = "--match and --match-any cannot be combined";
+                return false;
+            }
             std::wstring_view value;
             if (!next(value)) {
-                error = arg == L"--match" ? "--match needs IP or IP:PORT" : "--filter-ip needs IP or IP:PORT";
+                error = verdict_match ? "--match/--match-any needs IP or IP:PORT" : "--filter-ip needs IP or IP:PORT";
                 return false;
             }
             Endpoint endpoint;
             if (!ParseEndpoint(value, endpoint, error)) {
-                error = std::string(arg == L"--match" ? "--match: " : "--filter-ip: ") + error;
+                error = std::string(verdict_match ? "--match/--match-any: " : "--filter-ip: ") + error;
                 return false;
             }
-            (arg == L"--match" ? opt.match : opt.filter) = std::move(endpoint);
+            (verdict_match ? opt.match : opt.filter) = std::move(endpoint);
+            if (verdict_match) opt.match_any_endpoint = match_any;
         } else if (arg == L"--filter-protocol") {
             uint64_t protocol = 0;
             if (!number(255, protocol)) {
@@ -175,7 +182,7 @@ bool ParseOptions(int argc, const wchar_t* const* argv, Options& opt, std::strin
         }
     }
     if (opt.match.present && !opt.has_alt) {
-        error = "--match given without --verdict";
+        error = "--match/--match-any given without --verdict";
         return false;
     }
     error.clear();
@@ -196,7 +203,8 @@ bool ShowConnection(const Options& opt, const Connection& c) {
 }
 
 bool AlternateMatches(const Options& opt, const Connection& c) {
-    return opt.has_alt && MatchesEndpoint(opt.match, c.RemoteIpString(), c.remote_port);
+    return opt.has_alt && (MatchesEndpoint(opt.match, c.RemoteIpString(), c.remote_port) ||
+                           (opt.match_any_endpoint && MatchesEndpoint(opt.match, c.LocalIpString(), c.local_port)));
 }
 
 void PrintUsage(FILE* out) {
@@ -220,11 +228,12 @@ void PrintUsage(FILE* out) {
         "  --no-conn              suppress connection/end records.\n"
         "  --no-bandwidth         suppress bandwidth records.\n\n"
         "Verdicts:\n"
-        "  --verdict V [--match IP[:PORT]]\n"
+        "  --verdict V [--match IP[:PORT] | --match-any IP[:PORT]]\n"
         "                   V: accept | permanent-accept | block | permanent-block\n"
         "                      | drop | permanent-drop. Redirects are NOT supported.\n"
         "                   --match tests the remote endpoint in BOTH directions.\n"
-        "                   Unmatched events get PermanentAccept. Without --match,\n"
+        "                   --match-any tests either endpoint (for bridged traffic).\n"
+        "                   Unmatched events get PermanentAccept. Without a match,\n"
         "                   V applies to EVERY event. Default: PermanentAccept.\n"
         "                   TCP/UDP cache only: four tables per interface, TCP/UDP x IPv4/IPv6.\n"
         "                   TCP and UDP use separate caches; both directions share tuples within each.\n"
@@ -233,7 +242,7 @@ void PrintUsage(FILE* out) {
         "  --no-verdicts    do not answer events (pending timeout defaults to 8 s;\n"
         "                   driver is fail-closed by default: unanswered packets are dropped).\n"
         "  --verdict-delay-ms N  delay automatic verdicts by N ms (0..4294967295);\n"
-        "                   only matching events if --match is used. Unsent verdicts\n"
+        "                   only matching events if --match/--match-any is used. Unsent verdicts\n"
         "                   are discarded on stop. No PID suspension is performed.\n"
         "                   Delays >= 8000 ms can expire before a decision is sent.\n\n"
         "Semantics:\n"

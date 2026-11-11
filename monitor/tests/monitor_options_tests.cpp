@@ -77,9 +77,11 @@ bool TestInvalidNumbersAndEndpoints() {
         CHECK(!Parse({L"--duration", L"1", L"--filter-ip", bad}, opt, error));
         opt = {};
         CHECK(!Parse({L"--duration", L"1", L"--verdict", L"accept", L"--match", bad}, opt, error));
+        opt = {};
+        CHECK(!Parse({L"--duration", L"1", L"--verdict", L"accept", L"--match-any", bad}, opt, error));
     }
     for (const wchar_t* option : {L"--duration", L"--poll", L"--out", L"--filter-ip",
-                                 L"--filter-protocol", L"--verdict", L"--verdict-delay-ms", L"--match"}) {
+                                 L"--filter-protocol", L"--verdict", L"--verdict-delay-ms", L"--match", L"--match-any"}) {
         pmkext::monitor::Options opt;
         CHECK(!Parse({L"--duration", L"1", option}, opt, error));
     }
@@ -106,6 +108,12 @@ bool TestRejectedCapabilities() {
     }
     pmkext::monitor::Options bare_match;
     CHECK(!Parse({L"--duration", L"1", L"--match", L"192.0.2.1"}, bare_match, error));
+    pmkext::monitor::Options bare_any;
+    CHECK(!Parse({L"--match-any", L"192.0.2.1"}, bare_any, error));
+    pmkext::monitor::Options mixed;
+    CHECK(!Parse({L"--verdict", L"block", L"--match", L"192.0.2.1", L"--match-any", L"192.0.2.2"}, mixed, error));
+    mixed = {};
+    CHECK(!Parse({L"--verdict", L"block", L"--match-any", L"192.0.2.1", L"--match", L"192.0.2.2"}, mixed, error));
     return true;
 }
 
@@ -175,6 +183,35 @@ bool TestRemoteMatchesAcrossInterfacesAndDirections() {
     return true;
 }
 
+bool TestEitherEndpointVerdictMatch() {
+    std::string error;
+    for (bool ipv6 : {false, true}) {
+        pmkext::Connection c;
+        c.ipv6 = ipv6;
+        c.local_ip[0] = ipv6 ? 0x20 : 203;
+        c.remote_ip[0] = ipv6 ? 0x20 : 192;
+        c.local_ip[1] = c.remote_ip[1] = ipv6 ? 1 : 0;
+        c.local_ip[ipv6 ? 15 : 3] = 80;
+        c.remote_ip[ipv6 ? 15 : 3] = 26;
+        c.local_port = 80;
+        c.remote_port = 28436;
+        for (uint8_t direction : {uint8_t{0}, uint8_t{1}}) {
+            c.direction = direction;
+            pmkext::monitor::Options opt;
+            CHECK(Parse({L"--verdict", L"block", L"--match-any", ipv6 ? L"[2001::50]:80" : L"203.0.0.80:80"}, opt, error));
+            CHECK(opt.match_any_endpoint && pmkext::monitor::AlternateMatches(opt, c));
+            c.local_port = 81;
+            CHECK(!pmkext::monitor::AlternateMatches(opt, c));
+            c.local_port = 80;
+            opt.match = {true, true, c.RemoteIpString(), c.remote_port};
+            CHECK(pmkext::monitor::AlternateMatches(opt, c));
+            opt.match.port = c.local_port;
+            CHECK(!pmkext::monitor::AlternateMatches(opt, c));
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -184,6 +221,7 @@ int main() {
         {"redirects/suspension/PID filters/updates rejected", TestRejectedCapabilities},
         {"source/destination filters do not alter verdicts", TestFilterAndVerdictSeparation},
         {"--match uses the remote endpoint on every interface and direction", TestRemoteMatchesAcrossInterfacesAndDirections},
+        {"--match-any uses either complete endpoint", TestEitherEndpointVerdictMatch},
     };
     for (const auto& test : tests) {
         if (!test.run()) return 1;

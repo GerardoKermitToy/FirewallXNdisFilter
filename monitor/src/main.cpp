@@ -196,7 +196,8 @@ int RunMonitor(const pmkext::monitor::Options& opt) {
     if (!opt.send_verdicts) {
         std::printf("NOT answering events (--no-verdicts); pending packets are dropped on timeout by default.\n");
     } else if (opt.has_alt && opt.match.present) {
-        std::printf("Answering remote endpoint %s%s with %s, everything else with PermanentAccept.\n",
+        std::printf("Answering %s endpoint %s%s with %s, everything else with PermanentAccept.\n",
+                    opt.match_any_endpoint ? "either" : "remote",
                     opt.match.ip.c_str(),
                     opt.match.has_port ? (":" + std::to_string(opt.match.port)).c_str() : "",
                     pmkext::ToString(opt.alt_verdict));

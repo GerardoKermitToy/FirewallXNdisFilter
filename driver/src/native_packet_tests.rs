@@ -420,6 +420,16 @@ pub(super) mod calls {
     }
 }
 
+#[test]
+fn loopback_detection_uses_only_the_ndis_loopback_flag() {
+    let mut nbl = Box::<NET_BUFFER_LIST>::default();
+    let packet = &mut *nbl as *mut NET_BUFFER_LIST as usize;
+    nbl.NblFlags = NDIS_NBL_FLAGS_IS_IPV4;
+    assert_eq!(unsafe { fwx_is_loopback(packet) }, 0);
+    nbl.NblFlags |= NDIS_NBL_FLAGS_IS_LOOPBACK_PACKET;
+    assert_eq!(unsafe { fwx_is_loopback(packet) }, 1);
+}
+
 struct Input {
     data: Vec<Box<[u8]>>,
     mdls: Vec<MDL>,
@@ -471,27 +481,6 @@ fn source(inputs: &mut [Input]) -> Box<NET_BUFFER_LIST> {
         }
     }
     source
-}
-
-unsafe fn copy(source: &mut NET_BUFFER_LIST) -> *mut NET_BUFFER_LIST {
-    unsafe {
-        copy_receive(
-            0x303 as NDIS_HANDLE,
-            0x101 as NDIS_HANDLE,
-            0x202 as NDIS_HANDLE,
-            source,
-            MaxNetBufferListInfo as u32,
-        )
-    }
-}
-
-unsafe fn bytes(nb: *mut NET_BUFFER) -> &'static [u8] {
-    unsafe {
-        core::slice::from_raw_parts(
-            (*first_mdl(nb)).MappedSystemVa.cast(),
-            data_length(nb) as usize,
-        )
-    }
 }
 
 #[test]
@@ -556,94 +545,6 @@ fn mdl_mapping_is_fallible_cached_nx_and_reuses_existing_mapping() {
         assert!(map_mdl(&mut mdl).is_null());
         assert!(map_mdl(null_mut()).is_null());
         assert_eq!(super::map_mdl_call_count(), 3);
-    }
-}
-
-#[test]
-fn receive_copy_deep_copies_all_nbs_preserves_scalar_oob_and_original_offsets() {
-    reset(None);
-    let mut inputs = [
-        Input::new(&[b"xxabc", b"defyy"], 2, 6),
-        Input::new(&[b"ghi"], 0, 3),
-    ];
-    let mut source = source(&mut inputs);
-    let mut following = NET_BUFFER_LIST::default();
-    let allowed =
-        NDIS_NBL_FLAGS_IS_IPV4 | NDIS_NBL_FLAGS_IS_TCP | NDIS_NBL_FLAGS_IS_LOOPBACK_PACKET;
-    source.NblFlags = allowed | NDIS_NBL_FLAGS_SEND_READ_ONLY | NDIS_NBL_FLAGS_HD_SPLIT;
-    source.SourceHandle = 0x999 as NDIS_HANDLE;
-    let uro = 0x1234_5678_0555_0003usize;
-    source.NetBufferListInfo[UdpRecvSegCoalesceOffloadInfo as usize] = uro as PVOID;
-    for index in [
-        TcpIpChecksumNetBufferListInfo,
-        TcpReceiveNoPush,
-        Ieee8021QNetBufferListInfo,
-        NetBufferListFrameType,
-        NetBufferListHashValue,
-        NetBufferListHashInfo,
-    ] {
-        source.NetBufferListInfo[index as usize] = (index as usize + 1) as PVOID;
-    }
-    unsafe {
-        set_next_nbl(&mut *source, &mut following);
-        let first_original = first_nb(&mut *source);
-        let original_mdl = current_mdl(first_original);
-        let copy = copy(&mut source);
-        assert!(!copy.is_null());
-        assert!(next_nbl(copy).is_null());
-        assert_eq!((*copy).SourceHandle as usize, 0x303);
-        assert_eq!((*copy).NblFlags, allowed);
-        assert_eq!((*copy).NetBufferListInfo, source.NetBufferListInfo);
-        let first = first_nb(copy);
-        let second = next_nb(first);
-        assert_eq!(bytes(first), b"abcdef");
-        assert_eq!(bytes(second), b"ghi");
-        assert!(next_nb(second).is_null());
-        assert_eq!(current_mdl_offset(first), 0);
-        inputs[0].data[0][2] = b'Z';
-        assert_eq!(bytes(first), b"abcdef");
-        assert_eq!(current_mdl(first_original), original_mdl);
-        assert_eq!(current_mdl_offset(first_original), 2);
-        assert_eq!(
-            (*first_original)
-                .__bindgen_anon_1
-                .__bindgen_anon_1
-                .DataOffset,
-            2
-        );
-        assert_eq!(data_length(first_original), 6);
-        assert_eq!(first_nb(&mut *source), first_original);
-        assert_eq!(next_nbl(&mut *source), &mut following as *mut _);
-        assert_eq!(source.SourceHandle as usize, 0x999);
-        free_receive_copy(copy);
-    }
-    state(|s| assert_eq!(s.metadata_calls, 1));
-    assert_eq!(inputs[0].mdls.len(), 2);
-    assert_no_leaks();
-}
-
-#[test]
-fn receive_copy_fully_overwrites_uninitialized_pool_for_contiguous_and_split_mdl() {
-    for length in [1usize, 2, 64, 1500, 65_535] {
-        reset(None);
-        let data = vec![0; length];
-        let mid = length / 2;
-        let mut inputs = [
-            Input::new(&[&data], 0, length as u32),
-            Input::new(&[&data[..mid], &data[mid..]], 0, length as u32),
-        ];
-        let mut original = source(&mut inputs);
-        unsafe {
-            let copied = copy(&mut original);
-            assert!(!copied.is_null());
-            let first = first_nb(copied);
-            let second = next_nb(first);
-            assert_eq!(bytes(first), data.as_slice(), "contiguous length {length}");
-            assert_eq!(bytes(second), data.as_slice(), "split length {length}");
-            assert!(next_nb(second).is_null());
-            free_receive_copy(copied);
-        }
-        assert_no_leaks();
     }
 }
 
@@ -746,9 +647,6 @@ fn receive_metadata_rejects_borrowed_slots_and_respects_runtime_bound() {
             unsafe { copy_receive_metadata_supported(&mut *source, MaxNetBufferListInfo as u32) },
             supported
         );
-        if !supported {
-            assert!(unsafe { copy(&mut source) }.is_null());
-        }
         source.NetBufferListInfo[index] = null_mut();
     }
     state(|s| assert_eq!(s.attempts, 0));
@@ -758,80 +656,6 @@ fn receive_metadata_rejects_borrowed_slots_and_respects_runtime_bound() {
     });
     assert!(!unsafe { copy_receive_metadata_supported(&mut *source, MaxNetBufferListInfo as u32) });
     assert!(!unsafe { copy_receive_metadata_supported(&mut *source, u32::MAX) });
-    assert_no_leaks();
-}
-
-#[test]
-fn data_view_failures_clean_partial_copy_exactly_once() {
-    let mut inputs = [
-        Input::new(&[b"abcd"], 0, 4),
-        Input::new(&[b"a", b"bcd"], 0, 4),
-        Input::new(&[b"xy"], 0, 2),
-    ];
-    let mut source = source(&mut inputs);
-    // Mapping/view failures remain recoverable; allocations are assumed to succeed.
-    for failure in [3, 7, 11] {
-        reset(Some(failure));
-        assert!(
-            unsafe { copy(&mut source) }.is_null(),
-            "failure {failure} was ignored"
-        );
-        state(|s| assert_eq!(s.attempts, failure));
-        assert_no_leaks();
-        assert_eq!(inputs[0].data[0].as_ref(), b"abcd");
-        assert_eq!(unsafe { current_mdl_offset(&mut *inputs[0].nb) }, 0);
-    }
-    reset(None);
-    let copy = unsafe { copy(&mut source) };
-    assert!(!copy.is_null());
-    state(|s| assert_eq!(s.attempts, 13));
-    unsafe { free_receive_copy(copy) };
-    assert_no_leaks();
-}
-
-#[test]
-fn partially_filled_receive_storage_is_freed_on_data_view_failure() {
-    reset(None);
-    let mut inputs = [Input::new(&[b"abc"], 0, 3), Input::new(&[b"xy"], 0, 4)];
-    let mut original = source(&mut inputs);
-    // The second MDL chain is shorter than its declared length: the fake NDIS
-    // call copies two bytes to storage, then fails before the NB is published.
-    assert!(unsafe { copy(&mut original) }.is_null());
-    assert_eq!(inputs[0].data[0].as_ref(), b"abc");
-    assert_eq!(inputs[1].data[0].as_ref(), b"xy");
-    assert_no_leaks();
-}
-
-#[test]
-fn empty_and_zero_length_nbs_fail_without_leaking_prior_copies() {
-    reset(None);
-    let mut empty = NET_BUFFER_LIST::default();
-    assert!(unsafe { copy(&mut empty) }.is_null());
-    state(|s| assert_eq!(s.attempts, 0));
-    let mut inputs = [Input::new(&[b"abc"], 0, 3), Input::new(&[b""], 0, 0)];
-    let mut source = source(&mut inputs);
-    assert!(unsafe { copy(&mut source) }.is_null());
-    assert_no_leaks();
-}
-
-#[test]
-fn receive_copy_has_no_fixed_nb_count_quota() {
-    reset(None);
-    let mut inputs: Vec<Input> = (0..513).map(|_| Input::new(&[b"a"], 0, 1)).collect();
-    let mut source = source(&mut inputs);
-    unsafe {
-        let copy = copy(&mut source);
-        assert!(!copy.is_null());
-        let mut count = 0;
-        let mut nb = first_nb(copy);
-        while !nb.is_null() {
-            assert_eq!(bytes(nb), b"a");
-            count += 1;
-            nb = next_nb(nb);
-        }
-        assert_eq!(count, 513);
-        free_receive_copy(copy);
-    }
     assert_no_leaks();
 }
 

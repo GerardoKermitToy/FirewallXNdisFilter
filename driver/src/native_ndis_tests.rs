@@ -20,6 +20,7 @@ static SERIAL: Mutex<()> = Mutex::new(());
 enum Event {
     Send(usize, u32),
     Indicate(usize, u32),
+    IndicateResources(usize, NDIS_PORT_NUMBER, u32, u32),
     Complete(usize, NDIS_STATUS, u32),
     Return(usize, u32),
     PauseComplete,
@@ -535,15 +536,19 @@ pub(super) mod calls {
     pub(crate) unsafe fn NdisFIndicateReceiveNetBufferLists(
         _: NDIS_HANDLE,
         nbl: PNET_BUFFER_LIST,
-        _: NDIS_PORT_NUMBER,
+        port: NDIS_PORT_NUMBER,
         count: ULONG,
         flags: ULONG,
     ) {
         assert_unlocked();
-        assert_eq!(count, 1);
-        assert_eq!(flags & NDIS_RECEIVE_FLAGS_RESOURCES, 0);
         let (inline, a, pause, extra_flags) = state(|s| {
-            s.events.push(Event::Indicate(nbl as usize, flags));
+            if flags & NDIS_RECEIVE_FLAGS_RESOURCES != 0 {
+                s.events
+                    .push(Event::IndicateResources(nbl as usize, port, count, flags));
+            } else {
+                assert_eq!(count, 1);
+                s.events.push(Event::Indicate(nbl as usize, flags));
+            }
             (
                 s.inline,
                 s.adapter,
@@ -551,7 +556,7 @@ pub(super) mod calls {
                 s.receive_return_extra_flags,
             )
         });
-        if inline {
+        if inline && flags & NDIS_RECEIVE_FLAGS_RESOURCES == 0 {
             unsafe {
                 return_receive(
                     a as NDIS_HANDLE,
@@ -1198,53 +1203,6 @@ fn original_receive_allow_returns_lower_and_recomputes_dispatch_flags() {
 }
 
 #[test]
-fn resources_receive_uses_private_deep_copy_and_never_returns_original_or_private_lower() {
-    let f = Fixture::new();
-    let mut a = f.adapter();
-    let mut source = Source::new();
-    let mut tail = Box::<NET_BUFFER_LIST>::default();
-    source.nbl.NetBufferListInfo[UdpRecvSegCoalesceOffloadInfo as usize] = 3usize as PVOID;
-    let address = (&mut *source.nbl as *mut NET_BUFFER_LIST) as usize;
-    // Use one owned source with an external next link while directly testing
-    // CreateNdisPacket: RESOURCES must not alter the original chain or context.
-    unsafe {
-        packet::set_next_nbl(&mut *source.nbl, &mut *tail);
-        start(&mut *a);
-        let copied = create_ndis_packet(
-            &mut *a,
-            &mut *source.nbl,
-            4,
-            NDIS_RECEIVE_FLAGS_RESOURCES,
-            RECEIVE,
-            true,
-        )
-        .expect("receive copy should succeed");
-        assert!(!copied.is_null());
-        assert_ne!(copied as usize, address);
-        assert_eq!(
-            packet::next_nbl(&mut *source.nbl),
-            &mut *tail as *mut NET_BUFFER_LIST
-        );
-        assert!(source.nbl.Context.is_null());
-        assert_eq!(
-            (*copied).NetBufferListInfo[UdpRecvSegCoalesceOffloadInfo as usize] as usize,
-            3
-        );
-        let copied_nb = packet::first_nb(copied);
-        let copied_mdl = packet::first_mdl(copied_nb);
-        assert_ne!(
-            (*copied_mdl).MappedSystemVa,
-            source.data.as_mut_ptr().cast()
-        );
-        fwx_finish(copied as usize, 0);
-        assert_eq!(a.active, 0);
-        stop(&mut *a);
-    }
-    assert!(source.data.iter().all(|&b| b == 0x5a));
-    state(|s| assert!(!s.events.iter().any(|e| matches!(e, Event::Return(_, _)))));
-}
-
-#[test]
 fn mixed_send_completes_original_after_independent_children_and_restores_order() {
     let f = Fixture::new();
     let mut a = f.adapter();
@@ -1541,58 +1499,79 @@ fn mixed_receive_returns_original_only_after_all_children_finish() {
 }
 
 #[test]
-fn mixed_resources_receive_keeps_original_untouched_until_transit_finishes() {
-    let f = Fixture::new();
-    let mut a = f.adapter();
-    let mut local = Source::new();
-    let mut transit = Source::new();
-    let first = &mut *local._nb as *mut NET_BUFFER;
-    let second = &mut *transit._nb as *mut NET_BUFFER;
-    state(|s| {
-        s.classify_result = CLASSIFY_SPLIT;
-        s.split_results = vec![0, -1];
-    });
-    unsafe {
-        packet::set_next_nb(first, second);
-        start(&mut *a);
-        receive(
-            (&mut *a as *mut Adapter).cast(),
-            &mut *local.nbl,
-            0,
-            1,
-            NDIS_RECEIVE_FLAGS_RESOURCES,
-        );
-        assert_eq!(packet::next_nb(first), second);
-        assert!(local.nbl.Context.is_null());
-        state(|s| {
-            assert_eq!(s.pending.len(), 1);
-            assert_eq!(
-                s.events
-                    .iter()
-                    .filter(|e| matches!(e, Event::Indicate(_, _)))
-                    .count(),
-                1
-            );
-            assert!(!s.events.iter().any(|e| matches!(e, Event::Return(_, _))));
-        });
-        let child = state(|s| s.pending.remove(0));
-        fwx_finish(child, 1);
-        assert_eq!(a.active, 0);
-        assert_eq!(packet::next_nb(first), second);
-        stop(&mut *a);
+fn resources_receive_indicates_original_chain_without_policy_or_copies() {
+    for loopback in [false, true] {
+        for session_open in [false, true] {
+            let f = Fixture::new();
+            let mut a = f.adapter();
+            let mut first = Source::new();
+            let mut second = Source::new();
+            let head = (&mut *first.nbl as *mut NET_BUFFER_LIST) as usize;
+            let port = 3;
+            let flags = NDIS_RECEIVE_FLAGS_RESOURCES | NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE;
+            if loopback {
+                first.nbl.NblFlags |= NDIS_NBL_FLAGS_IS_LOOPBACK_PACKET;
+            }
+            first.nbl.NetBufferListInfo[MediaSpecificInformation as usize] = 0x1234usize as PVOID;
+            state(|s| {
+                s.session_open = session_open;
+                s.classify_result = CLASSIFY_SPLIT;
+            });
+            unsafe {
+                packet::set_next_nbl(&mut *first.nbl, &mut *second.nbl);
+                start(&mut *a);
+                packet::reset_test_allocator(Some(1));
+                receive(
+                    (&mut *a as *mut Adapter).cast(),
+                    &mut *first.nbl,
+                    port,
+                    2,
+                    flags,
+                );
+                assert_eq!(
+                    packet::next_nbl(&mut *first.nbl),
+                    &mut *second.nbl as *mut _
+                );
+                assert!(first.nbl.Context.is_null());
+                assert!(second.nbl.Context.is_null());
+                assert_eq!(first.nbl.SourceHandle as usize, 0x909);
+                assert_eq!(
+                    first.nbl.NetBufferListInfo[MediaSpecificInformation as usize] as usize,
+                    0x1234
+                );
+                assert_eq!(a.active, 0);
+                stop(&mut *a);
+            }
+            packet::assert_test_allocator_no_leaks();
+            state(|s| {
+                assert!(s.pending.is_empty());
+                assert_eq!(
+                    s.events
+                        .iter()
+                        .filter(|e| matches!(e,
+                            Event::IndicateResources(nbl, p, count, f)
+                                if *nbl == head && *p == port && *count == 2 && *f == flags
+                        ))
+                        .count(),
+                    1
+                );
+                assert!(!s.events.iter().any(|e| matches!(
+                    e,
+                    Event::Classify(_, _, _, _) | Event::Return(_, _) | Event::Indicate(_, _)
+                )));
+            });
+        }
     }
 }
 
 #[test]
-fn resource_receive_data_view_failure_never_retains_original() {
+fn resources_receive_holds_adapter_until_pause_completes() {
     let f = Fixture::new();
     let mut a = f.adapter();
     let mut source = Source::new();
+    state(|s| s.pause_after_forward = true);
     unsafe {
         start(&mut *a);
-    }
-    packet::reset_test_allocator(Some(3));
-    unsafe {
         receive(
             (&mut *a as *mut Adapter).cast(),
             &mut *source.nbl,
@@ -1603,18 +1582,22 @@ fn resource_receive_data_view_failure_never_retains_original() {
         assert_eq!(a.active, 0);
         assert!(source.nbl.Context.is_null());
     }
-    packet::assert_test_allocator_no_leaks();
-    unsafe {
-        stop(&mut *a);
-    }
     state(|s| {
-        assert_eq!(s.paused_drops, 0);
-        assert_eq!(s.resource_drops, 1);
-        assert!(
-            !s.events
+        assert_eq!(
+            s.events
                 .iter()
-                .any(|e| matches!(e, Event::Return(_, _) | Event::Indicate(_, _)))
-        )
+                .filter(|e| matches!(e, Event::IndicateResources(_, _, _, _)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            s.events
+                .iter()
+                .filter(|e| matches!(e, Event::PauseComplete))
+                .count(),
+            1
+        );
+        assert!(!s.events.iter().any(|e| matches!(e, Event::Return(_, _))));
     });
 }
 
@@ -1769,19 +1752,22 @@ fn pause_between_receive_chain_members_preserves_ownership_without_resource_drop
             assert_eq!(a.active, 0);
         }
         state(|s| {
-            assert_eq!(s.paused_drops, 1);
+            assert_eq!(s.paused_drops, u32::from(!resources));
             assert_eq!(s.resource_drops, 0);
             assert_eq!(
                 s.events
                     .iter()
                     .filter(|e| matches!(e, Event::Classify(_, _, _, _)))
                     .count(),
-                1
+                usize::from(!resources)
             );
             assert_eq!(
                 s.events
                     .iter()
-                    .filter(|e| matches!(e, Event::Indicate(_, _)))
+                    .filter(|e| matches!(
+                        e,
+                        Event::Indicate(_, _) | Event::IndicateResources(_, _, _, _)
+                    ))
                     .count(),
                 1
             );

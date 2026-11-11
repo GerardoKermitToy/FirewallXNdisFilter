@@ -32,6 +32,7 @@ struct Options {
     Verdict alt_verdict = Verdict::PermanentAccept;
     bool has_alt = false;
     Endpoint match;
+    bool match_any_endpoint = false;
     Endpoint filter;
     bool has_filter_protocol = false;
     uint8_t filter_protocol = 0;

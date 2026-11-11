@@ -1,7 +1,7 @@
 use crate::{
     bandwidth::{BandwidthGroup, BandwidthStore},
     cache::{CacheAllocator, CachePlan, CacheWork, Caches, Decision},
-    packet::Packet,
+    packet::{NdisPath, Packet},
     storage::{Handle, List},
 };
 use alloc::vec::Vec;
@@ -906,6 +906,34 @@ impl Engine {
                     .is_none()
             })
             && self.event_room(packet)
+    }
+    // An NDIS L2 loopback receive can reuse an existing permanent decision for
+    // the same packet's send-oriented tuple. A missing/expired decision never
+    // bypasses ordinary receive classification. Cache identity is a flow, not
+    // proof that this exact packet was observed on send; keep accounting it.
+    pub fn cached_loopback_with_work(
+        &mut self,
+        interface_index: u32,
+        packet: &Packet,
+        now: u64,
+        work: &mut BandwidthWork,
+    ) -> Option<Finish> {
+        if !self.online || packet.connection.direction != firewallx_protocol::Direction::Outbound {
+            return None;
+        }
+        let bank = self.cache_bank(interface_index, packet)?;
+        let mut send = *packet;
+        send.orient(NdisPath::Send);
+        // SAFETY: cache_bank found a live, running and non-dirty interface.
+        let allow = unsafe { self.interfaces.get_mut(bank) }.caches.apply(
+            &send.connection,
+            now,
+            self.cache_ttl,
+        )?;
+        self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
+        self.stats.received = self.stats.received.saturating_add(1);
+        self.account(interface_index, packet, allow, work);
+        Some(if allow { Finish::Allow } else { Finish::Drop })
     }
     fn immediate(
         &mut self,
@@ -4117,6 +4145,90 @@ mod tests {
             Submission::Pending(_)
         ));
     }
+    #[test]
+    fn loopback_reuses_only_a_live_send_tuple_decision() {
+        for protocol in [6, 17] {
+            for ipv6 in [false, true] {
+                for (verdict, finish) in [
+                    (Verdict::PermanentAccept, Finish::Allow),
+                    (Verdict::PermanentBlock, Finish::Drop),
+                ] {
+                    let mut e = engine();
+                    e.configure(2000, 1000, true);
+                    assert!(e.attach(102));
+                    assert!(e.restart(102));
+                    let receive = cache_packet(ipv6, protocol, 40000);
+                    let mut send = receive;
+                    send.orient(NdisPath::Send);
+                    let Submission::Pending(id) = e.submit(101, send, 1, None, 100, record(&send))
+                    else {
+                        panic!("expected send decision");
+                    };
+                    e.verdict(id, verdict, 101).unwrap();
+                    let mut work = BandwidthWork::prepare(e.bandwidth_plan());
+                    assert_eq!(
+                        e.cached_loopback_with_work(102, &receive, 102, &mut work),
+                        None
+                    );
+                    assert_eq!(
+                        e.cached_loopback_with_work(101, &receive, 102, &mut work),
+                        Some(finish)
+                    );
+                    let mut uncacheable = receive;
+                    uncacheable.cacheable = false;
+                    assert_eq!(
+                        e.cached_loopback_with_work(101, &uncacheable, 103, &mut work),
+                        None
+                    );
+                    assert_eq!(
+                        e.cached_loopback_with_work(101, &send, 103, &mut work),
+                        None
+                    );
+                    assert_eq!(
+                        e.cached_loopback_with_work(101, &receive, 1102, &mut work),
+                        None
+                    );
+                    e.disconnect();
+                    assert_eq!(
+                        e.cached_loopback_with_work(101, &receive, 104, &mut work),
+                        None
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn loopback_without_a_cached_send_remains_under_normal_policy() {
+        let mut e = engine();
+        e.configure(2000, 60000, true);
+        let receive = cache_packet(false, 6, 45000);
+        let mut send = receive;
+        send.orient(NdisPath::Send);
+        let Submission::Pending(id) = e.submit(101, send, 1, None, 100, record(&send)) else {
+            panic!("expected send decision");
+        };
+        e.verdict(id, Verdict::Accept, 101).unwrap();
+        let mut work = BandwidthWork::prepare(e.bandwidth_plan());
+        assert_eq!(
+            e.cached_loopback_with_work(101, &receive, 102, &mut work),
+            None
+        );
+        assert!(e.preflight(101, &receive, 2, 102).is_ok());
+        e.disconnect();
+        assert_eq!(
+            e.cached_loopback_with_work(101, &receive, 103, &mut work),
+            None
+        );
+        assert_eq!(
+            e.preflight(101, &receive, 3, 103),
+            Err(Action {
+                nbl: 3,
+                finish: Finish::Drop
+            })
+        );
+    }
+
     #[test]
     fn permanent_accept_ttl_refreshes_on_matching_inbound_and_outbound_packets() {
         for protocol in [6, 17] {

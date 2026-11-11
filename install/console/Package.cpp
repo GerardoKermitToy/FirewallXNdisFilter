@@ -303,9 +303,9 @@ void ValidateInfFile(const std::filesystem::path& path) {
     inf.RequireNdi(L"Ndi", L"FilterRunType", L"2");
     inf.RequireNdi(L"Ndi", L"ClsID", L"{1CFED41E-4579-42CF-962C-2A7E04C6DBC8}");
     inf.RequireDriverStoreFiles();
-    inf.RequireNdi(L"Ndi\\Interfaces", L"FilterMediaTypes", L"ethernet");
+    inf.RequireNdi(L"Ndi\\Interfaces", L"FilterMediaTypes", L"ethernet,nolower");
     inf.RequireNdi(L"Ndi\\Interfaces", L"UpperRange", L"noupper");
-    inf.RequireNdi(L"Ndi\\Interfaces", L"LowerRange", L"nolower");
+    inf.RequireNdi(L"Ndi\\Interfaces", L"LowerRange", L"nolower,ndis5");
 }
 
 void ValidateRemovalInfFile(const std::filesystem::path& path) {

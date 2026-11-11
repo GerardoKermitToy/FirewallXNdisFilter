@@ -311,6 +311,14 @@ int main() {
             Require(system.bindings[0].enabled && !system.bindings[1].enabled && system.bindings[2].enabled);
             Require(system.At("disable") < system.At("arm") && system.At("arm") < system.At("enable"));
         }},
+        {"VMware-like targets enable while an IP-tunnel path stays disabled", [] {
+            FakeSystem system;
+            system.target.name = L"VMnet1 Ethernet";
+            system.extra_targets = {{wsl_guid, 0x1122334455667788ull, L"VMnet8 Ethernet"}};
+            Require(Execute(Install(), system) == 0);
+            Require(system.configured.size() == 2 && system.bindings.size() == 3);
+            Require(system.bindings[0].enabled && !system.bindings[1].enabled && system.bindings[2].enabled);
+        }},
         {"adapter changes before post-install enumeration are included", [] {
             FakeSystem system; system.extra_targets = {WslTarget()};
             system.change_wsl_luid_after_install = true;

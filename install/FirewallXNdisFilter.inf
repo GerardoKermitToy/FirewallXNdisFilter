@@ -43,8 +43,10 @@ HKR,Ndi,FilterRunType,0x00010001,2
 HKR,Ndi,ClsID,,"{1CFED41E-4579-42CF-962C-2A7E04C6DBC8}"
 HKR,Ndi,ComponentDll,,"%13%\FirewallXNdisFilterNotify.dll"
 HKR,Ndi\Interfaces,UpperRange,,"noupper"
-HKR,Ndi\Interfaces,LowerRange,,"nolower"
-HKR,Ndi\Interfaces,FilterMediaTypes,,"ethernet"
+; VMnet adapters advertise an ndis5 upper range despite using Ethernet.
+; Setup and notify reject IP-only paths; FilterAttach requires Ethernet.
+HKR,Ndi\Interfaces,LowerRange,,"nolower,ndis5"
+HKR,Ndi\Interfaces,FilterMediaTypes,,"ethernet,nolower"
 
 [Install.Remove.Services]
 DelService=FirewallXNdisFilter,0x200

@@ -2180,6 +2180,11 @@ fn attach_rejects_gate_or_media_and_unwinds_nonallocation_failures() {
             filter_attach(null_mut(), null_mut(), &mut p),
             FWX_WDK_NDIS_NOT_SUPPORTED as NDIS_STATUS
         );
+        p.MiniportMediaType = NdisMediumIP;
+        assert_eq!(
+            filter_attach(null_mut(), null_mut(), &mut p),
+            FWX_WDK_NDIS_NOT_SUPPORTED as NDIS_STATUS
+        );
         state(|s| assert_eq!(s.allocation_attempts, 0));
         p.MiniportMediaType = NdisMedium802_3;
         p.BaseMiniportIfIndex = 8;

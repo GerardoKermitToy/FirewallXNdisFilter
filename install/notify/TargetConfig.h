@@ -12,14 +12,42 @@ inline constexpr wchar_t kConfigKey[] = L"SOFTWARE\\FirewallXNdisFilter\\Lwf";
 // While armed, the standard Ethernet LWF may bind newly enabled paths too.
 inline constexpr DWORD kBindingConfigVersion = 4;
 
+enum class AdapterEligibility { Compatible, Unsupported, Unavailable };
+
+struct AdapterQuery {
+    decltype(&ConvertInterfaceGuidToLuid) guid_to_luid = ConvertInterfaceGuidToLuid;
+    decltype(&ConvertInterfaceLuidToGuid) luid_to_guid = ConvertInterfaceLuidToGuid;
+    decltype(&GetIfEntry2) get_if_entry = GetIfEntry2;
+};
+
+// NETIO can report Native 802.11 for a Wi-Fi adapter whose LWF binding has
+// an Ethernet miniport below the media converter. Preserve those existing
+// paths; FilterAttach independently admits only NdisMedium802_3.
+inline AdapterEligibility QueryAdapter(const GUID& guid, NET_LUID& output, const AdapterQuery& api = {}) {
+    NET_LUID luid{};
+    GUID round_trip{};
+    if (guid == GUID_NULL || api.guid_to_luid(&guid, &luid) != NO_ERROR || !luid.Value ||
+        api.luid_to_guid(&luid, &round_trip) != NO_ERROR || round_trip != guid) {
+        return AdapterEligibility::Unavailable;
+    }
+    MIB_IF_ROW2 row{};
+    row.InterfaceLuid = luid;
+    if (api.get_if_entry(&row) != NO_ERROR || row.InterfaceGuid != guid || row.InterfaceLuid.Value != luid.Value) {
+        return AdapterEligibility::Unavailable;
+    }
+    if (row.MediaType != NdisMedium802_3 && row.MediaType != NdisMediumNative802_11) {
+        return AdapterEligibility::Unsupported;
+    }
+    output = luid;
+    return AdapterEligibility::Compatible;
+}
+
 struct TargetConfig {
     bool armed = false;
 
     static bool IsCurrentAdapter(const GUID& guid) {
         NET_LUID luid{};
-        GUID round_trip{};
-        return guid != GUID_NULL && ConvertInterfaceGuidToLuid(&guid, &luid) == NO_ERROR && luid.Value != 0 &&
-            ConvertInterfaceLuidToGuid(&luid, &round_trip) == NO_ERROR && round_trip == guid;
+        return QueryAdapter(guid, luid) == AdapterEligibility::Compatible;
     }
 };
 

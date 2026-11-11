@@ -4,7 +4,7 @@
 
 FirewallXNdisFilter is an experimental Windows network filter written in Rust, with a C++ monitor and client APIs. It uses an **NDIS Lightweight Filter (LWF)** on compatible host Ethernet adapters, both physical and virtual.
 
-Only traffic traversing an attached NDIS module can be inspected. Some adapters cannot accept an ordinary LWF; for example, Wintun/WireGuard adapters declaring `LowerRange=nolower` are not supported. Internal VM-to-VM traffic that never passes through an attached host adapter is also outside the filter's scope. The package and device API version is **0.3.3.0**; use a matching driver and client.
+Only traffic traversing an attached NDIS module can be inspected. Compatible VMware VMnet Ethernet adapters declaring `LowerRange=nolower` can be considered for attachment when NetCfg exposes their paths. IP-only adapters such as Wintun/WireGuard remain unsupported. Internal VM-to-VM traffic that never passes through an attached host adapter is also outside the filter's scope. The package and device API version is **0.3.3.0**; use a matching driver and client.
 
 > **Warning:** This is experimental kernel software. Mixed local/transit IP NBLs are split: local packets bypass policy, while transit packets receive independent verdicts or fallback decisions. The driver attempts to queue one warning while a controller is connected. Policy is temporarily bypassed when the local-address inventory is unavailable. **All IPv4 and IPv6 multicast destinations bypass policy at any TTL/Hop Limit**, on every attached adapter, including traffic that can reach a guest. Broadcast and DHCP exceptions also apply as described below. These exemptions do not authenticate the sender and are not an anti-spoofing boundary. With no controller connected, the default fail-closed policy otherwise drops eligible transit IP traffic on attached adapters. Use a test machine with local recovery access; offline tests and enabled bindings do not prove correct live filtering.
 
@@ -35,7 +35,7 @@ Use an elevated Administrator/SYSTEM console, stop any monitor, and keep local r
 ./dist/Install.exe
 ```
 
-The installer uses the package beside the EXE and enables the eligible binding paths exposed by NetCfg for this filter, including compatible physical Ethernet adapters and host vNICs. An adapter with no compatible binding path is not covered. New adapters are not guaranteed to be enabled automatically; verify their binding and running module before relying on coverage. Use `--what-if` for read-only preflight or `--yes` to skip confirmation. Conflicting staged packages can cause installation to fail; use the matching uninstaller rather than overwriting package files.
+The installer uses the package beside the EXE and enables the eligible binding paths exposed by NetCfg for this filter, including compatible physical Ethernet adapters and host vNICs. Other Ethernet-compatible paths, such as Bluetooth PAN, may also be included. An adapter with no compatible binding path is not covered. New adapters are not guaranteed to be enabled automatically; verify their binding and running module before relying on coverage. Use `--what-if` for read-only preflight or `--yes` to skip confirmation. Conflicting staged packages can cause installation to fail; use the matching uninstaller rather than overwriting package files.
 
 If installation returns **3010**, reboot and then resume enabling the compatible NetCfg paths available at that time:
 

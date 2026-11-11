@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Scope and operating constraints
 
-FirewallXNdisFilter 0.3.3 is an experimental **ordinary NDIS 6.40-6.89 optional modifying Ethernet Lightweight Filter (LWF)** for compatible host Ethernet adapters, physical or virtual. It is **not a Hyper-V switch extension** and does not use WFP; do not restore WFP callouts or use `Enable-VMSwitchExtension`. NDIS cannot attach this ordinary filter to every interface: in particular Wintun/WireGuard adapters declaring `LowerRange=nolower` are outside its scope.
+FirewallXNdisFilter 0.3.3 is an experimental **ordinary NDIS 6.40-6.89 optional modifying Ethernet Lightweight Filter (LWF)** for compatible host Ethernet adapters, physical or virtual, including eligible VMware VMnet adapters. It is **not a Hyper-V switch extension** and does not use WFP; do not restore WFP callouts or use `Enable-VMSwitchExtension`. IP-only adapters, including Wintun/WireGuard, are outside its scope even when their NetCfg range is `nolower`.
 
 - Work in the separate `C:\hyperv` repository. `C:\portmaster_v3` is the compatibility/reference project, not a build dependency; do not modify it as part of FirewallXNdisFilter work.
 - **Create commits only when explicitly requested.** The working branch is `master`; inspect the current branch/status before Git mutations. Amend the last commit only when explicitly requested, and do not infer permission to push or force-push from permission to commit/amend.
@@ -57,13 +57,13 @@ Default fallback is fail-closed (drop) for missing/disconnected controller, time
 
 ### Binding isolation: installer, notify object, kernel gate
 
-`install/FirewallXNdisFilter.inf` declares `FilterClass=custom`, `FilterType=2`, `FilterRunType=2`, `FilterMediaTypes=ethernet`; never `ms_switch_filter` or `vmnetextension`. The driver-store notify-object packaging requires **Windows x64 build 25341+**.
+`install/FirewallXNdisFilter.inf` declares `FilterClass=custom`, `FilterType=2`, `FilterRunType=2`, `LowerRange=nolower,ndis5`, `FilterMediaTypes=ethernet,nolower`; never `ms_switch_filter` or `vmnetextension`. The driver-store notify-object packaging requires **Windows x64 build 25341+**.
 
 The current driver-store INF package and device API version are **0.3.3.0** (blocking reads and host adapter indices). Connection records include interface_index:u32 immediately after id:u64; each bandwidth group header carries interface_index:u32 after protocol:u8 and before count:u32, breaking compatibility with 0.3.2.0 and earlier event streams. Connection events no longer contain process_id and carry complete IP packets. The earlier 0.2.1.4 setup fixes (GetClassGuid/E_POINTER, non-PnP identity and disable-before-arm ordering) remain. Use a coherent new INF/DLL/CAT/setup EXE set and matching monitor, never older package pieces.
 
 The installation/notify/kernel binding gates must stay consistent:
 
-1. Setup enumerates the filter's actual eligible NetCfg binding paths, including physical and virtual Ethernet, rather than an HNS ICS allowlist. Do not guess eligibility from adapter display names or claim coverage for paths NetCfg cannot expose.
+1. Setup enumerates the filter's actual eligible NetCfg binding paths, including physical and virtual Ethernet, rather than an HNS ICS allowlist. Setup and notify require a round-trip NET_LUID/GUID and NETIO media of Ethernet or Native 802.11; the latter preserves existing Wi-Fi paths whose NDIS filter attachment is Ethernet. IP-only and unknown media are not eligible. NETIO identity/media failures fail closed. Do not guess eligibility from adapter display names or claim coverage for paths NetCfg cannot expose.
 2. `dist/Install.exe` writes `HKLM\SOFTWARE\FirewallXNdisFilter\Lwf` with `ConfigVersion=4` and `AllowBindings=0` before installation/enable. It disarms and disables the component's eligible paths before arming and enabling them. Legacy schema-3 configurations must not authorize this new scope; remove the old installation first. Preserve setup rollback and reboot handling.
 3. `install/notify/` implements `INetCfgComponentControl` and `INetCfgComponentNotifyBinding`; add/enable requires an armed, valid schema-4 configuration and a verified, unambiguous adapter path. Disable/remove remain allowed. Building/testing the DLL never registers it.
 4. Kernel `FilterAttach` independently requires an armed schema-4 configuration, a valid NET_LUID/GUID and `NdisMedium802_3`. Do not fall back to an adapter name or admit unsupported media.

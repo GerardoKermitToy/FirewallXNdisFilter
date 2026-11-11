@@ -245,10 +245,10 @@ public:
             const GUID& guid = entry.binding.adapter;
             if (std::any_of(targets.begin(), targets.end(), [&](const Adapter& target) { return target.guid == guid; })) continue;
             NET_LUID luid{};
-            GUID round_trip{};
-            if (ConvertInterfaceGuidToLuid(&guid, &luid) != NO_ERROR || !luid.Value ||
-                ConvertInterfaceLuidToGuid(&luid, &round_trip) != NO_ERROR || round_trip != guid) {
-                throw Error{L"A filter binding path no longer has a valid NETIO adapter identity."};
+            const auto eligibility = QueryAdapter(guid, luid);
+            if (eligibility == AdapterEligibility::Unsupported) continue;
+            if (eligibility != AdapterEligibility::Compatible) {
+                throw Error{L"A filter binding path no longer has a valid NETIO adapter identity and media."};
             }
             targets.push_back({guid, luid.Value, GuidText(guid)});
         }
@@ -431,6 +431,12 @@ private:
             if (ConvertInterfaceGuidToLuid(&target->guid, &current) != NO_ERROR || current.Value != target->luid ||
                 ConvertInterfaceLuidToGuid(&current, &round_trip) != NO_ERROR || round_trip != target->guid) {
                 throw Error{L"A binding adapter identity changed during setup."};
+            }
+            if (enabled) {
+                NET_LUID eligible{};
+                if (QueryAdapter(target->guid, eligible) != AdapterEligibility::Compatible || eligible.Value != target->luid) {
+                    throw Error{L"A binding adapter's media or identity changed during setup."};
+                }
             }
             const HRESULT result = entry.path->Enable(enabled ? TRUE : FALSE);
             Check(result, enabled ? L"Enable exact target binding path" : L"Disable exact target binding path before arming");

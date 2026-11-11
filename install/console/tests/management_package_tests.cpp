@@ -42,8 +42,14 @@ int wmain(int argc, wchar_t** argv) {
             {"FilterRunType,0x00010001,2", "FilterRunType,0x00010001,1"},
             {"1CFED41E-4579-42CF-962C-2A7E04C6DBC8", "00000001-0002-0003-0405-060708090A0B"},
             {"ComponentDll,,\"%13%\\FirewallXNdisFilterNotify.dll\"", "ComponentDll,,\"other.dll\""},
-            {"LowerRange,,\"nolower\"", "LowerRange,,\"vmnetextension\""},
-            {"FilterMediaTypes,,\"ethernet\"", "FilterMediaTypes,,\"wan\""},
+            {"LowerRange,,\"nolower,ndis5\"", "LowerRange,,\"nolower\""},
+            {"LowerRange,,\"nolower,ndis5\"", "LowerRange,,\"vmnetextension\""},
+            {"FilterMediaTypes,,\"ethernet,nolower\"", "FilterMediaTypes,,\"ethernet\""},
+            {"FilterMediaTypes,,\"ethernet,nolower\"", "FilterMediaTypes,,\"nolower\""},
+            {"FilterMediaTypes,,\"ethernet,nolower\"", "FilterMediaTypes,,\"ethernet,ndis5,nolower\""},
+            {"FilterMediaTypes,,\"ethernet,nolower\"", "FilterMediaTypes,,\"ethernet,nolower,wan\""},
+            {"FilterMediaTypes,,\"ethernet,nolower\"", "FilterMediaTypes,,\"wan\""},
+            {"HKR,Ndi\\Interfaces,FilterMediaTypes,,\"ethernet,nolower\"", "HKR,Ndi\\Interfaces,FilterMediaTypes,,\"ethernet,nolower\"\nHKR,Ndi\\Interfaces,FilterMediaTypes,,\"ethernet,nolower\""},
             {"HKR,Ndi,FilterClass,,\"custom\"", "HKR,Ndi,FilterClass,,\"custom\"\nHKR,Ndi,FilterClass,,\"custom\""}
         };
         for (const auto& [from, to] : mutations) {

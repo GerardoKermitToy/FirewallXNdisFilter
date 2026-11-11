@@ -373,7 +373,7 @@ fn read_dhcp_reply(nb: Handle, nbl: usize, packet: &Packet, scratch: &mut Parser
     let Ok(view) = view else {
         return false;
     };
-    if (view.frame_len as usize) < limit {
+    if unlikely((view.frame_len as usize) < limit) {
         return false;
     }
     // SAFETY: this NB is still owned by the caller, and scratch is not
@@ -480,7 +480,7 @@ fn classify(
                     #[cfg(feature = "native-wdk")]
                     let inventory_scope = {
                         use native_local_address::LocalMatch;
-                        let matched = if p.flow.ipv6 {
+                        let matched = if unlikely(p.flow.ipv6) {
                             native_local_address::lookup_v6(p.flow.source, p.flow.destination)
                         } else {
                             let src = p.flow.source;
@@ -510,7 +510,7 @@ fn classify(
                         }
                     })
                 });
-                if batch.observe_ip(p, scope).is_err() {
+                if unlikely(batch.observe_ip(p, scope).is_err()) {
                     with_state(|e| {
                         e.malformed(interface_index, "IP and non-IP data share one NBL")
                     });
@@ -518,7 +518,7 @@ fn classify(
                 }
             }
             Ok(None) => {
-                if batch.observe_non_ip().is_err() {
+                if unlikely(batch.observe_non_ip().is_err()) {
                     with_state(|e| {
                         e.malformed(interface_index, "IP and non-IP data share one NBL")
                     });
@@ -593,7 +593,7 @@ fn classify(
     };
     // Splitting must not make a formerly multi-NB batch eligible for cache hits
     // or permanent decisions merely because each derived NBL has one NB.
-    if split != 0 {
+    if unlikely(split != 0) {
         packet.cacheable = false;
     }
     packet.orient(path);

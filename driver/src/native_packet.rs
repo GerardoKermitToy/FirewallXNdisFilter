@@ -10,6 +10,7 @@ use core::{
 };
 
 use crate::wdk::*;
+use likely_stable::{likely, unlikely};
 
 #[cfg(not(test))]
 use crate::wdk as api;
@@ -161,7 +162,7 @@ pub(crate) unsafe fn map_mdl(mdl: *mut MDL) -> *mut u8 {
     #[cfg(test)]
     tests::record_map_mdl_call();
     unsafe {
-        if mdl.is_null() {
+        if unlikely(mdl.is_null()) {
             return null_mut();
         }
         if (*mdl).MdlFlags as u32 & (MDL_MAPPED_TO_SYSTEM_VA | MDL_SOURCE_IS_NONPAGED_POOL) != 0 {
@@ -184,20 +185,20 @@ pub(crate) unsafe fn map_mdl(mdl: *mut MDL) -> *mut u8 {
 /// Used for local TCP LSO completion, including split MDL chains.
 pub(crate) unsafe fn read_byte(nb: *mut NET_BUFFER, mut offset: u32) -> Option<u8> {
     unsafe {
-        if nb.is_null() || offset >= data_length(nb) {
+        if unlikely(nb.is_null() || offset >= data_length(nb)) {
             return None;
         }
         let mut mdl = current_mdl(nb);
         let mut skip = current_mdl_offset(nb);
         while !mdl.is_null() {
             let length = (*mdl).ByteCount;
-            if skip > length {
+            if unlikely(skip > length) {
                 return None;
             }
             let available = length - skip;
             if offset < available {
                 let data = map_mdl(mdl);
-                return (!data.is_null()).then(|| *data.add((skip + offset) as usize));
+                return likely(!data.is_null()).then(|| *data.add((skip + offset) as usize));
             }
             offset -= available;
             skip = 0;
@@ -378,13 +379,17 @@ unsafe fn snapshot_view(
 ) -> *const u8 {
     unsafe {
         *copied = 0;
-        *frame_length = if nb.is_null() { 0 } else { data_length(nb) };
+        *frame_length = if unlikely(nb.is_null()) {
+            0
+        } else {
+            data_length(nb)
+        };
         let length = cap.min(*frame_length);
-        if length == 0 {
+        if unlikely(length == 0) {
             return ptr::null();
         }
         let data = api::NdisGetDataBuffer(nb, length, storage.cast(), 1, 0);
-        if data.is_null() {
+        if unlikely(data.is_null()) {
             return ptr::null();
         }
         *copied = length;
@@ -445,11 +450,11 @@ pub(crate) unsafe extern "C" fn fwx_snapshot(
         let data = snapshot_view(
             nb.cast(),
             out,
-            if out.is_null() { 0 } else { cap },
+            if unlikely(out.is_null()) { 0 } else { cap },
             copied,
             frame_length,
         );
-        let result = if data.is_null() {
+        let result = if unlikely(data.is_null()) {
             0
         } else {
             if data != out {

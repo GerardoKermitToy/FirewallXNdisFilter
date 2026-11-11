@@ -25,6 +25,7 @@ use self::tests::api;
 #[cfg(not(test))]
 use crate::wdk as api;
 use crate::wdk::*;
+use likely_stable::unlikely;
 
 const POOL_TAG: u32 = u32::from_le_bytes(*b"aIvH");
 // A failed query/registration or a race is retried, but never in a tight loop.
@@ -182,11 +183,12 @@ fn lookup(source: Address, destination: Address) -> LocalMatch {
     unsafe {
         let irql = lock();
         let snapshot = CURRENT;
-        if DIRTY
-            || STOPPING
-            || snapshot.is_null()
-            || api::ExAcquireRundownProtection(addr_of_mut!((*snapshot).rundown)) == 0
-        {
+        if unlikely(
+            DIRTY
+                || STOPPING
+                || snapshot.is_null()
+                || api::ExAcquireRundownProtection(addr_of_mut!((*snapshot).rundown)) == 0,
+        ) {
             unlock(irql);
             return LocalMatch::Unknown;
         }
@@ -211,7 +213,7 @@ fn lookup(source: Address, destination: Address) -> LocalMatch {
         let valid = !DIRTY && !STOPPING && CURRENT == snapshot;
         unlock(irql);
         api::ExReleaseRundownProtection(addr_of_mut!((*snapshot).rundown));
-        if !valid {
+        if unlikely(!valid) {
             LocalMatch::Unknown
         } else if found {
             LocalMatch::Local

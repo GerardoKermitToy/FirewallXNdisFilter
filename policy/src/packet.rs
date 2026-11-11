@@ -307,7 +307,7 @@ pub fn parse_ip(
         if unlikely(transport + min > ip_len) {
             return Err(ParseError::Malformed);
         }
-        if transport + min <= ip.len() {
+        if likely(transport + min <= ip.len()) {
             if proto == 6 {
                 let tcp_len = usize::from(ip[transport + 12] >> 4) * 4;
                 if unlikely(tcp_len < 20 || transport + tcp_len > ip_len) {

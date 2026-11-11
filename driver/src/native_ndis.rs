@@ -463,7 +463,7 @@ pub(super) unsafe extern "C" fn fwx_finish(nbl_address: usize, finish: u32) {
         packet::free_packet_context(nbl);
         if send {
             let lso_complete = complete_local_lso(nbl);
-            if !lso_complete {
+            if unlikely(!lso_complete) {
                 policy::FwxInvalidLso((*a).interface_index);
             }
             (*nbl).__bindgen_anon_2.Status = if finish == FINISH_CANCEL {
@@ -549,8 +549,11 @@ unsafe fn split_mixed(
         let direction = (*context).direction;
         let port = (*context).port;
         let flags = (*context).flags;
-        if !packet::split_metadata_supported(parent, direction, nbl_info_count(FILTER_NDIS_VERSION))
-        {
+        if unlikely(!packet::split_metadata_supported(
+            parent,
+            direction,
+            nbl_info_count(FILTER_NDIS_VERSION),
+        )) {
             policy::FwxResourceDrop((*a).interface_index);
             let cancelled = if batch.is_null() {
                 false
@@ -830,9 +833,10 @@ pub(super) unsafe extern "C" fn send_complete(
                 fwx_bugcheck();
             }
             let status = (*nbl).__bindgen_anon_2.Status;
-            if status != FWX_WDK_NDIS_SUCCESS as NDIS_STATUS
-                && status != FWX_WDK_NDIS_SEND_ABORTED as NDIS_STATUS
-            {
+            if unlikely(
+                status != FWX_WDK_NDIS_SUCCESS as NDIS_STATUS
+                    && status != FWX_WDK_NDIS_SEND_ABORTED as NDIS_STATUS,
+            ) {
                 policy::FwxSendFailure((*a).interface_index, status);
             }
             if unlikely(!(*owned).split.is_null()) {
@@ -1023,7 +1027,7 @@ pub(super) unsafe extern "C" fn oid(
 ) -> NDIS_STATUS {
     unsafe {
         let a = context.cast::<Adapter>();
-        if api::ExAcquireRundownProtection(addr_of_mut!((*a).oid_rundown)) == 0 {
+        if unlikely(api::ExAcquireRundownProtection(addr_of_mut!((*a).oid_rundown)) == 0) {
             return FWX_WDK_NDIS_CLOSING as NDIS_STATUS;
         }
         let mut clone = null_mut();

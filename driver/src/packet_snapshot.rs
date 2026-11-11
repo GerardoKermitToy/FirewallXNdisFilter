@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
 use firewallx_policy::packet::SNAPSHOT;
+use likely_stable::unlikely;
 
 #[derive(Default)]
 pub struct Snapshot {
@@ -44,13 +45,13 @@ impl ParserScratch {
         let mut view = snapshot(storage);
         if view.data.is_null() && view.frame_len != 0 && storage.is_null() {
             let mut bytes = allocate(limit);
-            if bytes.len() < limit {
+            if unlikely(bytes.len() < limit) {
                 return Err(SnapshotError::Resource);
             }
             view = snapshot(bytes.as_mut_ptr());
             self.bytes = Some(bytes);
         }
-        if view.data.is_null() || view.copied as usize > limit {
+        if unlikely(view.data.is_null() || view.copied as usize > limit) {
             return Err(SnapshotError::Malformed);
         }
         Ok(view)

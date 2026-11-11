@@ -4,6 +4,7 @@
 //! NBL must be split before its local and transit NBs get independent decisions.
 
 use firewallx_policy::packet::Packet;
+use likely_stable::unlikely;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IpScope {
@@ -21,19 +22,23 @@ pub(crate) fn ip_scope(packet: &Packet, lookup: impl FnOnce() -> IpScope) -> IpS
     const IPV6_MULTICAST_PREFIX: u8 = 0xff;
 
     let destination = &packet.flow.destination;
-    let bypass = if packet.flow.ipv6 {
+    let bypass = if unlikely(packet.flow.ipv6) {
         destination[0] == IPV6_MULTICAST_PREFIX
     } else {
         destination[0] & IPV4_MULTICAST_MASK == IPV4_MULTICAST_PREFIX
             || destination.starts_with(&IPV4_LIMITED_BROADCAST)
     };
-    if bypass { IpScope::Local } else { lookup() }
+    if unlikely(bypass) {
+        IpScope::Local
+    } else {
+        lookup()
+    }
 }
 
 /// Local or unavailable inventory already bypasses policy, so only inspect
 /// DHCP server replies when the inventory has identified transit traffic.
 pub(crate) fn inventory_then_dhcp(scope: IpScope, is_dhcp: impl FnOnce() -> bool) -> IpScope {
-    if scope == IpScope::Transit && is_dhcp() {
+    if unlikely(scope == IpScope::Transit && is_dhcp()) {
         IpScope::Local
     } else {
         scope
@@ -46,7 +51,7 @@ fn dhcp_server_to_client(packet: &Packet) -> bool {
     const DHCPV4_CLIENT_PORT: u16 = 68;
     const DHCPV6_SERVER_PORT: u16 = 547;
     const DHCPV6_CLIENT_PORT: u16 = 546;
-    let ports = if packet.flow.ipv6 {
+    let ports = if unlikely(packet.flow.ipv6) {
         (DHCPV6_SERVER_PORT, DHCPV6_CLIENT_PORT)
     } else {
         (DHCPV4_SERVER_PORT, DHCPV4_CLIENT_PORT)

@@ -7,6 +7,7 @@ use core::{
     ptr::{self, addr_of, addr_of_mut, null_mut},
     sync::atomic::{AtomicI32, AtomicI64, AtomicPtr, Ordering},
 };
+use likely_stable::unlikely;
 
 #[path = "native_device.rs"]
 mod device;
@@ -180,7 +181,7 @@ fn pool_allocation_failed() -> ! {
 
 #[inline]
 pub(crate) fn pool_allocation(pointer: PVOID) -> PVOID {
-    if pointer.is_null() {
+    if unlikely(pointer.is_null()) {
         pool_allocation_failed();
     }
     pointer

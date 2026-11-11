@@ -60,7 +60,8 @@ public:
     bool include_target = true, add_target_after_confirm = false, add_target_after_install = false;
     bool change_wsl_after_confirm = false, change_wsl_luid_after_install = false, skip_wsl_enable = false;
     bool enable_has_effect = true, disable_has_effect = true, leave_service = false;
-    Change install_result = Change::Complete, remove_result = Change::Complete, enable_result = Change::Complete, disable_result = Change::Complete;
+    Change install_result = Change::Complete, remove_result = Change::Complete, service_remove_result = Change::Complete;
+    Change enable_result = Change::Complete, disable_result = Change::Complete;
 
     void Step(const char* name) {
         calls.emplace_back(name);
@@ -129,12 +130,18 @@ public:
         Require(!allowed, "removal must follow disarm");
         Step("remove");
         if (remove_fails) throw Error{L"rollback removal failure"};
-        if (remove_result == Change::Complete) {
+        if (remove_result == Change::Complete && component) {
             component = false;
             service = leave_service;
             bindings.clear();
         }
         return remove_result;
+    }
+    Change RemoveOrphanedService() override {
+        Require(!component && !allowed, "service removal must follow component removal and disarm");
+        Step("remove-service");
+        if (service_remove_result == Change::Complete) service = false;
+        return service_remove_result;
     }
     std::vector<std::wstring> ReadDriverPackages() override { Step("packages"); return packages; }
     Change RemoveDriverPackage(const std::wstring& published_inf) override {
@@ -179,7 +186,7 @@ public:
         return static_cast<size_t>(found - calls.begin());
     }
     void RequireNoMutation() const {
-        for (const auto name : {"lock", "write-disarmed", "disarm", "arm", "ready", "install", "disable", "enable", "remove", "purge", "delete-config"}) {
+        for (const auto name : {"lock", "write-disarmed", "disarm", "arm", "ready", "install", "disable", "enable", "remove", "remove-service", "purge", "delete-config"}) {
             Require(!Called(name), "unexpected mutation in read-only path");
         }
     }
@@ -558,10 +565,35 @@ int main() {
             Require(Execute(Uninstall(), system) == kRebootRequired);
             Require(!system.Called("purge") && system.packages.size() == 1 && system.config && !system.recovery);
         }},
-        {"residual service prevents package deletion", [] {
+        {"orphaned service is removed before package cleanup", [] {
+            FakeSystem system; system.service = system.config = true; system.packages = {L"oem3.inf"};
+            Require(Execute(Uninstall(), system) == 0);
+            Require(!system.service && !system.config && system.packages.empty());
+            Require(system.At("remove") < system.At("remove-service") && system.At("remove-service") < system.At("purge"));
+        }},
+        {"service left by component removal is removed", [] {
             FakeSystem system; system.Installed(); system.leave_service = true; system.packages = {L"oem3.inf"};
-            Throws([&] { Execute(Uninstall(), system); }, L"incomplete");
+            Require(Execute(Uninstall(), system) == 0);
+            Require(!system.service && !system.config && system.packages.empty());
+        }},
+        {"service pending deletion postpones package cleanup", [] {
+            FakeSystem system; system.service = system.config = true; system.packages = {L"oem3.inf"};
+            system.service_remove_result = Change::RebootRequired;
+            Require(Execute(Uninstall(), system) == kRebootRequired);
             Require(!system.Called("purge") && system.packages.size() == 1 && system.config);
+            system.service_remove_result = Change::Complete;
+            Require(Execute(Uninstall(), system) == 0 && system.packages.empty() && !system.config);
+        }},
+        {"service deletion failure keeps configuration and packages", [] {
+            FakeSystem system; system.service = system.config = true; system.packages = {L"oem3.inf"};
+            system.fail = "remove-service";
+            Throws([&] { Execute(Uninstall(), system); }, L"injected");
+            Require(!system.Called("purge") && system.packages.size() == 1 && system.config);
+        }},
+        {"uninstall does not block on a monitor process name", [] {
+            FakeSystem system; system.fail = "monitor"; system.packages = {L"oem3.inf"};
+            Require(Execute(Uninstall(), system) == 0);
+            Require(!system.Called("monitor") && system.packages.empty());
         }},
         {"one package failure does not skip the other old versions", [] {
             FakeSystem system; system.Installed();
@@ -658,10 +690,10 @@ int main() {
             system.RequireNoMutation();
             Require(system.component && system.config && system.allowed);
         }},
-        {"residual service blocks configuration deletion", [] {
+        {"residual service is removed before configuration", [] {
             FakeSystem system; system.Installed(); system.allowed = true; system.leave_service = true;
-            Throws([&] { Execute(Uninstall(), system); }, L"incomplete");
-            Require(system.config && !system.allowed && !system.Called("delete-config"));
+            Require(Execute(Uninstall(), system) == 0);
+            Require(!system.service && !system.config && system.At("remove-service") < system.At("delete-config"));
         }}
     };
     for (const auto& test : cases) {

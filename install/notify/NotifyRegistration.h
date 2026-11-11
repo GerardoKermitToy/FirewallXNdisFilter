@@ -6,6 +6,8 @@
 
 namespace firewallx_ndis_filter {
 
+inline constexpr wchar_t kNotifyDescription[] = L"FirewallXNdisFilter target-adapter binding policy";
+
 inline std::wstring NotifyClassKey() {
     wchar_t guid[39]{};
     if (!StringFromGUID2(kNotifyClsid, guid, 39)) return {};
@@ -21,7 +23,20 @@ inline HRESULT ReadNotifyOwnership(const std::wstring& key, bool& owned) {
     DWORD bytes = sizeof(path);
     const LSTATUS status = RegGetValueW(HKEY_CLASSES_ROOT, server.c_str(), nullptr,
                                        RRF_RT_REG_SZ, nullptr, path, &bytes);
-    if (status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND) return S_OK;
+    if (status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND) {
+        // A failed/partial registration can leave only our class description.
+        // The CLSID is shared, so remove such a key only if that value identifies us.
+        wchar_t description[MAX_PATH]{};
+        DWORD description_bytes = sizeof(description);
+        const LSTATUS description_status = RegGetValueW(HKEY_CLASSES_ROOT, key.c_str(), nullptr,
+                                                        RRF_RT_REG_SZ, nullptr, description, &description_bytes);
+        if (description_status == ERROR_FILE_NOT_FOUND || description_status == ERROR_PATH_NOT_FOUND) return S_OK;
+        if (description_status != ERROR_SUCCESS) return HRESULT_FROM_WIN32(description_status);
+        if (description_bytes < sizeof(wchar_t) || description_bytes > sizeof(description) ||
+            description_bytes % sizeof(wchar_t) != 0 || description[description_bytes / sizeof(wchar_t) - 1] != L'\0') return E_UNEXPECTED;
+        owned = description_bytes == sizeof(kNotifyDescription) && std::wcscmp(description, kNotifyDescription) == 0;
+        return S_OK;
+    }
     if (status != ERROR_SUCCESS) return HRESULT_FROM_WIN32(status);
     if (bytes < sizeof(wchar_t) || bytes > sizeof(path) || bytes % sizeof(wchar_t) != 0 ||
         path[bytes / sizeof(wchar_t) - 1] != L'\0' || path[0] == L'\0') return E_UNEXPECTED;
@@ -48,9 +63,8 @@ inline HRESULT RegisterNotifyServer(HMODULE module) {
     const auto server = key + L"\\InprocServer32";
     // Use COM's registration root, including NetCfg's redirected classes view.
     // An explicit HKLM path can conflict with the installer's registry transaction.
-    const wchar_t description[] = L"FirewallXNdisFilter target-adapter binding policy";
     LSTATUS status = RegSetKeyValueW(HKEY_CLASSES_ROOT, key.c_str(), nullptr, REG_SZ,
-                                     description, sizeof(description));
+                                     kNotifyDescription, sizeof(kNotifyDescription));
     TraceNetCfg("Register notify class", HRESULT_FROM_WIN32(status));
     if (status != ERROR_SUCCESS) return HRESULT_FROM_WIN32(status);
     status = RegSetKeyValueW(HKEY_CLASSES_ROOT, server.c_str(), nullptr, REG_SZ,

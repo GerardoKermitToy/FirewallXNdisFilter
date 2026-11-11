@@ -3,6 +3,7 @@ add_library(firewallx_ndis_filter_setup STATIC
     WindowsSetup.cpp
     Package.cpp
     DriverStore.cpp
+    ServiceCleanup.cpp
 )
 target_include_directories(firewallx_ndis_filter_setup PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_features(firewallx_ndis_filter_setup PUBLIC cxx_std_20)
@@ -41,7 +42,7 @@ foreach(tool IN ITEMS Install Uninstall)
 endforeach()
 
 if(BUILD_TESTING)
-    foreach(test_name IN ITEMS management_console_tests management_package_tests management_driver_store_tests management_package_identity_tests)
+    foreach(test_name IN ITEMS management_console_tests management_package_tests management_driver_store_tests management_package_identity_tests management_service_tests)
         add_executable(${test_name} "tests/${test_name}.cpp")
         target_link_libraries(${test_name} PRIVATE firewallx_ndis_filter_setup)
         set_target_properties(${test_name} PROPERTIES
@@ -51,6 +52,7 @@ if(BUILD_TESTING)
         endif()
     endforeach()
     add_test(NAME management_console_tests COMMAND management_console_tests)
+    add_test(NAME management_service_tests COMMAND management_service_tests)
     add_test(NAME management_package_tests COMMAND management_package_tests
         "${CMAKE_CURRENT_SOURCE_DIR}/../FirewallXNdisFilter.inf" "${CMAKE_CURRENT_BINARY_DIR}")
     add_test(NAME management_driver_store_tests COMMAND management_driver_store_tests
@@ -61,6 +63,6 @@ if(BUILD_TESTING)
         "-DINSTALL=$<TARGET_FILE:firewallx_Install>"
         "-DUNINSTALL=$<TARGET_FILE:firewallx_Uninstall>"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/management_cli_tests.cmake")
-    set_tests_properties(management_console_tests management_package_tests management_driver_store_tests management_package_identity_tests management_cli_tests
+    set_tests_properties(management_console_tests management_service_tests management_package_tests management_driver_store_tests management_package_identity_tests management_cli_tests
         PROPERTIES TIMEOUT 30 LABELS "no-driver" WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
 endif()

@@ -6,7 +6,7 @@ function(check_cli executable expected)
     endif()
     if(expected EQUAL 0)
         if(NOT output MATCHES "Usage:" OR NOT output MATCHES "3010 reboot required" OR
-           NOT output MATCHES "invalid arguments do not access WMI")
+           NOT output MATCHES "invalid arguments do not access the system")
             message(FATAL_ERROR "Missing offline help/lifecycle contract: ${output}")
         endif()
     elseif(NOT error MATCHES "ERROR:")

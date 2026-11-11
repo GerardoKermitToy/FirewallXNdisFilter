@@ -15,8 +15,6 @@
 namespace firewallx_ndis_filter::setup {
 namespace {
 
-constexpr wchar_t kServiceKey[] = L"SYSTEM\\CurrentControlSet\\Services\\FirewallXNdisFilter";
-
 class Network {
 public:
     explicit Network(bool writable) : writable_(writable) {
@@ -359,10 +357,7 @@ public:
         // the persisted component. Never commit pending changes during rollback.
         network_->Refresh(true);
         auto component = network_->Component();
-        if (!component) {
-            if (HasService()) throw Error{L"FirewallXNdisFilter service remains without a NetCfg component; no SCM service will be forcibly deleted. Reboot/repair the old installation explicitly."};
-            return Change::Complete;
-        }
+        if (!component) return Change::Complete;
         GUID component_class{};
         Check(component->GetClassGuid(&component_class), L"Get FirewallXNdisFilter component class");
         ComPtr<INetCfgClassSetup> setup;
@@ -375,6 +370,14 @@ public:
         component.Reset();
         setup.Reset();
         return Applied(*network_, result);
+    }
+
+    Change RemoveOrphanedService() override {
+        if (!network_) throw Error{L"NetCfg write lock is required for service removal."};
+        const ServiceRemoval result = RemoveWindowsDriverService();
+        // The SCM may defer deletion while another process holds a service handle.
+        if (result == ServiceRemoval::RebootRequired || HasService()) return Change::RebootRequired;
+        return Change::Complete;
     }
 
     std::vector<std::wstring> ReadDriverPackages() override { return ReadWindowsDriverPackages(); }
@@ -400,9 +403,14 @@ public:
     void DeleteConfiguration() override {
         // Called only after the component and service are gone. NetCfg need not
         // invoke DllUnregisterServer for a Driver Store notify DLL on removal.
-        Check(UnregisterNotifyServer(), L"Remove only FirewallXNdisFilter notify registration");
-        const LSTATUS result = RegDeleteTreeW(HKEY_LOCAL_MACHINE, kConfigKey);
-        if (result != ERROR_FILE_NOT_FOUND && result != ERROR_PATH_NOT_FOUND) CheckWin32(result, L"Remove only FirewallXNdisFilter target configuration");
+        const HRESULT registration = UnregisterNotifyServer();
+        if (registration == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
+            Print(L"The shared notify CLSID belongs to another product and was left unchanged.\n");
+        } else {
+            Check(registration, L"Remove only FirewallXNdisFilter notify registration");
+        }
+        const LSTATUS result = RegDeleteTreeW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\FirewallXNdisFilter");
+        if (result != ERROR_FILE_NOT_FOUND && result != ERROR_PATH_NOT_FOUND) CheckWin32(result, L"Remove only FirewallXNdisFilter configuration");
     }
 private:
     Change SetTargetBindings(const Targets& targets, bool enabled) {

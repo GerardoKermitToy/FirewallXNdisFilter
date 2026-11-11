@@ -9,6 +9,7 @@ namespace firewallx_ndis_filter::setup {
 using Microsoft::WRL::ComPtr;
 
 // RegFlushKey requires KEY_QUERY_VALUE, including on write-only operations.
+inline constexpr wchar_t kServiceKey[] = L"SYSTEM\\CurrentControlSet\\Services\\FirewallXNdisFilter";
 inline constexpr REGSAM kDurableConfigAccess = KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY;
 static_assert((kDurableConfigAccess & (KEY_QUERY_VALUE | KEY_SET_VALUE)) == (KEY_QUERY_VALUE | KEY_SET_VALUE));
 
@@ -74,6 +75,19 @@ struct CoString {
 void ValidateInfFile(const std::filesystem::path& inf);
 void ValidateRemovalInfFile(const std::filesystem::path& inf);
 bool IsPublishedInfName(const std::wstring& name);
+struct ServiceControlApi {
+    decltype(&OpenSCManagerW) open_manager = OpenSCManagerW;
+    decltype(&OpenServiceW) open_service = OpenServiceW;
+    decltype(&QueryServiceStatusEx) query_status = QueryServiceStatusEx;
+    decltype(&ControlService) control = ControlService;
+    decltype(&DeleteService) remove = DeleteService;
+    decltype(&CloseServiceHandle) close = CloseServiceHandle;
+    decltype(&RegDeleteTreeW) delete_tree = RegDeleteTreeW;
+    decltype(&GetTickCount64) ticks = GetTickCount64;
+    decltype(&Sleep) sleep = Sleep;
+};
+enum class ServiceRemoval { Absent, Deleted, RebootRequired };
+ServiceRemoval RemoveWindowsDriverService(const ServiceControlApi& api = {});
 std::vector<std::wstring> ReadWindowsDriverPackages();
 Change RemoveWindowsDriverPackage(const std::wstring& published_inf);
 inline constexpr std::array<const wchar_t*, 4> kPackageFiles = {

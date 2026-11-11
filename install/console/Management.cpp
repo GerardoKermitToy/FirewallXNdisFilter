@@ -142,9 +142,9 @@ std::wstring Usage(Action executable) {
         ? L"Usage: Uninstall.exe [--yes] [--what-if]\n       Uninstall.exe --help\n\n"
         : L"Usage: Install.exe [--package DIRECTORY] [--yes] [--what-if]\n       Install.exe --enable [--yes] [--what-if]\n       Install.exe --help\n\n";
     result += uninstall
-        ? L"Disarms and removes only the firewallx_ndis_filter NetCfg component, then\nremoves ALL identified FirewallXNdisFilter package versions from Driver Store.\nPackages in use require reboot and another Uninstall.exe run; no forced file\ndeletion is performed. No Default Switch, VM, HNS, NAT or unrelated driver is changed.\n"
+        ? L"Disarms and removes only the firewallx_ndis_filter NetCfg component, any\nremaining FirewallXNdisFilter driver service, and ALL identified package versions\nfrom Driver Store. Windows may require a reboot and another Uninstall.exe run.\nNo Default Switch, VM, HNS, NAT or unrelated driver is changed.\n"
         : L"Installs the optional Ethernet NDIS LWF and enables the present compatible\nNetCfg binding paths. Adapters without a standard Ethernet LWF path (including\nWireGuard) are not covered. The package defaults to this EXE's directory.\n--enable resumes the installed component using its currently available paths.\n";
-    result += L"\nRun from an elevated Administrator/SYSTEM console; stop ndis_monitor first.\nConfirmation is required unless --yes is supplied. --what-if performs read-only\npreflight without a write lock, registry writes, package deletion or binding changes.\n--help and invalid arguments do not access WMI, NetCfg, registry or the driver.\n\nExit codes: 0 success/dry run, 1 failure, 2 invalid arguments,\n1223 cancelled, 3010 reboot required (configuration retained disarmed).\nThe programs never open the driver device or create an SCM service manually.\n";
+    result += L"\nRun from an elevated Administrator/SYSTEM console; stop monitoring before\ninstallation or enabling. Confirmation is required unless --yes is supplied.\n--what-if performs read-only preflight without registry writes, package deletion\nor binding changes. --help and invalid arguments do not access the system.\n\nExit codes: 0 success/dry run, 1 failure, 2 invalid arguments,\n1223 cancelled, 3010 reboot required (configuration retained disarmed).\nThe programs never open the driver device or create an SCM service manually.\n";
     return result;
 }
 
@@ -193,8 +193,10 @@ void ValidateBindings(const std::vector<Binding>& bindings, const Targets& targe
 
 int Execute(const Options& options, System& system) {
     system.RequireAdministrator();
-    if (options.action != Action::Uninstall) system.RequireSupportedOS();
-    system.RequireMonitorStopped();
+    if (options.action != Action::Uninstall) {
+        system.RequireSupportedOS();
+        system.RequireMonitorStopped();
+    }
     Targets targets;
     if (options.action == Action::Install) {
         RequireFresh(system);
@@ -231,18 +233,19 @@ int Execute(const Options& options, System& system) {
         return ERROR_CANCELLED;
     }
     system.LockNetwork();
-    system.RequireMonitorStopped();
     if (options.action == Action::Uninstall) {
         system.DisarmIfPresent();
         if (system.RemoveComponent() == Change::RebootRequired) return RemovalNeedsReboot(system);
-        if (system.HasComponent() || system.HasService()) {
+        if (system.HasComponent()) {
             throw Error{L"FirewallXNdisFilter removal is incomplete. Configuration remains disarmed; reboot if requested and run Uninstall.exe again."};
         }
+        if (system.RemoveOrphanedService() == Change::RebootRequired) return RemovalNeedsReboot(system);
         if (RemovePackages(system) == Change::RebootRequired) return RemovalNeedsReboot(system);
         system.DeleteConfiguration();
         system.Print(L"FirewallXNdisFilter and all its Driver Store package versions removed. No other component, switch, VM, HNS or NAT setting was changed.\n");
         return 0;
     }
+    system.RequireMonitorStopped();
     if (options.action == Action::Enable) {
         RevalidateTargets(system, targets);
         if (!system.HasComponent()) throw Error{L"The installed FirewallXNdisFilter component disappeared."};

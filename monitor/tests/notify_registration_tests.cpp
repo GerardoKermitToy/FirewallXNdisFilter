@@ -9,8 +9,9 @@ struct Write { HKEY root; std::wstring key, name, value; DWORD type, bytes; };
 std::vector<Write> writes;
 unsigned fail_write = 0, deletes = 0;
 LSTATUS write_error = ERROR_ACCESS_DENIED, delete_error = ERROR_SUCCESS;
-LSTATUS read_error = ERROR_FILE_NOT_FOUND;
+LSTATUS read_error = ERROR_FILE_NOT_FOUND, description_error = ERROR_FILE_NOT_FOUND;
 std::wstring registered_path = L"C:\\private\\FirewallXNdisFilterNotify.dll";
+std::wstring registered_description = L"FirewallXNdisFilter target-adapter binding policy";
 HKEY delete_root = nullptr;
 std::wstring delete_key;
 std::wstring module_path = L"C:\\private\\FirewallXNdisFilterNotify.dll";
@@ -23,12 +24,15 @@ DWORD WINAPI FakeGetModuleFileNameW(HMODULE, LPWSTR path, DWORD capacity) {
     std::wmemcpy(path, module_path.c_str(), module_path.size() + 1);
     return static_cast<DWORD>(module_path.size());
 }
-LSTATUS WINAPI FakeRegGetValueW(HKEY root, LPCWSTR, LPCWSTR, DWORD flags, LPDWORD, PVOID data, LPDWORD bytes) {
+LSTATUS WINAPI FakeRegGetValueW(HKEY root, LPCWSTR key, LPCWSTR, DWORD flags, LPDWORD, PVOID data, LPDWORD bytes) {
     if (root != HKEY_CLASSES_ROOT || flags != RRF_RT_REG_SZ) return ERROR_TRANSACTIONAL_CONFLICT;
-    if (read_error != ERROR_SUCCESS) return read_error;
-    const DWORD required = static_cast<DWORD>((registered_path.size() + 1) * sizeof(wchar_t));
+    const bool server = std::wstring(key).ends_with(L"\\InprocServer32");
+    const LSTATUS status = server ? read_error : description_error;
+    if (status != ERROR_SUCCESS) return status;
+    const auto& value = server ? registered_path : registered_description;
+    const DWORD required = static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t));
     if (*bytes < required) { *bytes = required; return ERROR_MORE_DATA; }
-    std::wmemcpy(static_cast<wchar_t*>(data), registered_path.c_str(), registered_path.size() + 1);
+    std::wmemcpy(static_cast<wchar_t*>(data), value.c_str(), value.size() + 1);
     *bytes = required;
     return ERROR_SUCCESS;
 }
@@ -45,7 +49,8 @@ LSTATUS WINAPI FakeRegDeleteTreeW(HKEY root, LPCWSTR key) {
 void Reset() {
     writes.clear(); fail_write = deletes = 0;
     write_error = ERROR_ACCESS_DENIED; delete_error = ERROR_SUCCESS;
-    read_error = ERROR_FILE_NOT_FOUND; registered_path = module_path;
+    read_error = description_error = ERROR_FILE_NOT_FOUND; registered_path = module_path;
+    registered_description = L"FirewallXNdisFilter target-adapter binding policy";
     delete_root = nullptr; delete_key.clear(); path_result = 1;
 }
 } // namespace
@@ -124,6 +129,20 @@ bool TestRegistrationOwnership() {
     Reset();
     CHECK(firewallx_ndis_filter::UnregisterNotifyServer() == S_OK);
     CHECK(writes.empty() && deletes == 0);
+
+    Reset(); read_error = ERROR_FILE_NOT_FOUND; description_error = ERROR_SUCCESS;
+    CHECK(firewallx_ndis_filter::UnregisterNotifyServer() == S_OK);
+    CHECK(deletes == 1 && delete_key == class_key);
+    Reset(); read_error = ERROR_PATH_NOT_FOUND; description_error = ERROR_SUCCESS;
+    registered_description = L"An unrelated notify class";
+    CHECK(firewallx_ndis_filter::UnregisterNotifyServer() == S_OK && deletes == 0);
+    Reset(); read_error = ERROR_FILE_NOT_FOUND; description_error = ERROR_SUCCESS;
+    registered_description = L"FirewallXNdisFilter target-adapter binding policy";
+    registered_description.push_back(L'\0'); registered_description += L"unrelated";
+    CHECK(firewallx_ndis_filter::UnregisterNotifyServer() == S_OK && deletes == 0);
+    Reset(); read_error = ERROR_FILE_NOT_FOUND; description_error = ERROR_ACCESS_DENIED;
+    CHECK(firewallx_ndis_filter::UnregisterNotifyServer() == HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED));
+    CHECK(deletes == 0);
 
     for (const auto* legacy : {L"C:\\old\\HyperVXNdisFilterNotify.dll",
                                L"C:\\old\\HyperVGuardNotify.dll",

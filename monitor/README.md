@@ -14,17 +14,23 @@ The pointer callbacks replace the former unified `Connection` / `Bandwidth` call
 
 ## Build and no-driver tests
 
-On Windows x64 with CMake, the Visual Studio C++ toolchain and Rust 1.91+ installed (Rust is required for the offline native-driver tests):
+On Windows x64 with CMake, the Visual Studio C++ toolchain and Rust 1.91+ installed (Rust is required for the offline native-driver tests), run these commands from the repository root in Windows Command Prompt (`cmd.exe`) or PowerShell:
 
-```powershell
-cmake -S C:\hyperv\monitor -B C:\hyperv\monitor\build -G "Visual Studio 18 2026" -A x64 -DBUILD_TESTING=ON
-cmake --build C:\hyperv\monitor\build --config Release --parallel
-ctest --test-dir C:\hyperv\monitor\build -C Release --output-on-failure -L no-driver
+```bat
+cmake -S monitor -B monitor\build -G "Visual Studio 18 2026" -A x64 -DBUILD_TESTING=ON
+```
+
+```bat
+cmake --build monitor\build --config Release --parallel
+```
+
+```bat
+ctest --test-dir monitor\build -C Release --output-on-failure -L no-driver
 ```
 
 For Visual Studio 2022 use `-G "Visual Studio 17 2022"`. Alternatively configure with Ninja from an x64 VS developer shell and add `-DCMAKE_BUILD_TYPE=Release`; the executable then appears directly in the build directory. A parent build can configure this CMake project without building a driver. Targets include `ndis_monitor`, `pmkext`, and `firewallx_ndis_filter_notify` (the separate NetCfg binding-policy DLL, built but never registered by CMake).
 
-With the VS generator the executable is `build\Release\ndis_monitor.exe`. It deliberately uses an **as-invoker** manifest so `--help` and invalid-CLI tests need neither elevation nor a device. Actual device access still requires elevated Administrator/SYSTEM because of the driver's device ACL.
+With the VS generator the executable is `monitor\build\Release\ndis_monitor.exe`. It deliberately uses an **as-invoker** manifest so `--help` and invalid-CLI tests need neither elevation nor a device. Actual device access still requires elevated Administrator/SYSTEM because of the driver's device ACL.
 
 All MSVC targets, including static libraries, standalone header-client examples, setup tools and offline tests, compile with `/Zi`; EXE/DLL links use `/DEBUG:FULL` and `/PDBALTPATH:%_PDB%`. Release optimizations are preserved. Linker PDBs go to the build root (the configuration subdirectory with the VS generator), and the main package build copies the product PDBs to `dist/` alongside their binaries.
 
@@ -34,7 +40,7 @@ CTest registers **only no-driver tests**: exact IPv4/IPv6/event/command codecs a
 
 ## Installation and session startup
 
-An NDIS LWF is a NetCfg network component, not a legacy demand-start service. Install explicitly using the native `dist/Install.exe`, which enables the filter's eligible NetCfg binding paths on compatible Ethernet adapters. Adapters that do not expose an eligible path, including Wintun/WireGuard, are not covered. Use `Install.exe --enable` to resume after a requested reboot and `Uninstall.exe` for removal. The older ICS-only `Set-Binding.ps1` helper is retired and does not change bindings. Setup EXEs do not launch PowerShell/netcfg.exe. The monitor does not install, start or bind a driver.
+An NDIS LWF is a NetCfg network component, not a legacy demand-start service. Install explicitly using the native `dist/Install.exe`, which enables the filter's eligible NetCfg binding paths on compatible Ethernet adapters. Adapters that do not expose an eligible path, including Wintun/WireGuard, are not covered. From the repository root, use `.\dist\Install.exe --enable` to resume after a requested reboot and `.\dist\Uninstall.exe` for removal. The older ICS-only `Set-Binding.ps1` helper is retired and does not change bindings. Setup EXEs do not launch PowerShell/netcfg.exe. The monitor does not install, start or bind a driver.
 
 `Driver::Open()` opens the existing `\\.\FirewallXNdisFilter` device only; it does not start an IPC server. `Driver::Install(...)` keeps its old signature but returns a descriptive **not supported** error without touching SCM or registry state. `Stop()` sends the existing shutdown IOCTL to end the device session and release pending packets; `Cleanup()` closes handles. Neither disables, uninstalls or unloads the LWF.
 
@@ -48,17 +54,32 @@ Connection headers print `id=... interface_index=...` for both IPv4 and IPv6, in
 
 A positive `--duration N` limits the monitoring phase. Zero/negative/junk durations, `.sys` positional arguments, process-suspension options, redirect verdicts and unsupported options fail before singleton/output/device access. `--help` is also offline-safe.
 
-```powershell
-# Help only: no device access.
-.\build\Release\ndis_monitor.exe --help
+From the repository root, display help without accessing the device:
 
-# Runtime examples only; require an explicitly installed/bound LWF,
-# elevation, and separate permission to run against live host-vNIC traffic.
-.\build\Release\ndis_monitor.exe  # Interactive: wait for startup, then Ctrl+C exits.
-.\build\Release\ndis_monitor.exe --duration 10 --only-logs
-.\build\Release\ndis_monitor.exe --duration 30 --out run.log --timestamps --payload
-.\build\Release\ndis_monitor.exe --duration 30 --filter-protocol 17
-.\build\Release\ndis_monitor.exe --duration 30 --verdict block --match 192.0.2.10:53
+```bat
+.\monitor\build\Release\ndis_monitor.exe --help
+```
+
+The following runtime examples require an installed/bound LWF, elevation and authorization for live traffic. The first runs until Ctrl+C:
+
+```bat
+.\monitor\build\Release\ndis_monitor.exe
+```
+
+```bat
+.\monitor\build\Release\ndis_monitor.exe --duration 10 --only-logs
+```
+
+```bat
+.\monitor\build\Release\ndis_monitor.exe --duration 30 --out run.log --timestamps --payload
+```
+
+```bat
+.\monitor\build\Release\ndis_monitor.exe --duration 30 --filter-protocol 17
+```
+
+```bat
+.\monitor\build\Release\ndis_monitor.exe --duration 30 --verdict block --match 192.0.2.10:53
 ```
 
 Supported options include `--out`, `--filter-ip IP[:PORT]` (`[IPv6]:PORT` for IPv6), `--filter-protocol`, `--match`, `--verdict`, `--no-verdicts`, `--payload`, `--poll`, `--timestamps`, `--memory-stats` and `--verdict-delay-ms`. `--only-logs`, `--no-conn` and `--no-bandwidth` are retained. Numeric values and ports are validated without truncation or wrapping. Display filters combine with AND, never change verdicts, and IP/port pairs must match the same endpoint. `--match` selects the normalized `remote` endpoint reported by the driver in both directions on every interface; the console does not reverse direction, endpoints or bandwidth counters based on interface roles.

@@ -8,44 +8,44 @@ The binaries are packaged beside **`FirewallXNdisFilter.sys`**, `FirewallXNdisFi
 
 ## Commands
 
-From Git Bash at the repository root, with the monitor stopped:
+From Windows Command Prompt (`cmd.exe`) or PowerShell at the repository root, with the monitor stopped:
 
-```bash
-./dist/Install.exe
+```bat
+.\dist\Install.exe
 ```
 
 An alternate package directory:
 
-```bash
-./dist/Install.exe --package 'C:/path/to/package'
+```bat
+.\dist\Install.exe --package "C:\path\to\package"
 ```
 
 Read-only preflight, without taking the NetCfg write lock or writing configuration:
 
-```bash
-./dist/Install.exe --what-if
+```bat
+.\dist\Install.exe --what-if
 ```
 
 Resume an installed component **after** a requested reboot, using the current eligible binding paths:
 
-```bash
-./dist/Install.exe --enable
+```bat
+.\dist\Install.exe --enable
 ```
 
 Remove only FirewallXNdisFilter and **all its identified Driver Store package versions**, even if an adapter has disappeared:
 
-```bash
-./dist/Uninstall.exe
+```bat
+.\dist\Uninstall.exe
 ```
 
 Help performs no WMI, NetCfg, registry, or driver initialization:
 
-```bash
-./dist/Install.exe --help
+```bat
+.\dist\Install.exe --help
 ```
 
-```bash
-./dist/Uninstall.exe --help
+```bat
+.\dist\Uninstall.exe --help
 ```
 
 Both accept `--yes` to skip confirmation, without bypassing any safety check. `--what-if` still requires privileges and checks the real system; it is not an appropriate automated offline test. EOF or any answer other than `y`/`yes` cancels by default. No process is forcibly stopped.
@@ -58,7 +58,7 @@ Both accept `--yes` to skip confirmation, without bypassing any safety check. `-
 | 1223 | Confirmation declined / input ended |
 | 3010 | Component/package removal or enable requires reboot; configuration is retained disarmed |
 
-When installation requests reboot, do not bypass the disarmed state. Reboot, then explicitly run `Install.exe --enable`. When removal requests reboot, reboot and run `Uninstall.exe` again to finish package cleanup before attempting a fresh installation. A partial removal or orphaned service is not treated as a clean installation; the tools never forcibly delete an SCM service.
+When installation requests reboot, do not bypass the disarmed state. Reboot, then explicitly run `.\dist\Install.exe --enable`. When removal requests reboot, reboot and run `.\dist\Uninstall.exe` again to finish package cleanup before attempting a fresh installation. A partial removal or orphaned service is not treated as a clean installation; the tools never forcibly delete an SCM service.
 
 ## Native lifecycle and scope
 
@@ -79,16 +79,16 @@ The old ICS-specific `scripts/Set-Binding.ps1` is retired and refuses to change 
 
 The existing user-mode CMake project builds both tools with a static MSVC CRT. In an initialized VS x64 environment:
 
-```bash
+```bat
 cmake -S monitor -B build/monitor -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 ```
 
-```bash
+```bat
 cmake --build build/monitor --target firewallx_Install firewallx_Uninstall management_console_tests management_package_tests
 ```
 
-```bash
-ctest --test-dir build/monitor -R '^management_' --output-on-failure
+```bat
+ctest --test-dir build/monitor -R "^management_" --output-on-failure
 ```
 
 The normal `scripts/Build.ps1` also builds/copies both EXEs, including with `-SkipMonitor`; supplied signing arguments sign both EXEs as well as the existing driver package. Building never installs, binds, loads or removes the driver and never registers the notify COM object.

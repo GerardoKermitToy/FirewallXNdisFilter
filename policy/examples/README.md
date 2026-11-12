@@ -40,7 +40,7 @@ not AVX/x87 or extra extended-state management. See the [Microsoft x64 WDM guida
 
 ## Build and run
 
-Use Git Bash in the repository root, with Rust's MSVC target and the Windows SDK
+Use Windows Command Prompt (`cmd.exe`) or PowerShell in the repository root, with Rust's MSVC target and the Windows SDK
 available. The runner builds **release only**, signs the standalone benchmark
 using the supplied existing certificates, verifies its Authenticode signature,
 and runs it. Both benchmark runners retain full debug information and a matching
@@ -49,8 +49,8 @@ and `/PDBALTPATH:%_PDB%`. They never import/copy certificates or change security
 Use the signing inputs authorized for the local workspace; the paths below are
 placeholders, not bundled certificates.
 
-```bash
-powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File 'C:\hyperv\scripts\Benchmark-Cache.ps1' -Entries 1000000 -Queries 1000000 -Rounds 7 -PfxPath 'C:\path\to\test-signing.pfx' -RootCertificate 'C:\path\to\test-root.der'
+```bat
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/Benchmark-Cache.ps1 -Entries 1000000 -Queries 1000000 -Rounds 7 -PfxPath "C:\path\to\test-signing.pfx" -RootCertificate "C:\path\to\test-root.der"
 ```
 
 `-Entries` is the number of live entries **per family and distribution**, not
@@ -115,10 +115,10 @@ loops use static dispatch, and checksums are consumed outside the timed region.
 The runner uses the repository release profile (`opt-level=2`, LTO, one codegen
 unit, panic abort) plus the driver's `no-redzone` flag.
 
-The benchmark generator and container adapters also have offline regression tests (including disjoint datasets, the exact 90/10 mix, TTL behavior, and forced hash collisions):
+The benchmark generator and container adapters also have offline regression tests (including disjoint datasets, the exact 90/10 mix, TTL behavior, and forced hash collisions). This command clears inherited kernel flags only in a child `cmd.exe`, without changing the current shell:
 
-```bash
-env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo test --release -p firewallx-policy --example cache_lookup_bench --locked
+```bat
+cmd.exe /d /c "set RUSTFLAGS=&& set CARGO_ENCODED_RUSTFLAGS=&& cargo test --release -p firewallx-policy --example cache_lookup_bench --locked"
 ```
 
 ## Interpretation and limits
@@ -161,12 +161,12 @@ host allocator. The previous 256-list design is frozen as `list_256_legacy`. The
 original `indexed_pages_incremental` page-directory prototype remains a separate
 reference, not the integrated driver implementation.
 
-```bash
-env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo test --release -p firewallx-policy --example bandwidth_stats_bench --locked -- --test-threads=1
+```bat
+cmd.exe /d /c "set RUSTFLAGS=&& set CARGO_ENCODED_RUSTFLAGS=&& cargo test --release -p firewallx-policy --example bandwidth_stats_bench --locked -- --test-threads=1"
 ```
 
-```bash
-env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo run --release -p firewallx-policy --example bandwidth_stats_bench --locked -- --records 1000000 --flows 250000 --rounds 5 --scenario realistic --out build/bandwidth-bench
+```bat
+cmd.exe /d /c "set RUSTFLAGS=&& set CARGO_ENCODED_RUSTFLAGS=&& cargo run --release -p firewallx-policy --example bandwidth_stats_bench --locked -- --records 1000000 --flows 250000 --rounds 5 --scenario realistic --out build/bandwidth-bench"
 ```
 
 The default realistic dataset contains one million admitted TCP/UDP observations
@@ -186,8 +186,8 @@ For a signed standalone benchmark executable, use the repository runner with the
 existing local test-signing inputs (the runner never imports them or changes trust
 settings):
 
-```bash
-powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File 'scripts/Benchmark-Bandwidth.ps1' -Records 1000000 -Flows 250000 -Rounds 5 -PfxPath 'C:\path\to\test-signing.pfx' -RootCertificate 'C:\path\to\test-root.der'
+```bat
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/Benchmark-Bandwidth.ps1 -Records 1000000 -Flows 250000 -Rounds 5 -PfxPath "C:\path\to\test-signing.pfx" -RootCertificate "C:\path\to\test-root.der"
 ```
 
 The direct `cargo run` command is useful for an unsigned user-mode iteration;

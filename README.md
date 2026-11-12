@@ -17,13 +17,13 @@ Requirements:
 - Windows SDK and WDK **10.0.28000.0**, and LLVM with libclang. Set `LIBCLANG_PATH` if libclang is not in `%ProgramFiles%\LLVM\bin`.
 - A signing certificate and root certificate. The [windows_kext_mod certificate instructions](https://github.com/GerardoKermitToy/windows_kext_mod#1-create-the-local-certificates) explain how to create the local keys used in the example below. Keep private keys out of source control.
 
-From Git Bash at the repository root, build a signed Release package and run the offline tests:
+Run the commands below from the repository root in Windows Command Prompt (`cmd.exe`) or PowerShell. To build a signed Release package:
 
-```bash
-powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/Build.ps1 -Test -PfxPath 'C:\path\to\certificate.pfx' -RootCertificate 'C:\path\to\root-ca.der'
+```bat
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/Build.ps1 -PfxPath "C:\portmaster_v3\windows_kext\localhost-km.pfx" -RootCertificate "C:\portmaster_v3\windows_kext\localhost-root-ca.der"
 ```
 
-Adjust the certificate paths for your machine. Set `FIREWALLXNDISFILTER_PFX_PASSWORD` or pass `-PfxPassword` when needed. The build requests an RFC 3161 timestamp from `http://timestamp.digicert.com` by default; use `-TimestampUrl` for another service. Only the timestamp hash is sent; the private key stays local. Signing does not by itself guarantee that Windows will accept the driver: review the target system's signing and security requirements independently. The build does not install the driver or change certificate stores or security settings.
+Adjust the certificate paths if needed, keeping the double quotes. Add `-Test` to run the offline tests. Set `FIREWALLXNDISFILTER_PFX_PASSWORD` or pass `-PfxPassword` when needed. The build requests an RFC 3161 timestamp from `http://timestamp.digicert.com` by default; use `-TimestampUrl` for another service. Only the timestamp hash is sent; the private key stays local. Signing does not by itself guarantee that Windows will accept the driver: review the target system's signing and security requirements independently. The build does not install the driver or change certificate stores or security settings.
 
 The package in `dist/` contains `FirewallXNdisFilter.sys`, its INF and CAT, `FirewallXNdisFilterNotify.dll`, `ndis_monitor.exe`, `Install.exe`, `Uninstall.exe`, and matching full PDBs. Keep these files together and do not mix package versions. If `dist/` contains artifacts from another product or monitor name, the build refuses to mix them; preserve and move the incompatible package before rebuilding.
 
@@ -31,33 +31,33 @@ The package in `dist/` contains `FirewallXNdisFilter.sys`, its INF and CAT, `Fir
 
 Use an elevated Administrator/SYSTEM console, stop any monitor, and keep local recovery access available. Windows may reconfigure networking during installation. If the filter is already installed, remove it first with its matching uninstaller; the installer does not replace a live driver or overwrite a notify registration belonging to another product.
 
-```bash
-./dist/Install.exe
+```bat
+.\dist\Install.exe
 ```
 
 The installer uses the package beside the EXE and enables the eligible binding paths exposed by NetCfg for this filter, including compatible physical Ethernet adapters and host vNICs. Other Ethernet-compatible paths, such as Bluetooth PAN, may also be included. An adapter with no compatible binding path is not covered. New adapters are not guaranteed to be enabled automatically; verify their binding and running module before relying on coverage. Use `--what-if` for read-only preflight or `--yes` to skip confirmation. Conflicting staged packages can cause installation to fail; use the matching uninstaller rather than overwriting package files.
 
 If installation returns **3010**, reboot and then resume enabling the compatible NetCfg paths available at that time:
 
-```bash
-./dist/Install.exe --enable
+```bat
+.\dist\Install.exe --enable
 ```
 
 ## Monitor
 
 Start with the default PermanentAccept policy:
 
-```bash
-./dist/ndis_monitor.exe --duration 15 --timestamps --memory-stats --out allow.log
+```bat
+.\dist\ndis_monitor.exe --duration 15 --timestamps --memory-stats --out allow.log
 ```
 
 Omit `--duration` to run until **Ctrl+C**. To apply a blocking verdict only to a test remote endpoint:
 
-```bash
-./dist/ndis_monitor.exe --duration 10 --match 192.0.2.10:9000 --verdict permanent-block --out block.log
+```bat
+.\dist\ndis_monitor.exe --duration 10 --match 192.0.2.10:9000 --verdict permanent-block --out block.log
 ```
 
-`--match` selects the remote endpoint reported by the driver in both directions; `--match-any` instead matches either reported endpoint, useful on bridged physical adapters where `remote` can be the guest address. These options are mutually exclusive; unmatched events receive PermanentAccept. `--filter-ip` only hides output and does not limit verdicts. A blocking verdict without a match applies to every event and can disrupt connectivity. Run `./dist/ndis_monitor.exe --help` for the remaining options.
+`--match` selects the remote endpoint reported by the driver in both directions; `--match-any` instead matches either reported endpoint, useful on bridged physical adapters where `remote` can be the guest address. These options are mutually exclusive; unmatched events receive PermanentAccept. `--filter-ip` only hides output and does not limit verdicts. A blocking verdict without a match applies to every event and can disrupt connectivity. Run `.\dist\ndis_monitor.exe --help` for the remaining options.
 
 The monitor opens the existing control device; it does not install, load, bind, or start a temporary driver. Install and start the NDIS LWF before running it. `--duration` bounds monitoring, not driver installation or startup.
 
@@ -67,11 +67,11 @@ At startup, the monitor prints an attached-adapter snapshot and the count of run
 
 Stop the monitor, then run from an elevated console:
 
-```bash
-./dist/Uninstall.exe
+```bat
+.\dist\Uninstall.exe
 ```
 
-The uninstaller disarms and removes this filter and its identified driver packages without requiring the target adapters to remain present. `--what-if` lists the affected packages without changing system state. If removal returns **3010**, reboot and run `Uninstall.exe` again before reinstalling.
+The uninstaller disarms and removes this filter and its identified driver packages without requiring the target adapters to remain present. `--what-if` lists the affected packages without changing system state. If removal returns **3010**, reboot and run `.\dist\Uninstall.exe` again before reinstalling.
 
 ## API
 

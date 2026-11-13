@@ -6,9 +6,9 @@ use firewallx_protocol as wire;
 mod constants {
     include!(concat!(env!("OUT_DIR"), "/device_constants.rs"));
 }
+pub(crate) use constants::STATUS_NOT_SUPPORTED;
 use constants::{
-    STATUS_BUFFER_TOO_SMALL, STATUS_INTEGER_OVERFLOW, STATUS_INVALID_PARAMETER,
-    STATUS_NOT_SUPPORTED, STATUS_SUCCESS,
+    STATUS_BUFFER_TOO_SMALL, STATUS_INTEGER_OVERFLOW, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
 };
 
 /// # Safety

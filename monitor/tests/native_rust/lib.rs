@@ -4,6 +4,8 @@
 
 #[path = "../../../driver/src/adapter_info.rs"]
 mod adapter_info;
+#[path = "../../../driver/src/cpu_features.rs"]
+mod cpu_features;
 #[path = "../../../driver/src/device_control.rs"]
 mod device_control;
 #[path = "../../../driver/src/native.rs"]

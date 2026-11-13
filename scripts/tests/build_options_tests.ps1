@@ -59,6 +59,33 @@ try {
     ++$script:passed
     Write-Host 'PASS all signing uses RFC 3161 with SHA-256 and the selected URL'
 
+    $rustFlagsAssignment = $ast.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left.Extent.Text -eq '$env:RUSTFLAGS'
+    }, $true)
+    if ($null -eq $rustFlagsAssignment) { throw 'Driver Rust flags assignment not found.' }
+    $rustFlags = & ([scriptblock]::Create($rustFlagsAssignment.Right.Extent.Text))
+    if ($rustFlags -notmatch '(?:^|\s)-C\s+target-feature=\+sse4\.2(?:\s|$)') {
+        throw 'Driver Rust flags do not enable SSE4.2 for the complete Cargo target build.'
+    }
+    if ($rustFlags -match '(?i)target-cpu\s*=\s*native|target-feature=\S*\+avx') {
+        throw 'Driver Rust flags enable the build machine CPU or AVX.'
+    }
+    ++$script:passed
+    Write-Host 'PASS driver target build enables SSE4.2 without native CPU or AVX'
+
+    $linkCommand = $ast.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -eq 'link.exe'
+    }, $true)
+    if ($null -eq $linkCommand -or $linkCommand.Extent.Text -notmatch '(?i)/ENTRY:FwxCpuCheckedEntry(?:\s|$)') {
+        throw 'The SYS entry does not point to the baseline CPU check.'
+    }
+    ++$script:passed
+    Write-Host 'PASS SYS link uses the CPU-checked entry'
+
     $guard = $ast.Find({
         param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and

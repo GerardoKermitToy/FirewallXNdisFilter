@@ -109,7 +109,7 @@ if(BUILD_TESTING)
     find_program(CARGO_EXECUTABLE cargo REQUIRED)
     # These suites compile the production Rust native modules against generated
     # WDK layouts. Only kernel API side effects are faked; no C++ native copy.
-    foreach(suite IN ITEMS native_packet native_ndis native_device native_local_address)
+    foreach(suite IN ITEMS cpu_features native_packet native_ndis native_device native_local_address)
         if(suite STREQUAL "native_ndis")
             set(test_name native_ndis_tests)
             set(test_filter "native::ndis::")

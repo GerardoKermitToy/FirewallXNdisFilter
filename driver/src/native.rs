@@ -17,9 +17,8 @@ mod ndis;
 #[path = "native_registry.rs"]
 mod registry;
 
-const TAG: u32 = 0x67564848;
-const CACHE_TAG: u32 = 0x63564848;
-const INFO_TAG: u32 = 0x69564848;
+// The little-endian bytes are the tag displayed by Windows pool diagnostics.
+pub(crate) const POOL_TAG: u32 = u32::from_le_bytes(*b"FwXn");
 const SEND: u32 = 0;
 const RECEIVE: u32 = 1;
 const PENDING_CHECK_MS: i32 = 1000;
@@ -215,7 +214,7 @@ extern "C" fn fwx_allocate(size: usize) -> *mut u8 {
             pool_allocation(ExAllocatePool2(
                 (FWX_WDK_POOL_FLAG_NON_PAGED | FWX_WDK_POOL_FLAG_UNINITIALIZED) as u64,
                 size as u64,
-                TAG,
+                POOL_TAG,
             ))
             .cast()
         }
@@ -224,7 +223,7 @@ extern "C" fn fwx_allocate(size: usize) -> *mut u8 {
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn fwx_free(data: *mut u8, _: usize) {
-    unsafe { ExFreePoolWithTag(data.cast(), TAG) }
+    unsafe { ExFreePoolWithTag(data.cast(), POOL_TAG) }
 }
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
@@ -236,7 +235,7 @@ extern "C" fn fwx_cache_allocate(size: usize) -> *mut u8 {
             pool_allocation(ExAllocatePool2(
                 (FWX_WDK_POOL_FLAG_NON_PAGED | FWX_WDK_POOL_FLAG_UNINITIALIZED) as u64,
                 size as u64,
-                CACHE_TAG,
+                POOL_TAG,
             ))
             .cast()
         }
@@ -245,7 +244,7 @@ extern "C" fn fwx_cache_allocate(size: usize) -> *mut u8 {
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn fwx_cache_free(data: *mut u8, _: usize) {
-    unsafe { ExFreePoolWithTag(data.cast(), CACHE_TAG) }
+    unsafe { ExFreePoolWithTag(data.cast(), POOL_TAG) }
 }
 unsafe fn close_classification_session() {
     unsafe {

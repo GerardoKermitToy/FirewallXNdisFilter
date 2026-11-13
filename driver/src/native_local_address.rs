@@ -24,10 +24,9 @@ use core::{
 use self::tests::api;
 #[cfg(not(test))]
 use crate::wdk as api;
-use crate::wdk::*;
+use crate::{native::POOL_TAG, wdk::*};
 use likely_stable::unlikely;
 
-const POOL_TAG: u32 = u32::from_le_bytes(*b"aIvH");
 // A failed query/registration or a race is retried, but never in a tight loop.
 const RETRY_100NS: i64 = -10_000_000;
 const DEBOUNCE_100NS: i64 = -1_000_000;

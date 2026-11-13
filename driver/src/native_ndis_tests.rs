@@ -374,7 +374,7 @@ pub(super) mod calls {
     pub(crate) unsafe fn ExAllocatePool2(flags: POOL_FLAGS, bytes: SIZE_T, tag: ULONG) -> PVOID {
         assert_unlocked();
         assert!(bytes > 0);
-        assert!(tag == TAG || tag == INFO_TAG);
+        assert_eq!(tag, POOL_TAG);
         if fail() {
             return null_mut();
         }
@@ -391,7 +391,9 @@ pub(super) mod calls {
                     .insert(pointer as usize, (layout, tag))
                     .is_none()
             );
-            if tag == INFO_TAG && s.snapshot_growth > 0 {
+            // In this fixture only snapshot staging uses uninitialized pool;
+            // adapter allocations triggered by growth are zero-initialized.
+            if flags & FWX_WDK_POOL_FLAG_UNINITIALIZED as POOL_FLAGS != 0 && s.snapshot_growth > 0 {
                 s.snapshot_growth -= 1;
                 true
             } else {
@@ -423,7 +425,7 @@ pub(super) mod calls {
     ) -> NDIS_HANDLE {
         unsafe {
             assert_eq!((*p).Header.Size, FWX_WDK_NBL_POOL_SIZE as u16);
-            assert_eq!((*p).PoolTag, TAG);
+            assert_eq!((*p).PoolTag, POOL_TAG);
         }
         if fail() {
             return null_mut();
@@ -443,7 +445,7 @@ pub(super) mod calls {
     ) -> NDIS_HANDLE {
         unsafe {
             assert_eq!((*p).Header.Size, FWX_WDK_NB_POOL_SIZE as u16);
-            assert_eq!((*p).PoolTag, TAG);
+            assert_eq!((*p).PoolTag, POOL_TAG);
         }
         if fail() {
             return null_mut();
@@ -615,7 +617,7 @@ pub(super) mod calls {
         tag: UINT,
         out: *mut PNDIS_OID_REQUEST,
     ) -> NDIS_STATUS {
-        assert_eq!(tag, TAG);
+        assert_eq!(tag, POOL_TAG);
         if fail() {
             return FWX_WDK_NDIS_RESOURCES as NDIS_STATUS;
         }
@@ -2258,6 +2260,7 @@ fn snapshot_errors_do_not_invent_partial_success_or_allocate_arithmetic_maximum(
             FWX_WDK_STATUS_RETRY as NTSTATUS
         );
         assert_eq!(transferred, 123);
+        state(|s| assert_eq!(s.snapshot_growth, 0));
         detach_all();
     }
 }

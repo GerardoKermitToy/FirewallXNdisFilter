@@ -609,13 +609,15 @@ pub(super) mod api {
             thread::yield_now();
         }
     }
-    pub unsafe fn ExAllocatePool2(_flags: POOL_FLAGS, size: SIZE_T, _tag: ULONG) -> PVOID {
+    pub unsafe fn ExAllocatePool2(_flags: POOL_FLAGS, size: SIZE_T, tag: ULONG) -> PVOID {
+        assert_eq!(tag, POOL_TAG);
         let layout = Layout::from_size_align(size as usize, 16).unwrap();
         let ptr = unsafe { alloc_zeroed(layout) };
         fake().allocations.insert(ptr as usize, layout);
         ptr.cast()
     }
-    pub unsafe fn ExFreePoolWithTag(p: PVOID, _tag: ULONG) {
+    pub unsafe fn ExFreePoolWithTag(p: PVOID, tag: ULONG) {
+        assert_eq!(tag, POOL_TAG);
         let layout = fake().allocations.remove(&(p as usize)).unwrap();
         unsafe { dealloc(p.cast(), layout) };
     }

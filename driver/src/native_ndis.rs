@@ -1031,7 +1031,7 @@ pub(super) unsafe extern "C" fn oid(
             return FWX_WDK_NDIS_CLOSING as NDIS_STATUS;
         }
         let mut clone = null_mut();
-        api::NdisAllocateCloneOidRequest((*a).filter, request, TAG, &mut clone);
+        api::NdisAllocateCloneOidRequest((*a).filter, request, POOL_TAG, &mut clone);
         addr_of_mut!((*clone).SourceReserved)
             .cast::<PNDIS_OID_REQUEST>()
             .write_unaligned(request);
@@ -1251,7 +1251,7 @@ pub(super) unsafe fn query_adapter_info(
                 AdapterInfoAction::GrowStaging => {
                     spin_unlock(addr_of_mut!(ADAPTER_INFO_LOCK), irql);
                     if !snapshot.is_null() {
-                        api::ExFreePoolWithTag(snapshot.cast(), INFO_TAG);
+                        api::ExFreePoolWithTag(snapshot.cast(), POOL_TAG);
                         snapshot = null_mut();
                     }
                     let Some(bytes) = (count as usize).checked_mul(size_of::<AdapterInfo>()) else {
@@ -1261,7 +1261,7 @@ pub(super) unsafe fn query_adapter_info(
                     snapshot = pool_allocation(api::ExAllocatePool2(
                         (FWX_WDK_POOL_FLAG_NON_PAGED | FWX_WDK_POOL_FLAG_UNINITIALIZED) as u64,
                         bytes as u64,
-                        INFO_TAG,
+                        POOL_TAG,
                     ))
                     .cast();
                     allocated_count = u64::from(count);
@@ -1303,7 +1303,7 @@ pub(super) unsafe fn query_adapter_info(
             break;
         }
         if !snapshot.is_null() {
-            api::ExFreePoolWithTag(snapshot.cast(), INFO_TAG);
+            api::ExFreePoolWithTag(snapshot.cast(), POOL_TAG);
         }
         status
     }
@@ -1357,7 +1357,7 @@ unsafe fn free_adapter(a: *mut Adapter) {
             api::NdisFreeRWLock((*a).classification_lock);
         }
         // NdisFreeSpinLock is an empty inline in the native WDK.
-        api::ExFreePoolWithTag(a.cast(), TAG);
+        api::ExFreePoolWithTag(a.cast(), POOL_TAG);
     }
 }
 
@@ -1375,7 +1375,7 @@ pub(super) unsafe extern "C" fn filter_attach(
         let a = pool_allocation(api::ExAllocatePool2(
             FWX_WDK_POOL_FLAG_NON_PAGED as u64,
             size_of::<Adapter>() as u64,
-            TAG,
+            POOL_TAG,
         ))
         .cast::<Adapter>();
         (*a).filter = filter;
@@ -1391,13 +1391,13 @@ pub(super) unsafe extern "C" fn filter_attach(
         nbl_pool.Header.Revision = NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1 as u8;
         nbl_pool.Header.Size = FWX_WDK_NBL_POOL_SIZE as u16;
         nbl_pool.ProtocolId = NDIS_PROTOCOL_ID_DEFAULT as u8;
-        nbl_pool.PoolTag = TAG;
+        nbl_pool.PoolTag = POOL_TAG;
         (*a).nbl_pool = api::NdisAllocateNetBufferListPool(filter, &nbl_pool);
         let mut nb_pool: NET_BUFFER_POOL_PARAMETERS = zeroed();
         nb_pool.Header.Type = NDIS_OBJECT_TYPE_DEFAULT as u8;
         nb_pool.Header.Revision = NET_BUFFER_POOL_PARAMETERS_REVISION_1 as u8;
         nb_pool.Header.Size = FWX_WDK_NB_POOL_SIZE as u16;
-        nb_pool.PoolTag = TAG;
+        nb_pool.PoolTag = POOL_TAG;
         (*a).nb_pool = api::NdisAllocateNetBufferPool(filter, &nb_pool);
         let attached = policy::FwxAttach((*a).interface_index);
         policy::FwxDrain();

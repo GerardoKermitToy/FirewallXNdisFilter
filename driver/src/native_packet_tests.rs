@@ -86,7 +86,7 @@ pub(super) mod calls {
             flags,
             (FWX_WDK_POOL_FLAG_NON_PAGED | FWX_WDK_POOL_FLAG_UNINITIALIZED) as POOL_FLAGS
         );
-        assert_eq!(tag, TAG);
+        assert_eq!(tag, POOL_TAG);
         assert!(bytes > 0);
         if fail() {
             return null_mut();
@@ -101,7 +101,7 @@ pub(super) mod calls {
     }
 
     pub(crate) unsafe fn ExFreePoolWithTag(pointer: PVOID, tag: ULONG) {
-        assert_eq!(tag, TAG);
+        assert_eq!(tag, POOL_TAG);
         let layout = state(|s| {
             s.pools
                 .remove(&(pointer as usize))
@@ -368,7 +368,7 @@ pub(super) mod calls {
     ) -> NDIS_STATUS {
         assert_eq!(size as usize, size_of::<PacketContext>());
         assert_eq!(backfill, 0);
-        assert_eq!(tag, CONTEXT_TAG);
+        assert_eq!(tag, POOL_TAG);
         if fail() {
             return 0xc000009au32 as NDIS_STATUS;
         }
@@ -486,8 +486,9 @@ fn source(inputs: &mut [Input]) -> Box<NET_BUFFER_LIST> {
 #[test]
 fn context_uses_exact_owner_layout_and_pointer_aligned_backfill() {
     reset(None);
-    assert_eq!(TAG, 0x6756_4848);
-    assert_eq!(CONTEXT_TAG, 0x6e56_4848);
+    assert_eq!(POOL_TAG, 0x6e58_7746);
+    assert_eq!(POOL_TAG.to_le_bytes(), *b"FwXn");
+    assert_eq!(CONTEXT_SIGNATURE, 0x6e56_4848);
     assert_eq!(OWNER_NDIS, 0);
     let mut nbl = NET_BUFFER_LIST::default();
     unsafe {
@@ -495,7 +496,7 @@ fn context_uses_exact_owner_layout_and_pointer_aligned_backfill() {
         assert!(!context.is_null());
         assert_eq!(context as usize % 16, 8);
         assert_eq!(packet_context(&mut nbl), context);
-        assert_eq!((*context).signature, CONTEXT_TAG);
+        assert_eq!((*context).signature, CONTEXT_SIGNATURE);
         let raw = core::slice::from_raw_parts(context.cast::<u8>(), size_of::<PacketContext>());
         for (i, &byte) in raw.iter().enumerate() {
             if !(offset_of!(PacketContext, signature)..offset_of!(PacketContext, signature) + 4)

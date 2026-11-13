@@ -9,7 +9,7 @@ use core::{
     ptr::{self, null_mut},
 };
 
-use crate::wdk::*;
+use crate::{native::POOL_TAG, wdk::*};
 use likely_stable::{likely, unlikely};
 
 #[cfg(not(test))]
@@ -17,9 +17,7 @@ use crate::wdk as api;
 #[cfg(test)]
 use tests::calls as api;
 
-#[cfg(test)]
-pub(crate) const TAG: u32 = u32::from_be_bytes(*b"gVHH");
-const CONTEXT_TAG: u32 = u32::from_be_bytes(*b"nVHH");
+const CONTEXT_SIGNATURE: u32 = u32::from_be_bytes(*b"nVHH");
 
 pub(crate) const OWNER_NDIS: u32 = 0;
 const NDIS_PATH_SEND: u32 = 0;
@@ -70,7 +68,7 @@ unsafe fn context_data(nbl: *mut NET_BUFFER_LIST) -> *mut PacketContext {
 pub(crate) unsafe fn packet_context(nbl: *mut NET_BUFFER_LIST) -> *mut PacketContext {
     unsafe {
         let context = context_data(nbl);
-        if (*context).signature != CONTEXT_TAG {
+        if (*context).signature != CONTEXT_SIGNATURE {
             crate::native::fwx_bugcheck();
         }
         context
@@ -80,15 +78,10 @@ pub(crate) unsafe fn packet_context(nbl: *mut NET_BUFFER_LIST) -> *mut PacketCon
 #[inline]
 pub(crate) unsafe fn allocate_packet_context(nbl: *mut NET_BUFFER_LIST) -> *mut PacketContext {
     unsafe {
-        api::NdisAllocateNetBufferListContext(
-            nbl,
-            size_of::<PacketContext>() as u16,
-            0,
-            CONTEXT_TAG,
-        );
+        api::NdisAllocateNetBufferListContext(nbl, size_of::<PacketContext>() as u16, 0, POOL_TAG);
         let context = context_data(nbl);
         ptr::write_bytes(context, 0, 1);
-        (*context).signature = CONTEXT_TAG;
+        (*context).signature = CONTEXT_SIGNATURE;
         context
     }
 }

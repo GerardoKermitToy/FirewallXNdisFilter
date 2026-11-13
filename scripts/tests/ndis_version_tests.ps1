@@ -8,7 +8,8 @@ $device = Get-Content -Raw -LiteralPath (Join-Path $root 'driver\src\native_devi
 $header = Get-Content -Raw -LiteralPath (Join-Path $root 'driver\wdk.h')
 $inf = Get-Content -Raw -LiteralPath (Join-Path $root 'install\FirewallXNdisFilter.inf')
 $checks = [ordered]@{
-    'native Rust WDK feature is built' = $build -match '--features native-wdk'
+    'native Rust WDK feature is built' = $build -match '--features\s+\$driverOptions\.Features' -and
+        $build -match "Features\s*=\s*'native-wdk'" -and $build -match "Features\s*=\s*'native-wdk,baseline-x64'"
     'kernel contains no C++ shim objects' = $build -notmatch 'ndis_shim\.obj|wfp_forward\.obj|foreach \(\$source'
     'WDK exposes NDIS 6.89 declarations' = $bindings -match '-DNDIS689=1'
     'no conflicting NDIS 6.40 build override' = $bindings -notmatch '-DNDIS640|-DNDIS_SUPPORT_NDIS'

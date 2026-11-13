@@ -59,32 +59,71 @@ try {
     ++$script:passed
     Write-Host 'PASS all signing uses RFC 3161 with SHA-256 and the selected URL'
 
+    $selector = $ast.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq 'Get-DriverBuildOptions'
+    }, $true)
+    if ($null -eq $selector) { throw 'Driver build option selector not found.' }
+    . ([scriptblock]::Create($selector.Extent.Text))
+    $defaultMode = [scriptblock]::Create($ast.ParamBlock.Extent.Text + "`n" + '$NoSse42.IsPresent')
+    if (& $defaultMode) { throw 'The baseline mode must be opt-in.' }
+
     $rustFlagsAssignment = $ast.Find({
         param($node)
         $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
             $node.Left.Extent.Text -eq '$env:RUSTFLAGS'
     }, $true)
-    if ($null -eq $rustFlagsAssignment) { throw 'Driver Rust flags assignment not found.' }
-    $rustFlags = & ([scriptblock]::Create($rustFlagsAssignment.Right.Extent.Text))
-    if ($rustFlags -notmatch '(?:^|\s)-C\s+target-feature=\+sse4\.2(?:\s|$)') {
-        throw 'Driver Rust flags do not enable SSE4.2 for the complete Cargo target build.'
+    $selectorAssignment = $ast.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left.Extent.Text -eq '$driverOptions'
+    }, $true)
+    if ($null -eq $rustFlagsAssignment -or $null -eq $selectorAssignment -or
+        $selectorAssignment.Right.Extent.Text -notmatch 'Get-DriverBuildOptions\s+\$NoSse42\.IsPresent') {
+        throw 'Driver build flags are not selected by the NoSse42 switch.'
     }
-    if ($rustFlags -match '(?i)target-cpu\s*=\s*native|target-feature=\S*\+avx') {
-        throw 'Driver Rust flags enable the build machine CPU or AVX.'
+    foreach ($case in @(
+        @{ Name = 'default SSE4.2'; Baseline = $false; Features = 'native-wdk';
+           CpuFlags = '-C target-feature=+sse4.2'; Entry = 'FwxCpuCheckedEntry' },
+        @{ Name = 'opt-in baseline x64'; Baseline = $true; Features = 'native-wdk,baseline-x64';
+           CpuFlags = '-C target-cpu=x86-64 -C target-feature=-sse3,-ssse3,-sse4.1,-sse4.2,-avx'; Entry = 'GsDriverEntry' }
+    )) {
+        $driverOptions = Get-DriverBuildOptions $case.Baseline
+        if ($driverOptions.Features -cne $case.Features -or $driverOptions.CpuFlags -cne $case.CpuFlags -or
+            $driverOptions.Entry -cne $case.Entry) {
+            throw "Unexpected driver build options: $($case.Name)"
+        }
+        $rustFlags = & ([scriptblock]::Create($rustFlagsAssignment.Right.Extent.Text))
+        $featureFlags = @([regex]::Matches($rustFlags, '(?:^|\s)-C\s*target-feature=\S+'))
+        $cpuFlags = @([regex]::Matches($rustFlags, '(?:^|\s)-C\s*target-cpu=\S+'))
+        $expectedCpuCount = if ($case.Baseline) { 1 } else { 0 }
+        if (!$rustFlags.Contains($case.CpuFlags) -or $featureFlags.Count -ne 1 -or
+            $cpuFlags.Count -ne $expectedCpuCount -or
+            $rustFlags -match '(?i)target-cpu\s*=\s*native|target-feature=\S*\+avx' -or
+            $rustFlags -notmatch '(?:^|\s)-C\s+no-redzone=yes(?:\s|$)') {
+            throw "Unexpected driver Rust flags: $($case.Name)"
+        }
+        ++$script:passed
+        Write-Host "PASS $($case.Name) selects matching flags, Cargo features and SYS entry"
     }
-    ++$script:passed
-    Write-Host 'PASS driver target build enables SSE4.2 without native CPU or AVX'
 
     $linkCommand = $ast.Find({
         param($node)
         $node -is [System.Management.Automation.Language.CommandAst] -and
             $node.GetCommandName() -eq 'link.exe'
     }, $true)
-    if ($null -eq $linkCommand -or $linkCommand.Extent.Text -notmatch '(?i)/ENTRY:FwxCpuCheckedEntry(?:\s|$)') {
-        throw 'The SYS entry does not point to the baseline CPU check.'
+    $cargoCommand = $ast.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -eq 'cargo' -and $node.Extent.Text -match 'cargo\s+build'
+    }, $true)
+    if ($null -eq $linkCommand -or $linkCommand.Extent.Text -notmatch '/ENTRY:\$\(\$driverOptions\.Entry\)' -or
+        $null -eq $cargoCommand -or $cargoCommand.Extent.Text -notmatch '--features\s+\$driverOptions\.Features') {
+        throw 'The SYS link or Cargo build does not use the selected CPU mode.'
     }
     ++$script:passed
-    Write-Host 'PASS SYS link uses the CPU-checked entry'
+    Write-Host 'PASS Cargo and SYS link both use the selected CPU mode'
 
     $guard = $ast.Find({
         param($node)

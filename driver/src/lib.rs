@@ -5,15 +5,25 @@
 compile_error!("Build the kernel driver with --release only.");
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
 compile_error!("The driver supports Windows x64 only.");
-#[cfg(not(target_feature = "sse4.2"))]
-compile_error!("Build the kernel driver with -C target-feature=+sse4.2.");
+#[cfg(all(not(feature = "baseline-x64"), not(target_feature = "sse4.2")))]
+compile_error!("Build the kernel driver with -C target-feature=+sse4.2 or select baseline-x64.");
+#[cfg(all(
+    feature = "baseline-x64",
+    any(
+        target_feature = "sse3",
+        target_feature = "ssse3",
+        target_feature = "sse4.1",
+        target_feature = "sse4.2"
+    )
+))]
+compile_error!("The baseline-x64 driver must not enable SSE3, SSSE3, SSE4.1 or SSE4.2.");
 #[cfg(target_feature = "avx")]
 compile_error!("Do not enable AVX for the kernel driver.");
 
 extern crate alloc;
 
 mod adapter_info;
-#[cfg(feature = "native-wdk")]
+#[cfg(all(feature = "native-wdk", not(feature = "baseline-x64")))]
 mod cpu_features;
 mod device_control;
 #[cfg(feature = "native-wdk")]

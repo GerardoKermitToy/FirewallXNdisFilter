@@ -1,10 +1,13 @@
-param([Parameter(Mandatory=$true)][string]$DriverPath)
+param(
+    [Parameter(Mandatory=$true)][string]$DriverPath,
+    [switch]$NoSse42
+)
 $ErrorActionPreference = 'Stop'
 
 # Check the actual PE entry, not just the linker command or a source-level test.
 # These baseline x64 bytes are the naked guard through both epilogues. Relative
 # call/jump displacements depend on the link; all other instructions must match.
-$pattern = @'
+$gatePattern = @'
 53 48 83 EC 30 48 89 4C 24 20 48 89 54 24 28 31 C0 0F A2
 83 F8 01 72 63 B8 01 00 00 00 31 C9 0F A2
 81 E1 01 02 18 00 81 F9 01 02 18 00 75 4C
@@ -14,6 +17,12 @@ B9 25 00 00 00 E8 ?? ?? ?? ?? 84 C0 74 22
 B9 26 00 00 00 E8 ?? ?? ?? ?? 84 C0 74 14
 48 8B 4C 24 20 48 8B 54 24 28 48 83 C4 30 5B E9 ?? ?? ?? ??
 B8 BB 00 00 C0 48 83 C4 30 5B C3
+'@ -split '\s+' | Where-Object { $_ }
+
+# The baseline build starts directly at the WDK security-cookie wrapper.
+$gsPattern = @'
+48 89 5C 24 08 57 48 83 EC 20 48 8B DA 48 8B F9 E8 ?? ?? ?? ??
+48 8B D3 48 8B CF E8 ?? ?? ?? ?? 48 8B 5C 24 30 48 83 C4 20 5F C3
 '@ -split '\s+' | Where-Object { $_ }
 
 function Resolve-Rva([byte[]]$Image, [long]$SectionTable, [int]$Sections, [long]$Rva, [int]$Length) {
@@ -31,7 +40,8 @@ function Resolve-Rva([byte[]]$Image, [long]$SectionTable, [int]$Sections, [long]
     throw 'RVA does not map to a PE section.'
 }
 
-function Assert-SafeEntry([byte[]]$Image) {
+function Assert-SafeEntry([byte[]]$Image, [bool]$Baseline) {
+    $pattern = if ($Baseline) { $gsPattern } else { $gatePattern }
     if ($Image.Length -lt 64 -or [BitConverter]::ToUInt16($Image, 0) -ne 0x5a4d) {
         throw 'Missing DOS header.'
     }
@@ -67,7 +77,7 @@ function Assert-SafeEntry([byte[]]$Image) {
             $entryOffset = [uint64]$rawOffset + $entryRva - $virtualAddress
             if ($entryOffset + $pattern.Count -gt $Image.Length -or
                 [uint64]$entryRva - $virtualAddress + $pattern.Count -gt $rawSize) {
-                throw 'Truncated CPU gate.'
+                throw 'Truncated driver entry.'
             }
             break
         }
@@ -75,8 +85,11 @@ function Assert-SafeEntry([byte[]]$Image) {
     if ($null -eq $entryOffset) { throw 'Entry does not map to a section.' }
     for ($i = 0; $i -lt $pattern.Count; ++$i) {
         if ($pattern[$i] -ne '??' -and $Image[$entryOffset + $i] -ne [Convert]::ToByte($pattern[$i], 16)) {
-            throw "Unexpected instruction in CPU gate at offset $i."
+            throw "Unexpected instruction in the driver entry at offset $i."
         }
+    }
+    if ($Baseline) {
+        return @{ EntryOffset = $entryOffset; TlsOffset = $tls }
     }
     # All four calls must resolve to the same import thunk, not arbitrary code.
     $featureTarget = $null
@@ -97,10 +110,6 @@ function Assert-SafeEntry([byte[]]$Image) {
     $jumpOffset = 0x76
     $gsRva = [long]$entryRva + $jumpOffset + 5 +
         [BitConverter]::ToInt32($Image, $entryOffset + $jumpOffset + 1)
-    $gsPattern = @'
-48 89 5C 24 08 57 48 83 EC 20 48 8B DA 48 8B F9 E8 ?? ?? ?? ??
-48 8B D3 48 8B CF E8 ?? ?? ?? ?? 48 8B 5C 24 30 48 83 C4 20 5F C3
-'@ -split '\s+' | Where-Object { $_ }
     $gsOffset = Resolve-Rva $Image $sectionTable $sections $gsRva $gsPattern.Count
     for ($i = 0; $i -lt $gsPattern.Count; ++$i) {
         if ($gsPattern[$i] -ne '??' -and $Image[$gsOffset + $i] -ne [Convert]::ToByte($gsPattern[$i], 16)) {
@@ -138,23 +147,39 @@ function Assert-SafeEntry([byte[]]$Image) {
 }
 
 $image = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $DriverPath).Path)
-$layout = Assert-SafeEntry $image
-Write-Host 'PASS SYS entry has the baseline CPUID/system-feature gate, valid unwind data and no TLS callbacks'
+$layout = Assert-SafeEntry $image $NoSse42.IsPresent
+if ($NoSse42) {
+    Write-Host 'PASS baseline SYS enters the WDK GS wrapper directly and has no TLS callbacks'
+    $cases = @(
+        @{ Name = 'entry prologue'; Offset = $layout.EntryOffset },
+        @{ Name = 'TLS directory'; Offset = $layout.TlsOffset }
+    )
+} else {
+    Write-Host 'PASS SYS entry has the baseline CPUID/system-feature gate, valid unwind data and no TLS callbacks'
+    $cases = @(
+        @{ Name = 'entry prologue'; Offset = $layout.EntryOffset },
+        @{ Name = 'CPUID instruction'; Offset = $layout.EntryOffset + 17 },
+        @{ Name = 'feature-call target'; Offset = $layout.EntryOffset + 0x35 },
+        @{ Name = 'GS tail-jump target'; Offset = $layout.EntryOffset + 0x77 },
+        @{ Name = 'failure return'; Offset = $layout.EntryOffset + $gatePattern.Count - 1 },
+        @{ Name = 'TLS directory'; Offset = $layout.TlsOffset },
+        @{ Name = 'unwind metadata'; Offset = $layout.UnwindOffset }
+    )
+}
+
+# Neither image may be accepted as the other build mode.
+$rejected = $false
+try { $null = Assert-SafeEntry $image (!$NoSse42.IsPresent) }
+catch { $rejected = $true }
+if (!$rejected) { throw 'Entry verifier accepted the wrong CPU build mode.' }
+Write-Host 'PASS entry verifier rejects the other CPU build mode'
 
 # Verify that the check rejects relevant damaged entrypoints and TLS metadata.
-foreach ($case in @(
-    @{ Name = 'entry prologue'; Offset = $layout.EntryOffset },
-    @{ Name = 'CPUID instruction'; Offset = $layout.EntryOffset + 17 },
-    @{ Name = 'feature-call target'; Offset = $layout.EntryOffset + 0x35 },
-    @{ Name = 'GS tail-jump target'; Offset = $layout.EntryOffset + 0x77 },
-    @{ Name = 'failure return'; Offset = $layout.EntryOffset + $pattern.Count - 1 },
-    @{ Name = 'TLS directory'; Offset = $layout.TlsOffset },
-    @{ Name = 'unwind metadata'; Offset = $layout.UnwindOffset }
-)) {
+foreach ($case in $cases) {
     $mutant = [byte[]]$image.Clone()
     $mutant[$case.Offset] = $mutant[$case.Offset] -bxor 1
     $rejected = $false
-    try { $null = Assert-SafeEntry $mutant }
+    try { $null = Assert-SafeEntry $mutant $NoSse42.IsPresent }
     catch { $rejected = $true }
     if (!$rejected) { throw "Entry verifier accepted a changed $($case.Name)." }
     Write-Host "PASS entry verifier rejects changed $($case.Name)"

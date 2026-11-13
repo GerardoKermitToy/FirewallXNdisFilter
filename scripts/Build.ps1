@@ -2,6 +2,7 @@
 param(
     [switch]$SkipMonitor,
     [switch]$Test,
+    [switch]$NoSse42,
     [string]$SdkVersion = '10.0.28000.0',
     [string]$CertificateThumbprint,
     [string]$PfxPath,
@@ -9,6 +10,21 @@ param(
     [ValidateNotNullOrEmpty()][string]$TimestampUrl = 'http://timestamp.digicert.com',
     [string]$PfxPassword = $(if ($env:FIREWALLXNDISFILTER_PFX_PASSWORD) { $env:FIREWALLXNDISFILTER_PFX_PASSWORD } else { '1' })
 )
+
+function Get-DriverBuildOptions([bool]$Baseline) {
+    if ($Baseline) {
+        return @{
+            CpuFlags = '-C target-cpu=x86-64 -C target-feature=-sse3,-ssse3,-sse4.1,-sse4.2,-avx'
+            Features = 'native-wdk,baseline-x64'
+            Entry = 'GsDriverEntry'
+        }
+    }
+    return @{
+        CpuFlags = '-C target-feature=+sse4.2'
+        Features = 'native-wdk'
+        Entry = 'FwxCpuCheckedEntry'
+    }
+}
 
 function Assert-NoLegacyPackageFiles([string]$Directory) {
     foreach ($name in @('HyperVXNdisFilter.inf', 'HyperVXNdisFilter.cat', 'HyperVXNdisFilter.sys',
@@ -53,18 +69,19 @@ $oldSdkVersion = $env:FIREWALLXNDISFILTER_SDK_VERSION
 $oldDir = Get-Location
 try {
     Set-Location $root
-    $env:RUSTFLAGS = '-C panic=abort -C no-redzone=yes -C target-feature=+sse4.2 -C debuginfo=2 -C link-arg=/DEBUG:FULL -C link-arg=/PDBALTPATH:%_PDB%'
+    $driverOptions = Get-DriverBuildOptions $NoSse42.IsPresent
+    $env:RUSTFLAGS = "-C panic=abort -C no-redzone=yes $($driverOptions.CpuFlags) -C debuginfo=2 -C link-arg=/DEBUG:FULL -C link-arg=/PDBALTPATH:%_PDB%"
     $env:CARGO_ENCODED_RUSTFLAGS = $null
     $env:FIREWALLXNDISFILTER_SDK_VERSION = $SdkVersion
-    & cargo build --release --target x86_64-pc-windows-msvc -p firewallx-driver --features native-wdk --locked
+    & cargo build --release --target x86_64-pc-windows-msvc -p firewallx-driver --features $driverOptions.Features --locked
     if ($LASTEXITCODE) { throw 'Rust driver build failed.' }
     $resource = Join-Path $build 'driver_version.res'
     & "$bin\rc.exe" /nologo "/I$include\um" "/I$include\shared" "/fo$resource" "$root\driver\version.rc"
     if ($LASTEXITCODE) { throw 'Driver version resource compilation failed.' }
-    & link.exe /NOLOGO /DRIVER /SUBSYSTEM:NATIVE,10.00 /ENTRY:FwxCpuCheckedEntry /MACHINE:X64 /MANIFEST:NO /NODEFAULTLIB /INCREMENTAL:NO /INTEGRITYCHECK /DYNAMICBASE /NXCOMPAT /OPT:REF /OPT:ICF /DEBUG:FULL '/PDBALTPATH:%_PDB%' /RELEASE "/OUT:$dist\FirewallXNdisFilter.sys" "/PDB:$dist\FirewallXNdisFilter.pdb" $resource "$root\target\x86_64-pc-windows-msvc\release\firewallx_driver.lib" "$lib\ndis.lib" "$lib\netio.lib" "$lib\ntoskrnl.lib" "$lib\hal.lib" "$lib\BufferOverflowK.lib"
+    & link.exe /NOLOGO /DRIVER /SUBSYSTEM:NATIVE,10.00 "/ENTRY:$($driverOptions.Entry)" /MACHINE:X64 /MANIFEST:NO /NODEFAULTLIB /INCREMENTAL:NO /INTEGRITYCHECK /DYNAMICBASE /NXCOMPAT /OPT:REF /OPT:ICF /DEBUG:FULL '/PDBALTPATH:%_PDB%' /RELEASE "/OUT:$dist\FirewallXNdisFilter.sys" "/PDB:$dist\FirewallXNdisFilter.pdb" $resource "$root\target\x86_64-pc-windows-msvc\release\firewallx_driver.lib" "$lib\ndis.lib" "$lib\netio.lib" "$lib\ntoskrnl.lib" "$lib\hal.lib" "$lib\BufferOverflowK.lib"
     if ($LASTEXITCODE) { throw 'Kernel image link failed.' }
     & "$PSScriptRoot\tests\driver_import_tests.ps1" -DriverPath "$dist\FirewallXNdisFilter.sys"
-    & "$PSScriptRoot\tests\driver_entry_tests.ps1" -DriverPath "$dist\FirewallXNdisFilter.sys"
+    & "$PSScriptRoot\tests\driver_entry_tests.ps1" -DriverPath "$dist\FirewallXNdisFilter.sys" -NoSse42:$NoSse42
     $cmake = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
     $ninja = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'
     & $cmake -S "$root\monitor" -B "$build\monitor" -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
